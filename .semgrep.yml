@@ -1,0 +1,28 @@
+rules:
+  - id: primecloud-no-hardcoded-secrets-go
+    languages: [go]
+    severity: ERROR
+    message: Potential hardcoded secret detected. Use Vault for secret management.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $X := "..."
+          - pattern: |
+              $X := `...`
+      - metavariable-regex:
+          metavariable: $X
+          regex: (?i)(password|secret|token|apiKey|privateKey|accessKey)
+
+  - id: primecloud-no-exec-shell
+    languages: [go]
+    severity: ERROR
+    message: Avoid exec.Command with shell interpretation.
+    pattern-either:
+      - pattern: exec.Command("sh", ...)
+      - pattern: exec.Command("bash", ...)
+
+  - id: primecloud-no-math-rand-for-tokens
+    languages: [go]
+    severity: WARNING
+    message: Use crypto/rand for tokens, not math/rand.
+    pattern: rand.Intn(...)

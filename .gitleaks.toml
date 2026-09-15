@@ -1,0 +1,29 @@
+# PrimeCloud Gitleaks Configuration
+# Phase 00 — Unit U-07, Module AG-00-16
+#
+# Baseline secret scanning configuration.
+# No secrets are defined here. No credentials. No tokens.
+# This file only configures what patterns to scan for.
+
+title = "PrimeCloud Gitleaks Configuration"
+
+[extend]
+# Extend the default gitleaks ruleset.
+useDefault = true
+
+[allowlist]
+description = "Global allowlist for false positives"
+paths = [
+    # Ignore vendor directories (populated in future phases)
+    '''vendor/''',
+    # Ignore compiled artifacts
+    '''dist/''',
+    '''build/''',
+    '''node_modules/''',
+    # Ignore license and governance files (no secrets expected)
+    '''LICENSE''',
+]
+regexes = [
+    # Documentation placeholders that are not real secrets
+    '''primecloud\.local''',
+]
