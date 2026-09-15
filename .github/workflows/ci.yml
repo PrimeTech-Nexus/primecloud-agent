@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Check gofmt
+        run: |
+          if find . -name "*.go" | grep -q .; then
+            gofmt -l . | tee /tmp/gofmt.out
+            test ! -s /tmp/gofmt.out
+          else
+            echo "No Go files yet — skipping."
+          fi
+
+      - name: Go vet
+        run: |
+          if [ -f "go.mod" ]; then
+            go vet ./...
+          else
+            echo "No go.mod yet — skipping."
+          fi
+
+      - name: Go build
+        run: |
+          if [ -f "go.mod" ]; then
+            go build ./...
+          else
+            echo "No go.mod yet — skipping."
+          fi
+
+      - name: Go test
+        run: |
+          if [ -f "go.mod" ]; then
+            go test ./...
+          else
+            echo "No go.mod yet — skipping."
+          fi
