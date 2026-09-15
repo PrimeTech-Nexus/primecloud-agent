@@ -1,0 +1,67 @@
+# Language build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+dist/
+build/
+target/
+bin/
+obj/
+node_modules/
+.next/
+out/
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+*.dll
+*.exe
+*.o
+*.a
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local secrets
+.secrets/
+*.pem
+*.key
+*.crt
+id_rsa
+id_ed25519
+credentials.json
+*.kdbx
+
+# Logs
+*.log
+logs/
+
+# Local test artifacts
+tmp/
+.tmp/
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
