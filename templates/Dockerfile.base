@@ -1,0 +1,33 @@
+# PrimeCloud Base Dockerfile Template
+# Phase 00 — Architecture & Engineering Foundation — Unit U-10, Module AG-00-19
+#
+# NOTE: This file is a template and specification only.
+# Active Dockerfile implementation is deferred to Phase 01+.
+#
+# Base Hardening Requirements (FD-004):
+# - Non-root user (UID 10001)
+# - Read-only rootfs compatibility
+# - Dropped capabilities
+# - Minimal attack surface
+#
+# Example Multi-Stage Structure:
+#
+# ----------------------------------------------------
+# Stage 1: Build Stage
+# ----------------------------------------------------
+# FROM golang:1.22-alpine AS builder
+# WORKDIR /app
+# COPY go.mod go.sum ./
+# RUN go mod download
+# COPY . .
+# RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/agent ./cmd/agent
+#
+# ----------------------------------------------------
+# Stage 2: Runtime Stage
+# ----------------------------------------------------
+# FROM gcr.io/distroless/static-debian12
+# LABEL primecloud.managed="true"
+# LABEL primecloud.service="agent"
+# COPY --from=builder /bin/agent /bin/agent
+# USER 10001:10001
+# ENTRYPOINT ["/bin/agent"]
