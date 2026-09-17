@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/backup"
+	"github.com/primecloud/primecloud-agent/tests/testenv"
 )
 
 func TestBackup_EncryptionAndManifest(t *testing.T) {
@@ -96,3 +97,27 @@ func TestBackup_EncryptionAndManifest(t *testing.T) {
 		t.Errorf("Recovered content mismatch: got %s, want %s", string(recovered), string(rawContent))
 	}
 }
+
+func TestBackup_VaultManagedKey(t *testing.T) {
+	vClient, _ := testenv.EnsureVaultDev(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	key1, err := backup.GetOrCreateBackupKey(ctx, vClient, "res-test-vault-key-1")
+	if err != nil {
+		t.Fatalf("GetOrCreateBackupKey failed: %v", err)
+	}
+	if len(key1) != 32 {
+		t.Fatalf("Expected 32-byte key, got %d", len(key1))
+	}
+
+	// Fetch again -> should be identical (persistent in Vault)
+	key2, err := backup.GetOrCreateBackupKey(ctx, vClient, "res-test-vault-key-1")
+	if err != nil {
+		t.Fatalf("GetOrCreateBackupKey second call failed: %v", err)
+	}
+	if string(key1) != string(key2) {
+		t.Error("Expected identical key retrieved from Vault KV")
+	}
+}
+
