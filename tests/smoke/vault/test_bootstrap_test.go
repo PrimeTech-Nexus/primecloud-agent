@@ -13,26 +13,12 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/agent"
 	"github.com/primecloud/primecloud-agent/internal/identity"
 	"github.com/primecloud/primecloud-agent/internal/vault"
+	"github.com/primecloud/primecloud-agent/tests/testenv"
 )
 
 func TestVault_ClientAndHealth(t *testing.T) {
-	vaultAddr := os.Getenv("VAULT_ADDR")
-	if vaultAddr == "" {
-		vaultAddr = "http://127.0.0.1:8200"
-	}
-	vaultToken := os.Getenv("VAULT_TOKEN")
-	if vaultToken == "" {
-		vaultToken = "root"
-	}
-
-	client, err := vault.NewClient(vault.Config{
-		Address: vaultAddr,
-		Token:   vaultToken,
-		Timeout: 5 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to initialize vault client: %v", err)
-	}
+	vClient, _ := testenv.EnsureVaultDev(t)
+	client := vClient
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -47,14 +33,8 @@ func TestVault_ClientAndHealth(t *testing.T) {
 }
 
 func TestVault_BootstrapTokenAndCertIssuance(t *testing.T) {
-	vaultAddr := os.Getenv("VAULT_ADDR")
-	if vaultAddr == "" {
-		vaultAddr = "http://127.0.0.1:8200"
-	}
-	vaultToken := os.Getenv("VAULT_TOKEN")
-	if vaultToken == "" {
-		vaultToken = "root"
-	}
+	_, vaultToken := testenv.EnsureVaultDev(t)
+	vaultAddr := "http://127.0.0.1:8200"
 
 	tempDir := t.TempDir()
 	tokenFile := filepath.Join(tempDir, "bootstrap-token")

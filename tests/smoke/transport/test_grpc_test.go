@@ -3,7 +3,6 @@ package transport_test
 import (
 	"context"
 	"net"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
 	"github.com/primecloud/primecloud-agent/internal/transport"
 	"github.com/primecloud/primecloud-agent/internal/vault"
+	"github.com/primecloud/primecloud-agent/tests/testenv"
 )
 
 type mockControlPlaneServer struct {
@@ -49,23 +49,7 @@ func (s *mockControlPlaneServer) SendHeartbeat(ctx context.Context, req *pb.Hear
 }
 
 func TestGRPC_MTLS_Transport(t *testing.T) {
-	vaultAddr := os.Getenv("VAULT_ADDR")
-	if vaultAddr == "" {
-		vaultAddr = "http://127.0.0.1:8200"
-	}
-	vaultToken := os.Getenv("VAULT_TOKEN")
-	if vaultToken == "" {
-		vaultToken = "root"
-	}
-
-	// 1. Issue real certificates from Vault for both server and client
-	vClient, err := vault.NewClient(vault.Config{
-		Address: vaultAddr,
-		Token:   vaultToken,
-	})
-	if err != nil {
-		t.Fatalf("Failed to initialize vault client: %v", err)
-	}
+	vClient, _ := testenv.EnsureVaultDev(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
