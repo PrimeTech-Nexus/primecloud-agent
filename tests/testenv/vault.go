@@ -1,4 +1,4 @@
-﻿// Package testenv provides utilities for managing real local test services (Vault, PKI, etc.).
+// Package testenv provides utilities for managing real local test services (Vault, PKI, etc.).
 package testenv
 
 import (

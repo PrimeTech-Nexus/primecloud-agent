@@ -1,4 +1,4 @@
-﻿// Package backup orchestrates node-level backup artifact packaging, encryption, manifests, and secure upload.
+// Package backup orchestrates node-level backup artifact packaging, encryption, manifests, and secure upload.
 package backup
 
 import (

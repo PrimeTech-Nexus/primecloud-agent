@@ -120,4 +120,3 @@ func TestBackup_VaultManagedKey(t *testing.T) {
 		t.Error("Expected identical key retrieved from Vault KV")
 	}
 }
-
