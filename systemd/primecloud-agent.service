@@ -1,0 +1,35 @@
+[Unit]
+Description=PrimeCloud Privileged Node Agent Daemon
+Documentation=https://docs.primecloud.io/agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/primecloud-agent
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+TimeoutStopSec=30s
+
+# Security Hardening Directives
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+LimitNOFILE=65536
+
+# State and Configuration Directories
+ReadWritePaths=/etc/primecloud /opt/primecloud /var/log/primecloud
+EnvironmentFile=-/etc/primecloud/agent.env
+
+[Install]
+WantedBy=multi-user.target
