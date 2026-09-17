@@ -1,4 +1,4 @@
-package reconciliation_test
+﻿package reconciliation_test
 
 import (
 	"context"
@@ -30,7 +30,7 @@ func (m *mockReconcileServer) Reconcile(ctx context.Context, req *protocol.Recon
 	m.reconcileReq = req
 	return &protocol.ReconcileResponse{
 		DesiredStateJson: m.desiredJSON,
-		HasDrift:         true,
+		HasDrift:         m.desiredJSON != "",
 	}, nil
 }
 
@@ -100,6 +100,71 @@ func TestReconciliation_DiffAndPlan(t *testing.T) {
 	}
 	if actions["app-unmanaged"] != reconciliation.ActionRemove {
 		t.Errorf("Expected ActionRemove for app-unmanaged, got %v", actions["app-unmanaged"])
+	}
+}
+
+func TestReconciliation_NoDrift(t *testing.T) {
+	desired := &state.DesiredState{
+		Version: 1,
+		NodeID:  "node-1",
+		Workloads: map[string]state.WorkloadSpec{
+			"app-1": {
+				ID:     "app-1",
+				Image:  "nginx:alpine",
+				Status: "RUNNING",
+			},
+		},
+	}
+
+	actual := &state.ActualState{
+		NodeID: "node-1",
+		Workloads: map[string]state.ActualWorkload{
+			"app-1": {
+				ID:          "app-1",
+				ContainerID: "cid-app1",
+				Image:       "nginx:alpine",
+				State:       "running",
+			},
+		},
+	}
+
+	drifts := state.Diff(desired, actual)
+	if len(drifts) != 0 {
+		t.Fatalf("Expected 0 drift items when in sync, got %d", len(drifts))
+	}
+
+	repairs := reconciliation.PlanRepairs(drifts, desired, actual)
+	if len(repairs) != 0 {
+		t.Fatalf("Expected 0 repairs planned when in sync, got %d", len(repairs))
+	}
+}
+
+func TestReconciliation_UnauthorizedBlocked(t *testing.T) {
+	// Unauthorized/unsolicited repair blocking: when control plane specifies no workloads or nil desired state
+	actual := &state.ActualState{
+		NodeID: "node-1",
+		Workloads: map[string]state.ActualWorkload{
+			"app-local": {
+				ID:          "app-local",
+				ContainerID: "cid-app-local",
+				Image:       "nginx:alpine",
+				State:       "running",
+			},
+		},
+	}
+
+	// Nil desired state -> no repairs should be planned without control plane directive
+	drifts := state.Diff(nil, actual)
+	if len(drifts) != 1 {
+		t.Fatalf("Expected 1 extraneous drift, got %d", len(drifts))
+	}
+
+	// With empty desired state, no auto-deployments can happen
+	repairs := reconciliation.PlanRepairs(drifts, nil, actual)
+	for _, r := range repairs {
+		if r.Action == reconciliation.ActionDeploy {
+			t.Errorf("Unauthorized deploy repair planned without control plane spec")
+		}
 	}
 }
 
