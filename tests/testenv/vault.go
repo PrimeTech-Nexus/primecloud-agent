@@ -160,6 +160,11 @@ func ConfigurePKI(t *testing.T, client *vault.Client) {
 	if err != nil {
 		t.Fatalf("Failed to configure pki_int/roles/agent: %v", err)
 	}
+
+	// 4. Enable kv secrets engine at primecloud
+	_ = raw.Sys().MountWithContext(ctx, "primecloud", &vaultapi.MountInput{
+		Type: "kv",
+	})
 }
 
 func findVaultExe() string {
