@@ -1,4 +1,4 @@
-// Package testenv provides utilities for managing real local test services (Vault, PKI, etc.).
+﻿// Package testenv provides utilities for managing real local test services (Vault, PKI, etc.).
 package testenv
 
 import (
@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,8 @@ const (
 	DefaultVaultAddr  = "http://127.0.0.1:8200"
 	DefaultVaultToken = "root"
 )
+
+var pkiMu sync.Mutex
 
 // EnsureVaultDev ensures a real local Vault dev server is running on 127.0.0.1:8200 with PKI configured.
 func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
@@ -35,7 +38,7 @@ func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
 	client, err := vault.NewClient(vault.Config{
 		Address: addr,
 		Token:   token,
-		Timeout: 3 * time.Second,
+		Timeout: 5 * time.Second,
 	})
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -58,12 +61,6 @@ func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Failed to start real Vault dev server: %v", err)
 	}
-
-	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	})
 
 	// Wait up to 5 seconds for Vault to listen on 127.0.0.1:8200
 	ready := false
@@ -98,10 +95,18 @@ func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
 func ConfigurePKI(t *testing.T, client *vault.Client) {
 	t.Helper()
 
+	pkiMu.Lock()
+	defer pkiMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	raw := client.RawClient()
+
+	// If role agent already exists and KV mounted, configuration is already complete
+	if role, err := raw.Logical().ReadWithContext(ctx, "pki_int/roles/agent"); err == nil && role != nil && role.Data != nil {
+		return
+	}
 
 	// 1. Enable and configure root PKI
 	_ = raw.Sys().MountWithContext(ctx, "pki", &vaultapi.MountInput{
