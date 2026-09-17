@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package primecloud.agent.v1;
+
+option go_package = "github.com/primecloud/primecloud-agent/internal/protocol";
+
+// AgentService defines the bidirectional mTLS communication boundary between Control Plane and Node Agent.
+service AgentService {
+  // Register performs initial node registration and handshake with the Control Plane.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // StreamOperations establishes a bidirectional streaming channel for receiving operations and reporting execution results.
+  rpc StreamOperations(stream OperationResponse) returns (stream OperationEnvelope);
+
+  // SendHeartbeat sends regular health, telemetry, and capacity heartbeats from the Agent.
+  rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // ReportInventory sends full container, network, and storage inventory on the node.
+  rpc ReportInventory(InventoryRequest) returns (InventoryResponse);
+
+  // ReportState sends the current actual state of workloads managed on the node.
+  rpc ReportState(StateRequest) returns (StateResponse);
+
+  // ReportEvent streams structured operational and lifecycle events to the Control Plane.
+  rpc ReportEvent(EventRequest) returns (EventResponse);
+
+  // ReportMetrics streams fine-grained CPU, memory, disk, and network metrics.
+  rpc ReportMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // Reconcile exchanges desired workload state with actual state and drift reports.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+// RegisterRequest contains hardware, kernel, and daemon metadata from the compute node.
+message RegisterRequest {
+  string agent_version = 1;
+  string certificate_cn = 2;
+  string hostname = 3;
+  string os_name = 4;
+  string kernel_version = 5;
+  string docker_version = 6;
+  int32 cpu_cores_total = 7;
+  int64 memory_mb_total = 8;
+  int64 disk_gb_total = 9;
+  map<string, string> labels = 10;
+  int64 timestamp_unix = 11;
+}
+
+// RegisterResponse returns the authoritative IDs and operating parameters from the Control Plane.
+message RegisterResponse {
+  string agent_id = 1;
+  string node_id = 2;
+  bool registered = 3;
+  int32 heartbeat_interval_sec = 4;
+  int32 reconcile_interval_sec = 5;
+  repeated string capabilities = 6;
+  string message = 7;
+}
+
+// OperationEnvelope represents an authoritative typed operation dispatched by the Control Plane.
+message OperationEnvelope {
+  string operation_id = 1;
+  string operation_type = 2;
+  string resource_id = 3;
+  string project_id = 4;
+  string environment_id = 5;
+  string payload_json = 6;
+  int64 created_at_unix = 7;
+  int32 timeout_seconds = 8;
+  bool cancel = 9;
+}
+
+// OperationResponse reports the execution progress, result, and telemetry back to Control Plane.
+message OperationResponse {
+  string operation_id = 1;
+  string status = 2; // PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED
+  string message = 3;
+  string error_code = 4;
+  string result_json = 5;
+  int64 completed_at_unix = 6;
+  int32 progress_percent = 7;
+}
+
+// HeartbeatRequest delivers node status and capacity metrics.
+message HeartbeatRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  double cpu_usage_percent = 3;
+  double memory_usage_percent = 4;
+  double disk_usage_percent = 5;
+  int32 container_count = 6;
+  string health_status = 7; // HEALTHY, DEGRADED, UNHEALTHY
+  int64 sent_at_unix = 8;
+}
+
+// HeartbeatResponse acknowledges receipt and provides directives (e.g. rotation trigger or drain).
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  bool trigger_reconciliation = 2;
+  bool rotate_certificate = 3;
+  bool drain_node = 4;
+  int64 server_time_unix = 5;
+}
+
+// InventoryRequest describes local container and resource allocations.
+message InventoryRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string inventory_json = 3;
+  int64 reported_at_unix = 4;
+}
+
+message InventoryResponse {
+  bool acknowledged = 1;
+}
+
+// StateRequest communicates current active containers and statuses.
+message StateRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string actual_state_json = 3;
+  int64 reported_at_unix = 4;
+}
+
+message StateResponse {
+  bool acknowledged = 1;
+  bool drift_detected = 2;
+}
+
+// EventRequest transmits lifecycle and alert events.
+message EventRequest {
+  string agent_id = 1;
+  string event_type = 2;
+  string severity = 3; // INFO, WARN, ERROR, CRITICAL
+  string message = 4;
+  string metadata_json = 5;
+  int64 occurred_at_unix = 6;
+}
+
+message EventResponse {
+  bool recorded = 1;
+}
+
+// MetricsRequest batches time-series telemetry.
+message MetricsRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string metrics_json = 3;
+  int64 sampled_at_unix = 4;
+}
+
+message MetricsResponse {
+  bool recorded = 1;
+}
+
+// ReconcileRequest provides desired state and queries differences.
+message ReconcileRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string actual_state_json = 3;
+  int64 timestamp_unix = 4;
+}
+
+message ReconcileResponse {
+  string desired_state_json = 1;
+  bool has_drift = 2;
+  repeated string repair_instructions = 3;
+}
