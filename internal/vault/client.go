@@ -3,11 +3,17 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
-	"github.com/primecloud/primecloud-agent/internal/agent"
+)
+
+var (
+	ErrInvalidConfig    = errors.New("invalid vault configuration")
+	ErrVaultUnavailable = errors.New("vault service is unavailable")
+	ErrBootstrapFailed  = errors.New("vault bootstrap failed")
 )
 
 // Client wraps the official HashiCorp Vault API client.
@@ -26,7 +32,7 @@ type Config struct {
 // NewClient initializes a new Vault client and validates connectivity.
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.Address == "" {
-		return nil, fmt.Errorf("%w: vault address is empty", agent.ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: vault address is empty", ErrInvalidConfig)
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
@@ -38,7 +44,7 @@ func NewClient(cfg Config) (*Client, error) {
 
 	c, err := vault.NewClient(vConfig)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to create vault client: %v", agent.ErrVaultUnavailable, err)
+		return nil, fmt.Errorf("%w: failed to create vault client: %v", ErrVaultUnavailable, err)
 	}
 
 	if cfg.Token != "" {
@@ -67,10 +73,10 @@ func (c *Client) SetToken(token string) {
 func (c *Client) IsHealthy(ctx context.Context) (bool, error) {
 	health, err := c.client.Sys().HealthWithContext(ctx)
 	if err != nil {
-		return false, fmt.Errorf("%w: health check error: %v", agent.ErrVaultUnavailable, err)
+		return false, fmt.Errorf("%w: health check error: %v", ErrVaultUnavailable, err)
 	}
 	if !health.Initialized || health.Sealed {
-		return false, fmt.Errorf("%w: vault unready (initialized=%v, sealed=%v)", agent.ErrVaultUnavailable, health.Initialized, health.Sealed)
+		return false, fmt.Errorf("%w: vault unready (initialized=%v, sealed=%v)", ErrVaultUnavailable, health.Initialized, health.Sealed)
 	}
 	return true, nil
 }

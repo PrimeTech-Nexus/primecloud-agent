@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/primecloud/primecloud-agent/internal/agent"
 )
 
 // CertificateBundle holds the issued x509 cert, private key, and CA chain in PEM format.
@@ -29,7 +27,7 @@ func (c *Client) IssueAgentCertificate(ctx context.Context, role, commonName str
 		role = "agent"
 	}
 	if commonName == "" {
-		return nil, fmt.Errorf("%w: common name is required for certificate issuance", agent.ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: common name is required for certificate issuance", ErrInvalidConfig)
 	}
 
 	issuePath := fmt.Sprintf("pki_int/issue/%s", role)
