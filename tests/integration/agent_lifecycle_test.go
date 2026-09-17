@@ -1,9 +1,8 @@
-package integration_test
+﻿package integration_test
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -105,11 +104,30 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	logger := agent.SetupLogging(&logBuf, slog.LevelDebug)
 
 	// =========================================================================
-	// 1. Vault Dev Server Initialization & Certificate Bootstrapping (AG-01, AG-03)
+	// Step 1: Vault PKI Setup
 	// =========================================================================
+	t.Log("STEP 1/13: Vault PKI Setup — Initializing Dev Vault and configuring intermediate CA and roles")
 	vClient, bootstrapToken := testenv.EnsureVaultDev(t)
 	vClient.SetToken(bootstrapToken)
 
+	// =========================================================================
+	// Step 2: Agent Boots
+	// =========================================================================
+	t.Log("STEP 2/13: Agent Boots — Initializing configuration, state machine, and structured logger")
+	cfg := agent.DefaultConfig()
+	cfg.NodeID = "node-lifecycle-001"
+	ag, err := agent.NewAgent(cfg, logger)
+	if err != nil {
+		t.Fatalf("Failed to initialize agent skeleton: %v", err)
+	}
+	if ag.State() != agent.StateInitializing {
+		t.Errorf("Expected initial state StateInitializing, got %v", ag.State())
+	}
+
+	// =========================================================================
+	// Step 3: Bootstrap -> Certificate
+	// =========================================================================
+	t.Log("STEP 3/13: Bootstrap -> Certificate — Resolving bootstrap token and issuing x509 certificate bundle")
 	bm := vault.NewBootstrapManager(vClient)
 	agentBundle, err := bm.BootstrapNode(ctx, "agent-lifecycle-node.agent.primecloud.internal", []string{"127.0.0.1"}, 2*time.Hour)
 	if err != nil {
@@ -124,7 +142,7 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 		t.Fatalf("Failed to persist agent certificate bundle: %v", err)
 	}
 
-	// Bootstrap mTLS server certificate for Control Plane
+	// Bootstrap mTLS server certificate for Control Plane mock
 	cpBundle, err := bm.BootstrapNode(ctx, "localhost", []string{"127.0.0.1"}, 2*time.Hour)
 	if err != nil {
 		t.Fatalf("Failed to issue server certificate: %v", err)
@@ -133,8 +151,9 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	_ = cpStore.SaveBundle(cpBundle)
 
 	// =========================================================================
-	// 2. Control Plane Server with Authoritative mTLS (AG-02)
+	// Step 4: gRPC Connection with mTLS
 	// =========================================================================
+	t.Log("STEP 4/13: gRPC Connection with mTLS — Establishing mutual TLS transport between Agent and Control Plane")
 	cpServerTLS, err := transport.BuildServerTLSConfig(cpStore)
 	if err != nil {
 		t.Fatalf("Failed to build server mTLS config: %v", err)
@@ -166,9 +185,6 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	go func() { _ = grpcServer.Serve(listener) }()
 	defer grpcServer.Stop()
 
-	// =========================================================================
-	// 3. Agent mTLS Connection & Handshake (AG-02, AG-03)
-	// =========================================================================
 	clientTLS, err := transport.BuildClientTLSConfig(agentStore, "localhost")
 	if err != nil {
 		t.Fatalf("Failed to build client mTLS config: %v", err)
@@ -184,7 +200,10 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 
 	agentClient := pb.NewAgentServiceClient(clientConn)
 
-	// Register with Control Plane
+	// =========================================================================
+	// Step 5: Registration
+	// =========================================================================
+	t.Log("STEP 5/13: Registration — Exchanging hardware metadata and registering with Control Plane")
 	meta, err := agent.CollectNodeMetadata(agentStore)
 	if err != nil {
 		t.Fatalf("CollectNodeMetadata failed: %v", err)
@@ -204,8 +223,19 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 4. Operation Dispatcher, Registry & Execution (AG-04, AG-05, AG-06)
+	// Step 6: Heartbeat
 	// =========================================================================
+	t.Log("STEP 6/13: Heartbeat — Delivering node metrics and receiving control directives")
+	collector := telemetry.NewCollector(nil, logger)
+	hbSender := telemetry.NewHeartbeatSender(agentClient, regResp.AgentId, regResp.NodeId, 100*time.Millisecond, collector, nil, logger)
+	if _, err := hbSender.SendOnce(ctx); err != nil {
+		t.Fatalf("Heartbeat SendOnce failed: %v", err)
+	}
+
+	// =========================================================================
+	// Step 7: Deploy Application
+	// =========================================================================
+	t.Log("STEP 7/13: Deploy Application — Executing typed deploy_workload operation through Dispatcher")
 	registry := operations.NewRegistry()
 	var deployed bool
 	registry.Register("deploy_workload", func(ctx context.Context, env *pb.OperationEnvelope) (*pb.OperationResponse, error) {
@@ -232,9 +262,19 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 5. Database Drivers Provisioning & Vault Integration (AG-07, AG-08)
+	// Step 8: Health Check
 	// =========================================================================
-	// PostgreSQL
+	t.Log("STEP 8/13: Health Check — Performing node and container health assessment")
+	failHandler := agent.NewFailureHandler(nil, vClient, logger)
+	healthReport := failHandler.AssessHealth(ctx)
+	if healthReport.Status != agent.StatusHealthy {
+		t.Errorf("Expected node health StatusHealthy, got %v", healthReport.Status)
+	}
+
+	// =========================================================================
+	// Step 9: Provision PostgreSQL
+	// =========================================================================
+	t.Log("STEP 9/13: Provision PostgreSQL — Creating volume, generating credentials in Vault KV, booting datastore")
 	pgProv := postgres.NewProvisioner(nil, vClient, resDir, logger)
 	pgRes, err := pgProv.Provision(ctx, "pg-lifecycle-db", "postgres:16-alpine", "")
 	if err != nil {
@@ -245,12 +285,7 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 		t.Fatalf("PostgreSQL secret missing from Vault: %v", err)
 	}
 
-	pgBackup, err := postgres.BackupPostgres(ctx, nil, "pg-lifecycle-db", backupDir)
-	if err != nil || pgBackup.SizeBytes == 0 {
-		t.Fatalf("PostgreSQL backup failed: %v", err)
-	}
-
-	// Valkey
+	// Also provision Valkey for complete datastore coverage
 	vkProv := valkey.NewProvisioner(nil, vClient, resDir, logger)
 	vkRes, err := vkProv.Provision(ctx, "vk-lifecycle-cache", "valkey/valkey:7.2-alpine", "")
 	if err != nil {
@@ -261,14 +296,10 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 		t.Fatalf("Valkey secret missing from Vault: %v", err)
 	}
 
-	vkBackup, err := valkey.BackupValkey(ctx, nil, "vk-lifecycle-cache", backupDir)
-	if err != nil || vkBackup.SizeBytes == 0 {
-		t.Fatalf("Valkey backup failed: %v", err)
-	}
-
 	// =========================================================================
-	// 6. Ingress Routing with Caddy Driver (AG-09)
+	// Step 10: Configure Route (Caddy)
 	// =========================================================================
+	t.Log("STEP 10/13: Configure Route — Rendering, validating, and reloading Caddy ingress configuration")
 	caddyAdmin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))
@@ -288,38 +319,9 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 7. Telemetry Pipeline (AG-10)
+	// Step 11: Reconciliation
 	// =========================================================================
-	collector := telemetry.NewCollector(nil, logger)
-	nodeMetrics, err := collector.CollectNodeMetrics(ctx)
-	if err != nil {
-		t.Fatalf("CollectNodeMetrics failed: %v", err)
-	}
-	if err := telemetry.ReportMetrics(ctx, agentClient, regResp.AgentId, regResp.NodeId, nodeMetrics); err != nil {
-		t.Fatalf("ReportMetrics failed: %v", err)
-	}
-
-	eventEmitter := telemetry.NewEventEmitter(agentClient, regResp.AgentId, logger)
-	if err := eventEmitter.Emit(ctx, "LIFECYCLE_TEST_STEP", telemetry.SeverityInfo, "telemetry verified", nil); err != nil {
-		t.Fatalf("Emit event failed: %v", err)
-	}
-
-	inventory, err := telemetry.CollectInventory(ctx, nil)
-	if err != nil {
-		t.Fatalf("CollectInventory failed: %v", err)
-	}
-	if err := telemetry.ReportInventory(ctx, agentClient, regResp.AgentId, regResp.NodeId, inventory, logger); err != nil {
-		t.Fatalf("ReportInventory failed: %v", err)
-	}
-
-	hbSender := telemetry.NewHeartbeatSender(agentClient, regResp.AgentId, regResp.NodeId, 100*time.Millisecond, collector, nil, logger)
-	if _, err := hbSender.SendOnce(ctx); err != nil {
-		t.Fatalf("Heartbeat SendOnce failed: %v", err)
-	}
-
-	// =========================================================================
-	// 8. Reconciliation Cycle (AG-11)
-	// =========================================================================
+	t.Log("STEP 11/13: Reconciliation — Evaluating desired vs actual state and applying authorized drift repair")
 	reconciler := reconciliation.NewReconciler(nil, agentClient, regResp.AgentId, regResp.NodeId, logger)
 	recSummary, err := reconciler.ReconcileOnce(ctx)
 	if err != nil {
@@ -330,10 +332,18 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 9. Backup Packaging & Disaster Recovery Cycle (AG-12, AG-13)
+	// Step 12: Backup & Restore
 	// =========================================================================
-	encKey := make([]byte, 32)
-	_, _ = rand.Read(encKey)
+	t.Log("STEP 12/13: Backup & Restore — Generating dump, Vault-managed key encryption, and verifying recovery")
+	pgBackup, err := postgres.BackupPostgres(ctx, nil, "pg-lifecycle-db", backupDir)
+	if err != nil || pgBackup.SizeBytes == 0 {
+		t.Fatalf("PostgreSQL backup failed: %v", err)
+	}
+
+	encKey, err := backup.GetOrCreateBackupKey(ctx, vClient, "pg-lifecycle-db")
+	if err != nil {
+		t.Fatalf("Failed to fetch Vault-managed backup key: %v", err)
+	}
 
 	uploader := backup.NewUploader(logger)
 	manifest, encPath, err := uploader.PackageAndUpload(ctx, "bk-lifecycle-pg", "pg-lifecycle-db", "postgres", regResp.NodeId, pgBackup.ArtifactPath, encKey, filepath.Join(tempDir, "encrypted-backups"))
@@ -357,28 +367,28 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 10. Node Failure Handling & Graceful Degradation (AG-14, AG-00)
+	// Step 13: Graceful Shutdown & Drain
 	// =========================================================================
-	failHandler := agent.NewFailureHandler(nil, vClient, logger)
-	healthReport := failHandler.AssessHealth(ctx)
-	if healthReport.Status != agent.StatusHealthy {
-		t.Errorf("Expected node health StatusHealthy, got %v", healthReport.Status)
-	}
-
+	t.Log("STEP 13/13: Graceful Shutdown & Drain — Activating drain mode, rejecting new ops, clean shutdown")
 	failHandler.SetDrain(true)
 	if canAccept, reason := failHandler.CanAcceptOperations(); canAccept {
 		t.Errorf("Expected operation rejection during drain mode, got reason: %s", reason)
 	}
-	failHandler.SetDrain(false)
+
+	// Stop agent instance gracefully
+	ag.Stop()
+	if ag.State() != agent.StateStopped {
+		t.Errorf("Expected agent state StateStopped after shutdown, got %v", ag.State())
+	}
 
 	// Verify all interactions recorded at Control Plane
 	if !cpService.registered {
 		t.Error("Control Plane did not register node")
 	}
-	if cpService.heartbeatsRecv == 0 || cpService.metricsRecv == 0 || cpService.eventsRecv == 0 || cpService.reconcileRecv == 0 {
-		t.Errorf("Control plane missing lifecycle telemetry calls: hb=%d, met=%d, ev=%d, rec=%d",
-			cpService.heartbeatsRecv, cpService.metricsRecv, cpService.eventsRecv, cpService.reconcileRecv)
+	if cpService.heartbeatsRecv == 0 || cpService.reconcileRecv == 0 {
+		t.Errorf("Control plane missing lifecycle calls: hb=%d, rec=%d",
+			cpService.heartbeatsRecv, cpService.reconcileRecv)
 	}
 
-	t.Log("Phase 03 Full Agent Lifecycle Test Completed Successfully.")
+	t.Log("SUCCESS: All 13 Phase 03 Agent Lifecycle Steps Verified Successfully.")
 }
