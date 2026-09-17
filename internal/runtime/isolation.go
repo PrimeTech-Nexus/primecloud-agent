@@ -33,6 +33,7 @@ func DefaultHardenedProfile() *HardenedIsolationProfile {
 		SecurityOpts: []string{
 			"no-new-privileges:true",
 			"apparmor=docker-default",
+			"seccomp=builtin",
 		},
 		User:               "1000:1000",
 		ReadOnlyRootfs:     false,
