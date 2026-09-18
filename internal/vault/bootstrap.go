@@ -49,11 +49,23 @@ func ResolveBootstrapToken(tokenFromConfig, tokenFilePath string) (string, error
 	return token, nil
 }
 
-// BootstrapNode authenticates with Vault and requests the initial certificate bundle with IP and URI SANs.
-func (b *BootstrapManager) BootstrapNode(ctx context.Context, commonName string, ipSANs []string, uriSANs []string, ttl time.Duration) (*CertificateBundle, error) {
+// BootstrapNode authenticates with Vault and requests the initial certificate bundle with IP and optional URI SANs.
+func (b *BootstrapManager) BootstrapNode(ctx context.Context, commonName string, ipSANs []string, args ...interface{}) (*CertificateBundle, error) {
 	healthy, err := b.client.IsHealthy(ctx)
 	if err != nil || !healthy {
 		return nil, fmt.Errorf("%w: cannot bootstrap, vault is unhealthy: %v", ErrVaultUnavailable, err)
+	}
+
+	var uriSANs []string
+	var ttl time.Duration = 720 * time.Hour
+
+	for _, arg := range args {
+		switch v := arg.(type) {
+		case []string:
+			uriSANs = v
+		case time.Duration:
+			ttl = v
+		}
 	}
 
 	bundle, err := b.client.IssueAgentCertificate(ctx, "agent", commonName, ipSANs, uriSANs, ttl)

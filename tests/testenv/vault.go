@@ -103,8 +103,19 @@ func ConfigurePKI(t *testing.T, client *vault.Client) {
 
 	raw := client.RawClient()
 
-	// If role agent already exists and KV mounted, configuration is already complete
+	// If role agent already exists and KV mounted, ensure URI SANs are configured and return
 	if role, err := raw.Logical().ReadWithContext(ctx, "pki_int/roles/agent"); err == nil && role != nil && role.Data != nil {
+		_, _ = raw.Logical().WriteWithContext(ctx, "pki_int/roles/agent", map[string]interface{}{
+			"allowed_domains":    "primecloud.internal,agent.primecloud.internal,localhost,127.0.0.1",
+			"allow_subdomains":   true,
+			"allow_bare_domains": true,
+			"allow_localhost":    true,
+			"allow_ip_sans":      true,
+			"allowed_uri_sans":   "primecloud://agent/node/*,primecloud://agent/*",
+			"allow_any_name":     true,
+			"max_ttl":            "720h",
+			"ttl":                "24h",
+		})
 		return
 	}
 
@@ -159,6 +170,8 @@ func ConfigurePKI(t *testing.T, client *vault.Client) {
 		"allow_bare_domains": true,
 		"allow_localhost":    true,
 		"allow_ip_sans":      true,
+		"allowed_uri_sans":   "primecloud://agent/node/*,primecloud://agent/*",
+		"allow_any_name":     true,
 		"max_ttl":            "720h",
 		"ttl":                "24h",
 	})
