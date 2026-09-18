@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/docker/docker v26.1.5+incompatible
-	github.com/docker/go-connections v0.5.0
+	github.com/docker/go-connections v0.8.1
 	github.com/hashicorp/vault/api v1.23.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
