@@ -58,7 +58,14 @@ func (r *RotationManager) CheckAndRotate(ctx context.Context, ttl time.Duration)
 		ipSANs = append(ipSANs, ip.String())
 	}
 
-	newBundle, err := r.vaultClient.IssueAgentCertificate(ctx, r.role, commonName, ipSANs, ttl)
+	uriSANs := make([]string, 0, len(cert.URIs))
+	for _, u := range cert.URIs {
+		if u != nil {
+			uriSANs = append(uriSANs, u.String())
+		}
+	}
+
+	newBundle, err := r.vaultClient.IssueAgentCertificate(ctx, r.role, commonName, ipSANs, uriSANs, ttl)
 	if err != nil {
 		return false, fmt.Errorf("failed to issue renewal certificate from vault: %w", err)
 	}

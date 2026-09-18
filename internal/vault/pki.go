@@ -21,8 +21,8 @@ type CertificateBundle struct {
 	ParsedCert     *x509.Certificate
 }
 
-// IssueAgentCertificate requests a client/server TLS certificate from Vault PKI.
-func (c *Client) IssueAgentCertificate(ctx context.Context, role, commonName string, ipSANs []string, ttl time.Duration) (*CertificateBundle, error) {
+// IssueAgentCertificate requests a client/server TLS certificate from Vault PKI with optional IP and URI SANs.
+func (c *Client) IssueAgentCertificate(ctx context.Context, role, commonName string, ipSANs []string, uriSANs []string, ttl time.Duration) (*CertificateBundle, error) {
 	if role == "" {
 		role = "agent"
 	}
@@ -36,6 +36,9 @@ func (c *Client) IssueAgentCertificate(ctx context.Context, role, commonName str
 	}
 	if len(ipSANs) > 0 {
 		reqData["ip_sans"] = ipSANs
+	}
+	if len(uriSANs) > 0 {
+		reqData["uri_sans"] = uriSANs
 	}
 	if ttl > 0 {
 		reqData["ttl"] = ttl.String()

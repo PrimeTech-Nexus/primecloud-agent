@@ -184,7 +184,7 @@ func TestChunkA_Integration(t *testing.T) {
 
 	// 8. Certificate rotation
 	rotMgr := identity.NewRotationManager(store, vClient, "agent", logger)
-	newCertBundle, err := vClient.IssueAgentCertificate(ctx, "agent", "agent-node-chunk-a.agent.primecloud.internal", []string{"127.0.0.1"}, 2*time.Hour)
+	newCertBundle, err := vClient.IssueAgentCertificate(ctx, "agent", "agent-node-chunk-a.agent.primecloud.internal", []string{"127.0.0.1"}, []string{"primecloud://agent/node/001"}, 2*time.Hour)
 	if err != nil {
 		t.Fatalf("Issue renewal certificate failed: %v", err)
 	}

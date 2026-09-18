@@ -167,7 +167,7 @@ func TestCertificateRotation(t *testing.T) {
 
 	// Issue an almost-expired cert or manually test rotation logic
 	// Force new issue via Vault client to verify rotate execution
-	newBundle, err := vClient.IssueAgentCertificate(ctx, "agent", "agent-node-rot.agent.primecloud.internal", []string{"127.0.0.1"}, 2*time.Hour)
+	newBundle, err := vClient.IssueAgentCertificate(ctx, "agent", "agent-node-rot.agent.primecloud.internal", []string{"127.0.0.1"}, []string{"primecloud://agent/node/001"}, 2*time.Hour)
 	if err != nil {
 		t.Fatalf("Manual issue renewal failed: %v", err)
 	}

@@ -143,3 +143,42 @@ func (s *CertificateStore) CertPaths() (string, string, string) {
 		filepath.Join(s.baseDir, KeyFileName),
 		filepath.Join(s.baseDir, CAFileName)
 }
+
+// ExtractNodeURI extracts the authoritative URI SAN in the format primecloud://agent/node/<node-id>.
+func ExtractNodeURI(cert *x509.Certificate) (string, error) {
+	if cert == nil {
+		return "", errors.New("cannot extract URI from nil certificate")
+	}
+	for _, uri := range cert.URIs {
+		if uri != nil && len(uri.String()) > 0 {
+			uriStr := uri.String()
+			if filepath.Clean(uriStr) != "" && (uri.Scheme == "primecloud" && uri.Host == "agent") {
+				return uriStr, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no valid primecloud://agent/node/<node-id> URI SAN found in certificate")
+}
+
+// ValidateNodeIdentity verifies that the certificate contains the expected node URI and is valid.
+func ValidateNodeIdentity(cert *x509.Certificate, expectedNodeID string) error {
+	if cert == nil {
+		return errors.New("cannot validate nil certificate")
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return errors.New("certificate not yet valid")
+	}
+	if now.After(cert.NotAfter) {
+		return errors.New("certificate has expired")
+	}
+	uri, err := ExtractNodeURI(cert)
+	if err != nil {
+		return err
+	}
+	expectedURI := fmt.Sprintf("primecloud://agent/node/%s", expectedNodeID)
+	if uri != expectedURI {
+		return fmt.Errorf("certificate URI identity mismatch: got %s, expected %s", uri, expectedURI)
+	}
+	return nil
+}
