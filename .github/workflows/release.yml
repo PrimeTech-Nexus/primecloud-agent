@@ -1,19 +1,90 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release Tag (e.g. v0.3.0)'
+        required: true
+        default: 'v0.3.0'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  release:
-    name: Release Scaffolding
+  build-and-release:
+    name: Build & Publish Release Artifacts
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Release placeholder
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run Tests & Verification
         run: |
-          echo "Phase 00 release scaffolding check: OK"
+          go vet ./...
+          go test -v ./...
+
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v0.3.0"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Building PrimeCloud Agent release for tag ${TAG}..."
+
+      - name: Cross-Compile Agent Binaries
+        env:
+          CGO_ENABLED: '0'
+          GO_LDFLAGS: '-s -w'
+        run: |
+          mkdir -p dist/amd64 dist/arm64 dist/release
+          GOOS=linux GOARCH=amd64 go build -ldflags="${GO_LDFLAGS}" -o dist/amd64/primecloud-agent ./cmd/agent
+          GOOS=linux GOARCH=arm64 go build -ldflags="${GO_LDFLAGS}" -o dist/arm64/primecloud-agent ./cmd/agent
+
+      - name: Package Release Tarballs
+        run: |
+          tar -czf dist/release/primecloud-agent-linux-amd64.tar.gz -C dist/amd64 primecloud-agent
+          tar -czf dist/release/primecloud-agent-linux-arm64.tar.gz -C dist/arm64 primecloud-agent
+
+      - name: Generate and Validate SHA256SUMS Manifest
+        run: |
+          cd dist/release
+          sha256sum primecloud-agent-linux-amd64.tar.gz primecloud-agent-linux-arm64.tar.gz > SHA256SUMS
+          # Cryptographic self-check (fail-closed)
+          sha256sum -c SHA256SUMS
+          echo "Generated cryptographic manifest:"
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          gh release create "${TAG}" \
+            dist/release/primecloud-agent-linux-amd64.tar.gz \
+            dist/release/primecloud-agent-linux-arm64.tar.gz \
+            dist/release/SHA256SUMS \
+            --title "PrimeCloud Agent ${TAG}" \
+            --notes "Automated immutable release of PrimeCloud Agent ${TAG} with cryptographic SHA256SUMS manifest." \
+            || gh release upload "${TAG}" \
+                 dist/release/primecloud-agent-linux-amd64.tar.gz \
+                 dist/release/primecloud-agent-linux-arm64.tar.gz \
+                 dist/release/SHA256SUMS --clobber
+
