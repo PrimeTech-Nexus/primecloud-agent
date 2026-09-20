@@ -54,7 +54,7 @@ credentials.json
 
 # Logs
 *.log
-logs/
+/logs/
 
 # Local test artifacts
 tmp/

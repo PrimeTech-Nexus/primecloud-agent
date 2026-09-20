@@ -8,6 +8,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/primecloud/primecloud-agent/internal/logs"
+	"github.com/primecloud/primecloud-agent/internal/metrics"
 )
 
 // State represents the runtime state of the Agent daemon.
@@ -24,14 +27,16 @@ const (
 
 // Agent represents the privileged PrimeCloud Agent daemon running on a compute node.
 type Agent struct {
-	cfg       *Config
-	logger    *slog.Logger
-	state     atomic.Value
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	stopOnce  sync.Once
-	startTime time.Time
+	cfg              *Config
+	logger           *slog.Logger
+	state            atomic.Value
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	stopOnce         sync.Once
+	startTime        time.Time
+	metricsCollector *metrics.Collector
+	logHarvester     *logs.Harvester
 }
 
 // NewAgent constructs a new Agent daemon instance.
@@ -49,6 +54,24 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		startTime: time.Now(),
 	}
 	a.state.Store(StateInitializing)
+
+	// Initialize continuous telemetry routines
+	a.metricsCollector = metrics.NewCollector(
+		15*time.Second,
+		cfg.NodeID,
+		cfg.AgentID,
+		nil, // container runtime initialized when active
+		nil, // gRPC client bound upon Control Plane registration
+		a.logger,
+	)
+	a.logHarvester = logs.NewHarvester(
+		nil,
+		cfg.ControlPlaneURL,
+		100,
+		5*time.Second,
+		a.logger,
+	)
+
 	return a, nil
 }
 
@@ -61,6 +84,22 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		"cert_dir", a.cfg.CertDir,
 		"log_level", a.cfg.LogLevel.String(),
 	)
+
+	// Boot background telemetry collector routines
+	if a.metricsCollector != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.metricsCollector.Start(a.ctx)
+		}()
+	}
+	if a.logHarvester != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.logHarvester.Start(a.ctx)
+		}()
+	}
 
 	a.state.Store(StateReady)
 	a.logger.Info("primecloud_agent_ready", "state", string(StateReady))
