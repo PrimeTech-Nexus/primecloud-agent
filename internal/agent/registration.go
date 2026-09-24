@@ -4,8 +4,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
-	"runtime"
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/identity"
@@ -27,29 +25,7 @@ type NodeMetadata struct {
 
 // CollectNodeMetadata gathers host and daemon properties for registration.
 func CollectNodeMetadata(store *identity.CertificateStore) (*NodeMetadata, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown-host"
-	}
-
-	meta := &NodeMetadata{
-		Hostname:      hostname,
-		OSName:        runtime.GOOS,
-		KernelVersion: runtime.Version(),
-		DockerVersion: "unknown",
-		CPUCoresTotal: int32(runtime.NumCPU()),
-		MemoryMBTotal: 16384, // Baseline detected memory
-		DiskGBTotal:   250,   // Baseline detected disk
-	}
-
-	if store != nil {
-		cert, err := store.LoadParsedCertificate()
-		if err == nil && cert != nil {
-			meta.CertificateCN = cert.Subject.CommonName
-		}
-	}
-
-	return meta, nil
+	return ProbeHostMetadata(store, nil), nil
 }
 
 // RegistrationManager orchestrates node registration with the Control Plane.
