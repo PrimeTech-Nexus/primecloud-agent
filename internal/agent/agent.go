@@ -9,8 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/primecloud/primecloud-agent/internal/applications"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
+	"github.com/primecloud/primecloud-agent/internal/operations"
+	pb "github.com/primecloud/primecloud-agent/internal/protocol"
+	"github.com/primecloud/primecloud-agent/internal/runtime"
+	"github.com/primecloud/primecloud-agent/internal/transport"
+	"github.com/primecloud/primecloud-agent/internal/vault"
 )
 
 // State represents the runtime state of the Agent daemon.
@@ -37,6 +43,9 @@ type Agent struct {
 	startTime        time.Time
 	metricsCollector *metrics.Collector
 	logHarvester     *logs.Harvester
+	dispatcher       *operations.Dispatcher
+	valkeyConsumer   *transport.ValkeyConsumer
+	runtime          runtime.ContainerRuntime
 }
 
 // NewAgent constructs a new Agent daemon instance.
@@ -55,17 +64,139 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}
 	a.state.Store(StateInitializing)
 
+	// Initialize Container Runtime
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		a.logger.Warn("docker_runtime_init_warning", "error", err)
+	}
+	a.runtime = rt
+
+	// Initialize Vault client if specified
+	var vaultClient *vault.Client
+	if cfg.VaultAddr != "" {
+		vClient, err := vault.NewClient(vault.Config{
+			Address: cfg.VaultAddr,
+			Token:   cfg.BootstrapToken,
+		})
+		if err != nil {
+			a.logger.Warn("vault_client_init_warning", "error", err)
+		} else {
+			vaultClient = vClient
+		}
+	}
+
+	// Build Operation Dispatcher with registered handlers
+	deployer := applications.NewDeployer(rt, vaultClient, a.logger)
+	registry := operations.NewRegistry()
+
+	// 1. deploy_application
+	registry.Register("deploy_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		appID := op.ResourceId
+		if appID == "" {
+			appID = op.OperationId
+		}
+		instanceID := op.OperationId
+
+		containerID, err := deployer.Deploy(ctx, op.ProjectId, op.EnvironmentId, appID, instanceID, op.PayloadJson)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DEPLOYMENT_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"RUNNING","node_id":%q}`, containerID, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("Application container %s started successfully", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	// 2. restart_application
+	registry.Register("restart_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		containerID := op.ResourceId
+		if err := applications.RestartApplication(ctx, rt, containerID, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTART_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Application container %s restarted successfully", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 3. remove_application
+	registry.Register("remove_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		containerID := op.ResourceId
+		if err := applications.RemoveApplication(ctx, rt, containerID, true); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "REMOVE_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Application container %s removed successfully", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 4. health_check_application
+	registry.Register("health_check_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		containerID := op.ResourceId
+		if err := applications.WaitForContainerReady(ctx, rt, containerID, 10*time.Second); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "HEALTH_CHECK_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Application container %s is healthy", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	locks := operations.NewLockManager()
+	idempotency := operations.NewIdempotencyTracker(24 * time.Hour)
+	a.dispatcher = operations.NewDispatcher(registry, locks, idempotency, a.logger)
+
+	// Initialize Valkey Queue Consumer
+	a.valkeyConsumer = transport.NewValkeyConsumer(cfg.QueueURL, cfg.NodeID, a.dispatcher, a.logger)
+
 	// Initialize continuous telemetry routines
 	a.metricsCollector = metrics.NewCollector(
 		15*time.Second,
 		cfg.NodeID,
 		cfg.AgentID,
-		nil, // container runtime initialized when active
-		nil, // gRPC client bound upon Control Plane registration
+		rt,
+		nil,
 		a.logger,
 	)
 	a.logHarvester = logs.NewHarvester(
-		nil,
+		rt,
 		cfg.ControlPlaneURL,
 		100,
 		5*time.Second,
@@ -79,11 +210,22 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 func (a *Agent) Start(parentCtx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(parentCtx)
 	a.logger.Info("primecloud_agent_starting",
+		"node_id", a.cfg.NodeID,
+		"queue_url", a.cfg.QueueURL,
 		"control_plane_url", a.cfg.ControlPlaneURL,
 		"vault_addr", a.cfg.VaultAddr,
 		"cert_dir", a.cfg.CertDir,
 		"log_level", a.cfg.LogLevel.String(),
 	)
+
+	// Boot background Valkey Queue Consumer routine
+	if a.valkeyConsumer != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			_ = a.valkeyConsumer.Start(a.ctx)
+		}()
+	}
 
 	// Boot background telemetry collector routines
 	if a.metricsCollector != nil {

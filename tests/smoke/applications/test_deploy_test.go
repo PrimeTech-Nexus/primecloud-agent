@@ -37,6 +37,7 @@ func TestApplications_SecretResolutionAndDeploy(t *testing.T) {
 
 	// 2. Test Deploy validation (checks payload parsing & secret resolution)
 	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/test-app-1:latest",
 		"image_digest": "sha256:ba88008889163273e5bf0cb33cc9bf1e6878b6ee1789c021b0337c767f407b46",
 		"env": {
 			"NODE_ENV": "production"
@@ -85,6 +86,12 @@ func TestApplications_PayloadParsing(t *testing.T) {
 	_, err := deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", `{"ports": {"80": "80"}}`)
 	if err == nil {
 		t.Error("Expected error when image is missing")
+	}
+
+	// Bare sha256 digest should return explicit error
+	_, err = deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", `{"image_digest": "sha256:ba88008889163273e5bf0cb33cc9bf1e6878b6ee1789c021b0337c767f407b46"}`)
+	if err == nil {
+		t.Error("Expected error when bare sha256 digest is provided without canonical image reference")
 	}
 
 	// Invalid JSON should return error

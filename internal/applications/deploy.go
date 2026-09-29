@@ -15,8 +15,8 @@ import (
 
 // DeployPayload defines the JSON payload schema for deploy_application operations.
 type DeployPayload struct {
-	ImageDigest      string                  `json:"image_digest"`
 	Image            string                  `json:"image"`
+	ImageDigest      string                  `json:"image_digest"`
 	Env              map[string]string       `json:"env"`
 	SecretRefs       map[string]string       `json:"secret_refs"` // ENV_VAR_NAME -> "path/in/vault#key"
 	Ports            map[string]string       `json:"ports"`
@@ -56,13 +56,24 @@ func (d *Deployer) Deploy(
 		return "", fmt.Errorf("failed to parse deploy payload: %w", err)
 	}
 
-	imageToRun := payload.ImageDigest
-	if imageToRun == "" {
-		imageToRun = payload.Image
+	// Canonical image resolution
+	imageToPull := strings.TrimSpace(payload.Image)
+	if strings.HasPrefix(imageToPull, "sha256:") {
+		imageToPull = ""
 	}
-	if imageToRun == "" {
-		return "", fmt.Errorf("either image_digest or image must be provided")
+
+	if imageToPull == "" {
+		trimmedDigest := strings.TrimSpace(payload.ImageDigest)
+		if trimmedDigest != "" && !strings.HasPrefix(trimmedDigest, "sha256:") {
+			imageToPull = trimmedDigest
+		}
 	}
+
+	if imageToPull == "" {
+		return "", fmt.Errorf("invalid image reference: bare sha256 digest is not pullable; canonical registry reference required")
+	}
+
+	imageToRun := imageToPull
 
 	d.logger.Info("application_deploy_starting",
 		"project_id", projectID,
@@ -87,7 +98,19 @@ func (d *Deployer) Deploy(
 		}
 	}
 
-	// 2. Prepare container config
+	if d.rt == nil {
+		return "", fmt.Errorf("container runtime is not configured")
+	}
+
+	// 2. Pull container image before creation
+	d.logger.Info("docker_image_pulling", "image", imageToPull)
+	if err := d.rt.PullImage(ctx, imageToPull); err != nil {
+		d.logger.Error("docker_image_pull_failed", "image", imageToPull, "error", err)
+		return "", fmt.Errorf("failed to pull docker image %s: %w", imageToPull, err)
+	}
+	d.logger.Info("docker_image_pulled", "image", imageToPull)
+
+	// 3. Prepare container config
 	containerName := fmt.Sprintf("pc-app-%s-%s", appID, instanceID)
 	if instanceID == "" {
 		containerName = fmt.Sprintf("pc-app-%s", appID)
@@ -114,11 +137,7 @@ func (d *Deployer) Deploy(
 
 	profile := runtime.DefaultHardenedProfile()
 
-	if d.rt == nil {
-		return "", fmt.Errorf("container runtime is not configured")
-	}
-
-	// 3. Create Container
+	// 4. Create Container
 	containerID, err := d.rt.CreateContainer(ctx, cfg, limits, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to create application container: %w", err)

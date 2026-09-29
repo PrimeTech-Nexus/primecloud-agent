@@ -16,6 +16,7 @@ type Config struct {
 	NodeID              string        `json:"node_id"`
 	AgentID             string        `json:"agent_id"`
 	ControlPlaneURL     string        `json:"control_plane_url"`
+	QueueURL            string        `json:"queue_url"`
 	VaultAddr           string        `json:"vault_addr"`
 	BootstrapToken      string        `json:"-"` // Never serialized in JSON
 	CertDir             string        `json:"cert_dir"`
@@ -29,15 +30,18 @@ type Config struct {
 
 // String implements fmt.Stringer to ensure secrets are never leaked in string formatting.
 func (c *Config) String() string {
-	return fmt.Sprintf("Config{NodeID:%s, AgentID:%s, ControlPlaneURL:%s, VaultAddr:%s, CertDir:%s, ResourceDir:%s, HeartbeatInterval:%v, LogLevel:%v, DockerHost:%s}",
-		c.NodeID, c.AgentID, c.ControlPlaneURL, c.VaultAddr, c.CertDir, c.ResourceDir, c.HeartbeatInterval, c.LogLevel, c.DockerHost)
+	return fmt.Sprintf("Config{NodeID:%s, AgentID:%s, ControlPlaneURL:%s, QueueURL:%s, VaultAddr:%s, CertDir:%s, ResourceDir:%s, HeartbeatInterval:%v, LogLevel:%v, DockerHost:%s}",
+		c.NodeID, c.AgentID, c.ControlPlaneURL, c.QueueURL, c.VaultAddr, c.CertDir, c.ResourceDir, c.HeartbeatInterval, c.LogLevel, c.DockerHost)
 }
 
 // DefaultConfig returns baseline configuration defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		ConfigFile:          "/etc/primecloud/agent.yaml",
+		NodeID:              "0191c001-0000-7000-8000-000000000001",
+		AgentID:             "agent-node-0191c001-0000-7000-8000-000000000001",
 		ControlPlaneURL:     "127.0.0.1:50051",
+		QueueURL:            "127.0.0.1:6379",
 		VaultAddr:           "http://127.0.0.1:8200",
 		CertDir:             "/etc/primecloud/agent",
 		ResourceDir:         "/opt/primecloud/resources",
@@ -67,6 +71,15 @@ func LoadConfig() (*Config, error) {
 	}
 	if v := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL"); v != "" {
 		cfg.ControlPlaneURL = v
+	}
+	if v := os.Getenv("PRIMECLOUD_QUEUE_URL"); v != "" {
+		cfg.QueueURL = v
+	} else if v := os.Getenv("PRIMECLOUD_AGENT_QUEUE_URL"); v != "" {
+		cfg.QueueURL = v
+	} else if v := os.Getenv("VALKEY_URL"); v != "" {
+		cfg.QueueURL = v
+	} else if v := os.Getenv("REDIS_URL"); v != "" {
+		cfg.QueueURL = v
 	}
 	if v := os.Getenv("VAULT_ADDR"); v != "" {
 		cfg.VaultAddr = v

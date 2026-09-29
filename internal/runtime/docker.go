@@ -3,8 +3,13 @@ package runtime
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -16,6 +21,7 @@ import (
 // ContainerRuntime specifies the abstraction contract for container lifecycle on compute nodes.
 type ContainerRuntime interface {
 	PullImage(ctx context.Context, imageRef string) error
+	PullImageWithAuth(ctx context.Context, imageRef string, authBase64 string) error
 	CreateContainer(ctx context.Context, cfg *ContainerConfig, limits *ResourceLimits, profile *HardenedIsolationProfile) (string, error)
 	StartContainer(ctx context.Context, containerID string) error
 	StopContainer(ctx context.Context, containerID string, timeoutSec *int) error
@@ -52,14 +58,90 @@ func (d *DockerRuntime) Ping(ctx context.Context) error {
 	return err
 }
 
+type authConfig struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// GetGHCRAuth resolves GitHub Container Registry credentials from environment, credential files, or docker config.
+func GetGHCRAuth() string {
+	u := os.Getenv("GHCR_USERNAME")
+	p := os.Getenv("GHCR_TOKEN")
+	if p == "" {
+		p = os.Getenv("GITHUB_TOKEN")
+	}
+
+	// Fallback 1: check provisioned GitHub artifact token file on production node
+	if p == "" {
+		if tokenBytes, err := os.ReadFile("/etc/primecloud/credentials/github_artifact_token"); err == nil {
+			tok := strings.TrimSpace(string(tokenBytes))
+			if tok != "" {
+				p = tok
+				if u == "" {
+					u = "x-access-token"
+				}
+			}
+		}
+	}
+
+	// Fallback 2: check host ~/.docker/config.json or /root/.docker/config.json
+	if p == "" {
+		dockerConfigPath := "/root/.docker/config.json"
+		if home, err := os.UserHomeDir(); err == nil {
+			userConfig := filepath.Join(home, ".docker", "config.json")
+			if _, err := os.Stat(userConfig); err == nil {
+				dockerConfigPath = userConfig
+			}
+		}
+		if data, err := os.ReadFile(dockerConfigPath); err == nil {
+			var cfg struct {
+				Auths map[string]struct {
+					Auth string `json:"auth"`
+				} `json:"auths"`
+			}
+			if err := json.Unmarshal(data, &cfg); err == nil {
+				if a, ok := cfg.Auths["ghcr.io"]; ok && a.Auth != "" {
+					return a.Auth
+				}
+				if a, ok := cfg.Auths["https://ghcr.io"]; ok && a.Auth != "" {
+					return a.Auth
+				}
+			}
+		}
+	}
+
+	if u != "" && p != "" {
+		authData, err := json.Marshal(authConfig{
+			Username: u,
+			Password: p,
+		})
+		if err == nil {
+			return base64.URLEncoding.EncodeToString(authData)
+		}
+	}
+	return ""
+}
+
 // PullImage pulls an image from the container registry (e.g. by tag or digest).
 func (d *DockerRuntime) PullImage(ctx context.Context, imageRef string) error {
-	reader, err := d.cli.ImagePull(ctx, imageRef, image.PullOptions{})
+	authStr := GetGHCRAuth()
+	return d.PullImageWithAuth(ctx, imageRef, authStr)
+}
+
+// PullImageWithAuth pulls an image using base64-encoded registry authentication.
+func (d *DockerRuntime) PullImageWithAuth(ctx context.Context, imageRef string, authBase64 string) error {
+	pullOpts := image.PullOptions{}
+	if authBase64 != "" {
+		pullOpts.RegistryAuth = authBase64
+	}
+	reader, err := d.cli.ImagePull(ctx, imageRef, pullOpts)
 	if err != nil {
 		return fmt.Errorf("failed to pull image %s: %w", imageRef, err)
 	}
 	defer reader.Close()
-	_, _ = io.Copy(io.Discard, reader)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return fmt.Errorf("failed reading pull response for image %s: %w", imageRef, err)
+	}
 	return nil
 }
 

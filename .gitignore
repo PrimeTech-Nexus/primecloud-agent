@@ -60,6 +60,7 @@ credentials.json
 tmp/
 .tmp/
 .cache/
+primecloud-agent*
 
 # OS files
 .DS_Store
