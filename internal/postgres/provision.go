@@ -80,14 +80,22 @@ func GenerateCredentials(resourceID string) (*Credentials, error) {
 
 // Provision prepares storage, generates credentials, writes them to Vault, and starts the container.
 func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, hostPort string) (*ProvisionResult, error) {
+	return p.ProvisionWithProject(ctx, "default", resourceID, image, hostPort)
+}
+
+// ProvisionWithProject prepares storage, generates credentials, writes them to Vault under the tenant path, and starts the container.
+func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resourceID, image, hostPort string) (*ProvisionResult, error) {
 	if resourceID == "" {
 		return nil, fmt.Errorf("resource_id cannot be empty")
+	}
+	if projectID == "" {
+		projectID = "default"
 	}
 	if image == "" {
 		image = "postgres:16-alpine"
 	}
 
-	p.logger.Info("provisioning_postgres_starting", "resource_id", resourceID, "image", image)
+	p.logger.Info("provisioning_postgres_starting", "project_id", projectID, "resource_id", resourceID, "image", image)
 
 	// 1. Create Volume Directory
 	volumePath := filepath.Join(p.baseResDir, "postgres", resourceID)
@@ -101,19 +109,30 @@ func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, h
 		return nil, err
 	}
 
+	host := fmt.Sprintf("pc-pg-%s", resourceID)
+	url := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s", creds.Username, creds.Password, host, creds.Port, creds.Database)
+
 	// 3. Store Credentials in Vault
-	vaultRef := fmt.Sprintf("primecloud/resources/postgres/%s", resourceID)
+	tenantVaultRef := fmt.Sprintf("secret/data/primecloud/tenants/%s/postgres/%s", projectID, resourceID)
+	compatVaultRef := fmt.Sprintf("primecloud/resources/postgres/%s", resourceID)
 	if p.vaultClient != nil {
 		secretData := map[string]interface{}{
 			"username": creds.Username,
 			"password": creds.Password,
 			"database": creds.Database,
+			"host":     host,
 			"port":     creds.Port,
+			"url":      url,
 		}
-		if err := p.vaultClient.WriteSecret(ctx, vaultRef, secretData); err != nil {
-			return nil, fmt.Errorf("failed to store postgres credentials in vault: %w", err)
+		if err := p.vaultClient.WriteSecret(ctx, tenantVaultRef, secretData); err != nil {
+			return nil, fmt.Errorf("failed to store postgres credentials in vault (%s): %w", tenantVaultRef, err)
 		}
-		p.logger.Info("postgres_credentials_stored_in_vault", "vault_ref", vaultRef)
+		p.logger.Info("postgres_credentials_stored_in_vault", "vault_ref", tenantVaultRef)
+
+		// Dual-write legacy compatibility path
+		if err := p.vaultClient.WriteSecret(ctx, compatVaultRef, secretData); err != nil {
+			p.logger.Warn("postgres_credentials_compat_vault_write_failed", "vault_ref", compatVaultRef, "error", err)
+		}
 	}
 
 	// 4. Container Configuration
@@ -172,8 +191,8 @@ func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, h
 	result := &ProvisionResult{
 		ResourceID:     resourceID,
 		ContainerID:    containerID,
-		Endpoint:       fmt.Sprintf("%s:5432", containerName),
-		VaultSecretRef: vaultRef,
+		Endpoint:       fmt.Sprintf("%s:5432", host),
+		VaultSecretRef: tenantVaultRef,
 		VolumePath:     volumePath,
 		Credentials:    creds,
 	}

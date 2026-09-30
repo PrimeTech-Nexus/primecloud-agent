@@ -208,7 +208,17 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			hostPort = hp
 		}
 
-		provRes, err := pgProv.Provision(ctx, resID, image, hostPort)
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -416,7 +426,17 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			hostPort = hp
 		}
 
-		provRes, err := vkProv.Provision(ctx, resID, image, hostPort)
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		provRes, err := vkProv.ProvisionWithProject(ctx, projectID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,

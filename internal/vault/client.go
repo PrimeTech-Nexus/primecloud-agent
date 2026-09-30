@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
@@ -83,7 +84,13 @@ func (c *Client) IsHealthy(ctx context.Context) (bool, error) {
 
 // WriteSecret writes a secret payload to the specified Vault path.
 func (c *Client) WriteSecret(ctx context.Context, path string, data map[string]interface{}) error {
-	_, err := c.client.Logical().WriteWithContext(ctx, path, data)
+	payload := data
+	if strings.Contains(path, "/data/") {
+		if _, hasData := data["data"]; !hasData {
+			payload = map[string]interface{}{"data": data}
+		}
+	}
+	_, err := c.client.Logical().WriteWithContext(ctx, path, payload)
 	if err != nil {
 		return fmt.Errorf("failed to write secret to %s: %w", path, err)
 	}
@@ -98,6 +105,9 @@ func (c *Client) ReadSecret(ctx context.Context, path string) (map[string]interf
 	}
 	if secret == nil || secret.Data == nil {
 		return nil, nil
+	}
+	if nested, ok := secret.Data["data"].(map[string]interface{}); ok {
+		return nested, nil
 	}
 	return secret.Data, nil
 }

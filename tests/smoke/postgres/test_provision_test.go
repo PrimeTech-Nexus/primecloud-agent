@@ -23,7 +23,8 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 	provisioner := postgres.NewProvisioner(nil, vClient, baseResDir, nil)
 
 	resID := "res-pg-smoke-1"
-	result, err := provisioner.Provision(ctx, resID, "postgres:16-alpine", "")
+	projectID := "proj-pg-smoke"
+	result, err := provisioner.Provision(ctx, projectID, resID, "postgres:16-alpine", "")
 	if err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
@@ -31,17 +32,18 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 	if result.ResourceID != resID {
 		t.Errorf("Expected resource ID %s, got %s", resID, result.ResourceID)
 	}
-	if result.VaultSecretRef == "" {
-		t.Error("VaultSecretRef is empty")
+	expectedVaultRef := "secret/data/primecloud/tenants/proj-pg-smoke/postgres/res-pg-smoke-1"
+	if result.VaultSecretRef != expectedVaultRef {
+		t.Errorf("Expected VaultSecretRef %s, got %s", expectedVaultRef, result.VaultSecretRef)
 	}
 
-	// Verify credentials exist in Real Vault
+	// Verify credentials exist in Real Vault at tenant path
 	vaultData, err := vClient.ReadSecret(ctx, result.VaultSecretRef)
 	if err != nil {
 		t.Fatalf("Failed to read credentials from Vault at %s: %v", result.VaultSecretRef, err)
 	}
 	if vaultData == nil {
-		t.Fatal("Vault secret not found")
+		t.Fatal("Vault secret not found at tenant path")
 	}
 
 	if vaultData["username"] != result.Credentials.Username {
@@ -49,6 +51,21 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 	}
 	if vaultData["password"] != result.Credentials.Password {
 		t.Errorf("Password mismatch in Vault")
+	}
+	if vaultData["host"] != "pc-pg-res-pg-smoke-1" {
+		t.Errorf("Expected host pc-pg-res-pg-smoke-1, got %v", vaultData["host"])
+	}
+	if vaultData["url"] == nil || vaultData["url"] == "" {
+		t.Errorf("Expected url to be present in Vault secret")
+	}
+
+	// Verify dual-write compatibility path
+	compatData, err := vClient.ReadSecret(ctx, "primecloud/resources/postgres/"+resID)
+	if err != nil || compatData == nil {
+		t.Fatalf("Failed to read credentials from compat Vault path: %v", err)
+	}
+	if compatData["username"] != result.Credentials.Username {
+		t.Errorf("Username mismatch in compat Vault")
 	}
 
 	// 4. Test Backup
@@ -81,7 +98,7 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 		pingCtx, pCancel := context.WithTimeout(ctx, 2*time.Second)
 		if pingErr := rt.Ping(pingCtx); pingErr == nil {
 			liveProv := postgres.NewProvisioner(rt, vClient, baseResDir, nil)
-			liveRes, pErr := liveProv.Provision(ctx, "live-pg-test", "postgres:16-alpine", "")
+			liveRes, pErr := liveProv.Provision(ctx, "default", "live-pg-test", "postgres:16-alpine", "")
 			if pErr == nil && liveRes.ContainerID != "" {
 				liveLM := postgres.NewLifecycleManager(rt)
 				_ = liveLM.Restart(ctx, liveRes.ContainerID, 5)

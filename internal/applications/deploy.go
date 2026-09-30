@@ -233,18 +233,26 @@ func (d *Deployer) resolveSecret(ctx context.Context, envVar, ref string) (strin
 		key = parts[1]
 	} else {
 		path = cleanRef
-		key = envVar
+		if envVar == "DATABASE_URL" || envVar == "REDIS_URL" {
+			key = "url"
+		} else {
+			key = envVar
+		}
 	}
 
 	if key == "" {
-		key = envVar
+		if envVar == "DATABASE_URL" || envVar == "REDIS_URL" {
+			key = "url"
+		} else {
+			key = envVar
+		}
 	}
 
 	if path == "" {
 		return "", fmt.Errorf("secret reference path is empty for variable %s", envVar)
 	}
 
-	data, err := d.vaultClient.ReadSecret(ctx, path)
+	data, err := d.readSecretWithFallback(ctx, path)
 	if err != nil {
 		return "", fmt.Errorf("vault read error at %s: %w", path, err)
 	}
@@ -259,10 +267,127 @@ func (d *Deployer) resolveSecret(ctx context.Context, envVar, ref string) (strin
 
 	val, exists := data[key]
 	if !exists {
+		// Synthesize URL if "url" was requested (or envVar is DATABASE_URL/REDIS_URL) and component fields exist
+		if key == "url" || envVar == "DATABASE_URL" || envVar == "REDIS_URL" {
+			if synthURL, ok := synthesizeURL(data, path); ok {
+				return synthURL, nil
+			}
+		}
+		if key == "password" {
+			if tok, ok := data["auth_token"]; ok {
+				return fmt.Sprintf("%v", tok), nil
+			}
+		}
+		if key == "auth_token" {
+			if pass, ok := data["password"]; ok {
+				return fmt.Sprintf("%v", pass), nil
+			}
+		}
 		return "", fmt.Errorf("key %s not found in vault secret at %s", key, path)
 	}
 
 	return fmt.Sprintf("%v", val), nil
+}
+
+func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map[string]interface{}, error) {
+	pathsToTry := []string{path}
+
+	// Cross-mount variations
+	if strings.Contains(path, "/keyvalue/") {
+		pathsToTry = append(pathsToTry, strings.Replace(path, "/keyvalue/", "/redis/", 1))
+	}
+	if strings.Contains(path, "/redis/") {
+		pathsToTry = append(pathsToTry, strings.Replace(path, "/redis/", "/keyvalue/", 1))
+	}
+
+	if strings.HasPrefix(path, "secret/data/") {
+		pathsToTry = append(pathsToTry, strings.TrimPrefix(path, "secret/data/"))
+		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/data/", "secret/", 1))
+	} else if strings.HasPrefix(path, "secret/") {
+		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/", "secret/data/", 1))
+	} else if strings.HasPrefix(path, "primecloud/tenants/") {
+		pathsToTry = append(pathsToTry, "secret/data/"+path)
+	}
+
+	// Legacy driver paths fallback
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 {
+		resID := parts[len(parts)-1]
+		resType := parts[len(parts)-2]
+		if resType == "postgres" {
+			pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/postgres/%s", resID))
+		} else if resType == "keyvalue" || resType == "redis" || resType == "valkey" {
+			pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/valkey/%s", resID))
+		}
+	}
+
+	for _, p := range pathsToTry {
+		data, err := d.vaultClient.ReadSecret(ctx, p)
+		if err == nil && data != nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+
+	return d.vaultClient.ReadSecret(ctx, path)
+}
+
+func synthesizeURL(data map[string]interface{}, path string) (string, bool) {
+	// 1. PostgreSQL check
+	if db, ok := data["database"]; ok {
+		u := "postgres"
+		if userVal, ok := data["username"]; ok && userVal != "" {
+			u = fmt.Sprintf("%v", userVal)
+		}
+		p := ""
+		if passVal, ok := data["password"]; ok {
+			p = fmt.Sprintf("%v", passVal)
+		}
+		host := "localhost"
+		if hostVal, ok := data["host"]; ok && hostVal != "" {
+			host = fmt.Sprintf("%v", hostVal)
+		}
+		port := 5432
+		if portVal, ok := data["port"]; ok {
+			switch pv := portVal.(type) {
+			case int:
+				port = pv
+			case float64:
+				port = int(pv)
+			default:
+				fmt.Sscanf(fmt.Sprintf("%v", portVal), "%d", &port)
+			}
+		}
+		return fmt.Sprintf("postgresql://%s:%s@%s:%d/%v", u, p, host, port, db), true
+	}
+
+	// 2. Redis / Valkey check
+	tok := ""
+	if tokVal, ok := data["auth_token"]; ok {
+		tok = fmt.Sprintf("%v", tokVal)
+	} else if passVal, ok := data["password"]; ok {
+		tok = fmt.Sprintf("%v", passVal)
+	}
+
+	if tok != "" || strings.Contains(path, "redis") || strings.Contains(path, "keyvalue") || strings.Contains(path, "valkey") {
+		host := "localhost"
+		if hostVal, ok := data["host"]; ok && hostVal != "" {
+			host = fmt.Sprintf("%v", hostVal)
+		}
+		port := 6379
+		if portVal, ok := data["port"]; ok {
+			switch pv := portVal.(type) {
+			case int:
+				port = pv
+			case float64:
+				port = int(pv)
+			default:
+				fmt.Sscanf(fmt.Sprintf("%v", portVal), "%d", &port)
+			}
+		}
+		return fmt.Sprintf("redis://default:%s@%s:%d", tok, host, port), true
+	}
+
+	return "", false
 }
 
 func (d *Deployer) resolveGHCRAuth(ctx context.Context) string {
