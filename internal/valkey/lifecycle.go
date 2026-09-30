@@ -4,6 +4,7 @@ package valkey
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 )
@@ -55,5 +56,9 @@ func (lm *LifecycleManager) Remove(ctx context.Context, containerID string) erro
 	}
 	timeout := 5
 	_ = lm.rt.StopContainer(ctx, containerID, &timeout)
-	return lm.rt.RemoveContainer(ctx, containerID, true)
+	err := lm.rt.RemoveContainer(ctx, containerID, true)
+	if err != nil && (strings.Contains(err.Error(), "No such container") || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "404")) {
+		return nil
+	}
+	return err
 }

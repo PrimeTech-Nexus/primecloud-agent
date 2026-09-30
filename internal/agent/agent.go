@@ -3,8 +3,12 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,9 +17,11 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
 	"github.com/primecloud/primecloud-agent/internal/operations"
+	"github.com/primecloud/primecloud-agent/internal/postgres"
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/transport"
+	"github.com/primecloud/primecloud-agent/internal/valkey"
 	"github.com/primecloud/primecloud-agent/internal/vault"
 )
 
@@ -179,6 +185,440 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}, nil
 	}, nil)
 
+	// Managed Services Drivers
+	pgProv := postgres.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
+	pgLC := postgres.NewLifecycleManager(rt)
+	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
+	vkLC := valkey.NewLifecycleManager(rt)
+
+	// 5. provision_postgres
+	registry.Register("provision_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		payload := parsePayloadMap(op.PayloadJson)
+
+		image := "postgres:16-alpine"
+		if img, ok := payload["image"].(string); ok && img != "" {
+			image = img
+		} else if ver, ok := payload["version"].(string); ok && ver != "" {
+			image = fmt.Sprintf("postgres:%s-alpine", ver)
+		}
+
+		hostPort := ""
+		if hp, ok := payload["host_port"].(string); ok {
+			hostPort = hp
+		}
+
+		provRes, err := pgProv.Provision(ctx, resID, image, hostPort)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "PROVISION_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"resource_id":      provRes.ResourceID,
+			"container_id":     provRes.ContainerID,
+			"endpoint":         provRes.Endpoint,
+			"vault_secret_ref": provRes.VaultSecretRef,
+			"volume_path":      provRes.VolumePath,
+			"status":           "AVAILABLE",
+			"node_id":          cfg.NodeID,
+		}
+		resBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resBytes),
+			Message:         fmt.Sprintf("PostgreSQL container %s provisioned and available", provRes.ContainerID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	// 6. start_postgres
+	registry.Register("start_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-pg-") {
+			containerName = fmt.Sprintf("pc-pg-%s", resID)
+		}
+		if err := pgLC.Start(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "START_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("PostgreSQL container %s started successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 7. stop_postgres
+	registry.Register("stop_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-pg-") {
+			containerName = fmt.Sprintf("pc-pg-%s", resID)
+		}
+		if err := pgLC.Stop(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "STOP_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"STOPPED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("PostgreSQL container %s stopped successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 8. restart_postgres
+	registry.Register("restart_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-pg-") {
+			containerName = fmt.Sprintf("pc-pg-%s", resID)
+		}
+		if err := pgLC.Restart(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTART_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("PostgreSQL container %s restarted successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 9. deprovision_postgres
+	registry.Register("deprovision_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-pg-") {
+			containerName = fmt.Sprintf("pc-pg-%s", resID)
+		}
+		if err := pgLC.Remove(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DEPROVISION_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		volDir := filepath.Join(cfg.ResourceDir, "postgres", resID)
+		_ = os.RemoveAll(volDir)
+
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"DELETED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("PostgreSQL container %s and resources deprovisioned successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 10. health_check_postgres
+	registry.Register("health_check_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-pg-") {
+			containerName = fmt.Sprintf("pc-pg-%s", resID)
+		}
+		if rt == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RUNTIME_UNAVAILABLE",
+				Message:         "container runtime is not available",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("runtime unavailable")
+		}
+		inspect, err := rt.InspectContainer(ctx, containerName)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "HEALTH_CHECK_FAILED",
+				Message:         fmt.Sprintf("failed to inspect container: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		if !inspect.Running {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_NOT_RUNNING",
+				Message:         fmt.Sprintf("container %s is not running (state=%s)", containerName, inspect.State),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is not running", containerName)
+		}
+		if inspect.Health == "unhealthy" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_UNHEALTHY",
+				Message:         fmt.Sprintf("container %s health status is unhealthy", containerName),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is unhealthy", containerName)
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("PostgreSQL container %s is healthy", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 11. provision_keyvalue / provision_valkey
+	valkeyProvisionHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		payload := parsePayloadMap(op.PayloadJson)
+
+		image := "valkey/valkey:7.2-alpine"
+		if img, ok := payload["image"].(string); ok && img != "" {
+			image = img
+		} else if ver, ok := payload["version"].(string); ok && ver != "" {
+			image = fmt.Sprintf("valkey/valkey:%s-alpine", ver)
+		}
+
+		hostPort := ""
+		if hp, ok := payload["host_port"].(string); ok {
+			hostPort = hp
+		}
+
+		provRes, err := vkProv.Provision(ctx, resID, image, hostPort)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "PROVISION_VALKEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"resource_id":      provRes.ResourceID,
+			"container_id":     provRes.ContainerID,
+			"endpoint":         provRes.Endpoint,
+			"vault_secret_ref": provRes.VaultSecretRef,
+			"volume_path":      provRes.VolumePath,
+			"status":           "AVAILABLE",
+			"node_id":          cfg.NodeID,
+		}
+		resBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resBytes),
+			Message:         fmt.Sprintf("Valkey container %s provisioned and available", provRes.ContainerID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}
+	registry.Register("provision_keyvalue", valkeyProvisionHandler, nil)
+	registry.Register("provision_valkey", valkeyProvisionHandler, nil)
+
+	// 12. start_keyvalue / start_valkey
+	valkeyStartHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-vk-") {
+			containerName = fmt.Sprintf("pc-vk-%s", resID)
+		}
+		if err := vkLC.Start(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "START_VALKEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("Valkey container %s started successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("start_keyvalue", valkeyStartHandler, nil)
+	registry.Register("start_valkey", valkeyStartHandler, nil)
+
+	// 13. stop_keyvalue / stop_valkey
+	valkeyStopHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-vk-") {
+			containerName = fmt.Sprintf("pc-vk-%s", resID)
+		}
+		if err := vkLC.Stop(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "STOP_VALKEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"STOPPED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("Valkey container %s stopped successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("stop_keyvalue", valkeyStopHandler, nil)
+	registry.Register("stop_valkey", valkeyStopHandler, nil)
+
+	// 14. restart_keyvalue / restart_valkey
+	valkeyRestartHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-vk-") {
+			containerName = fmt.Sprintf("pc-vk-%s", resID)
+		}
+		if err := vkLC.Restart(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTART_VALKEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("Valkey container %s restarted successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("restart_keyvalue", valkeyRestartHandler, nil)
+	registry.Register("restart_valkey", valkeyRestartHandler, nil)
+
+	// 15. deprovision_keyvalue / deprovision_valkey
+	valkeyDeprovisionHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-vk-") {
+			containerName = fmt.Sprintf("pc-vk-%s", resID)
+		}
+		if err := vkLC.Remove(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DEPROVISION_VALKEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		volDir := filepath.Join(cfg.ResourceDir, "valkey", resID)
+		_ = os.RemoveAll(volDir)
+
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"DELETED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("Valkey container %s and resources deprovisioned successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("deprovision_keyvalue", valkeyDeprovisionHandler, nil)
+	registry.Register("deprovision_valkey", valkeyDeprovisionHandler, nil)
+
+	// 16. health_check_keyvalue / health_check_valkey
+	valkeyHealthCheckHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "keyvalue_id", "valkey_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-vk-") {
+			containerName = fmt.Sprintf("pc-vk-%s", resID)
+		}
+		if rt == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RUNTIME_UNAVAILABLE",
+				Message:         "container runtime is not available",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("runtime unavailable")
+		}
+		inspect, err := rt.InspectContainer(ctx, containerName)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "HEALTH_CHECK_FAILED",
+				Message:         fmt.Sprintf("failed to inspect container: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		if !inspect.Running {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_NOT_RUNNING",
+				Message:         fmt.Sprintf("container %s is not running (state=%s)", containerName, inspect.State),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is not running", containerName)
+		}
+		if inspect.Health == "unhealthy" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_UNHEALTHY",
+				Message:         fmt.Sprintf("container %s health status is unhealthy", containerName),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is unhealthy", containerName)
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Valkey container %s is healthy", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("health_check_keyvalue", valkeyHealthCheckHandler, nil)
+	registry.Register("health_check_valkey", valkeyHealthCheckHandler, nil)
+
 	locks := operations.NewLockManager()
 	idempotency := operations.NewIdempotencyTracker(24 * time.Hour)
 	a.dispatcher = operations.NewDispatcher(registry, locks, idempotency, a.logger)
@@ -298,3 +738,37 @@ func (a *Agent) Config() *Config {
 func (a *Agent) Logger() *slog.Logger {
 	return a.logger
 }
+
+// Dispatcher returns the configured operation dispatcher.
+func (a *Agent) Dispatcher() *operations.Dispatcher {
+	return a.dispatcher
+}
+
+func extractResourceID(op *pb.OperationEnvelope, fallbackKeys ...string) string {
+	if op.ResourceId != "" {
+		return op.ResourceId
+	}
+	if op.PayloadJson != "" {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(op.PayloadJson), &m); err == nil {
+			for _, k := range fallbackKeys {
+				if v, ok := m[k].(string); ok && v != "" {
+					return v
+				}
+			}
+			if v, ok := m["resource_id"].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return op.OperationId
+}
+
+func parsePayloadMap(payloadJSON string) map[string]interface{} {
+	m := make(map[string]interface{})
+	if payloadJSON != "" {
+		_ = json.Unmarshal([]byte(payloadJSON), &m)
+	}
+	return m
+}
+
