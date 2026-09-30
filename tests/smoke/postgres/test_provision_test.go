@@ -24,7 +24,7 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 
 	resID := "res-pg-smoke-1"
 	projectID := "proj-pg-smoke"
-	result, err := provisioner.Provision(ctx, projectID, resID, "postgres:16-alpine", "")
+	result, err := provisioner.ProvisionWithProject(ctx, projectID, resID, "postgres:16-alpine", "")
 	if err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 		pingCtx, pCancel := context.WithTimeout(ctx, 2*time.Second)
 		if pingErr := rt.Ping(pingCtx); pingErr == nil {
 			liveProv := postgres.NewProvisioner(rt, vClient, baseResDir, nil)
-			liveRes, pErr := liveProv.Provision(ctx, "default", "live-pg-test", "postgres:16-alpine", "")
+			liveRes, pErr := liveProv.ProvisionWithProject(ctx, "default", "live-pg-test", "postgres:16-alpine", "")
 			if pErr == nil && liveRes.ContainerID != "" {
 				liveLM := postgres.NewLifecycleManager(rt)
 				_ = liveLM.Restart(ctx, liveRes.ContainerID, 5)

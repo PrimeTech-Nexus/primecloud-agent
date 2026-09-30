@@ -309,15 +309,17 @@ func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map
 		pathsToTry = append(pathsToTry, "secret/data/"+path)
 	}
 
-	// Legacy driver paths fallback
-	parts := strings.Split(path, "/")
-	if len(parts) >= 2 {
-		resID := parts[len(parts)-1]
-		resType := parts[len(parts)-2]
-		if resType == "postgres" {
-			pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/postgres/%s", resID))
-		} else if resType == "keyvalue" || resType == "redis" || resType == "valkey" {
-			pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/valkey/%s", resID))
+	// Legacy driver paths fallback (only if NOT an explicit tenant path)
+	if !strings.Contains(path, "/tenants/") {
+		parts := strings.Split(path, "/")
+		if len(parts) >= 2 {
+			resID := parts[len(parts)-1]
+			resType := parts[len(parts)-2]
+			if resType == "postgres" {
+				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/postgres/%s", resID))
+			} else if resType == "keyvalue" || resType == "redis" || resType == "valkey" {
+				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/valkey/%s", resID))
+			}
 		}
 	}
 
