@@ -219,8 +219,13 @@ func (d *DockerRuntime) CreateContainer(
 		natPort, err := nat.NewPort("tcp", cPort)
 		if err == nil {
 			exposedPorts[natPort] = struct{}{}
+			effectiveHostPort := hPort
+			if effectiveHostPort == "8000" {
+				// Port 8000 is reserved by primecloud-control-plane on host; assign ephemeral host port
+				effectiveHostPort = ""
+			}
 			portBindings[natPort] = []nat.PortBinding{
-				{HostIP: "0.0.0.0", HostPort: hPort},
+				{HostIP: "0.0.0.0", HostPort: effectiveHostPort},
 			}
 		}
 	}
@@ -315,6 +320,22 @@ func (d *DockerRuntime) InspectContainer(ctx context.Context, containerID string
 		Running:  inspect.State.Running,
 		ExitCode: inspect.State.ExitCode,
 		Labels:   inspect.Config.Labels,
+		Ports:    make(map[string]string),
+	}
+
+	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Ports != nil {
+		for port, bindings := range inspect.NetworkSettings.Ports {
+			if len(bindings) > 0 && bindings[0].HostPort != "" {
+				res.Ports[string(port)] = bindings[0].HostPort
+			}
+		}
+	}
+	if len(res.Ports) == 0 && inspect.HostConfig != nil && inspect.HostConfig.PortBindings != nil {
+		for port, bindings := range inspect.HostConfig.PortBindings {
+			if len(bindings) > 0 && bindings[0].HostPort != "" {
+				res.Ports[string(port)] = bindings[0].HostPort
+			}
+		}
 	}
 
 	if inspect.State.Health != nil {

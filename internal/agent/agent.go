@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
+	"github.com/primecloud/primecloud-agent/internal/caddy"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
 	"github.com/primecloud/primecloud-agent/internal/operations"
@@ -200,11 +202,41 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			}, err
 		}
 
-		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"RUNNING","node_id":%q}`, containerID, cfg.NodeID)
+		var hostPort int
+		if inspect, err := rt.InspectContainer(ctx, containerID); err == nil && inspect != nil {
+			for _, hpStr := range inspect.Ports {
+				if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+					hostPort = hp
+					break
+				}
+			}
+		}
+
+		if hostPort == 0 {
+			if p, ok := payload["port"].(float64); ok && p > 0 {
+				hostPort = int(p)
+			} else if p, ok := payload["port"].(int); ok && p > 0 {
+				hostPort = p
+			} else if pStr, ok := payload["port"].(string); ok {
+				hostPort, _ = strconv.Atoi(pStr)
+			}
+		}
+
+		resMap := map[string]interface{}{
+			"container_id": containerID,
+			"status":       "RUNNING",
+			"node_id":      cfg.NodeID,
+		}
+		if hostPort > 0 {
+			resMap["port"] = hostPort
+			resMap["host_port"] = hostPort
+		}
+		resBytes, _ := json.Marshal(resMap)
+
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
-			ResultJson:      resJSON,
+			ResultJson:      string(resBytes),
 			Message:         fmt.Sprintf("Application container %s started successfully", containerID),
 			CompletedAtUnix: time.Now().Unix(),
 			ProgressPercent: 100,
@@ -271,11 +303,143 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}, nil
 	}, nil)
 
-	// Managed Services Drivers
+	// Managed Services & Ingress Drivers
+	caddyMgr := caddy.NewManager("/etc/caddy/conf.d", "http://127.0.0.1:2019", a.logger)
 	pgProv := postgres.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	pgLC := postgres.NewLifecycleManager(rt)
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	vkLC := valkey.NewLifecycleManager(rt)
+
+	// 5. configure_route
+	registry.Register("configure_route", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		domain, _ := payload["domain"].(string)
+		if domain == "" {
+			domain = op.ResourceId
+		}
+		if domain == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_DOMAIN",
+				Message:         "domain is required for route configuration",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("domain is required")
+		}
+
+		targetHost := "127.0.0.1"
+		if th, ok := payload["target_host"].(string); ok && th != "" {
+			targetHost = th
+		}
+
+		var targetPort int
+		if tp, ok := payload["target_port"].(float64); ok {
+			targetPort = int(tp)
+		} else if tp, ok := payload["target_port"].(int); ok {
+			targetPort = tp
+		} else if tpStr, ok := payload["target_port"].(string); ok {
+			targetPort, _ = strconv.Atoi(tpStr)
+		}
+
+		upstream, _ := payload["upstream"].(string)
+		if upstream == "" && targetPort > 0 {
+			upstream = fmt.Sprintf("%s:%d", targetHost, targetPort)
+		}
+
+		if upstream == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_UPSTREAM",
+				Message:         "upstream or valid target_port is required for route configuration",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("upstream or target_port required")
+		}
+
+		tlsEnabled := true
+		if te, ok := payload["tls_enabled"].(bool); ok {
+			tlsEnabled = te
+		} else if te, ok := payload["tls"].(bool); ok {
+			tlsEnabled = te
+		}
+
+		routeCfg := &caddy.RouteConfig{
+			Domain:   domain,
+			Upstream: upstream,
+			TLS:      tlsEnabled,
+		}
+
+		if err := caddyMgr.ConfigureRoute(ctx, routeCfg); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONFIGURE_ROUTE_FAILED",
+				Message:         fmt.Sprintf("failed to configure route for domain %s: %v", domain, err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"route_id": fmt.Sprintf("route-%s", op.OperationId),
+			"domain":   domain,
+			"upstream": upstream,
+			"status":   "ACTIVE",
+			"url":      fmt.Sprintf("https://%s", domain),
+		}
+		resJSONBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resJSONBytes),
+			Message:         fmt.Sprintf("Route for %s configured successfully pointing to %s", domain, upstream),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	// 6. remove_route
+	registry.Register("remove_route", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		domain, _ := payload["domain"].(string)
+		if domain == "" {
+			domain = op.ResourceId
+		}
+		if domain == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_DOMAIN",
+				Message:         "domain is required for route removal",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("domain is required")
+		}
+
+		if err := caddyMgr.RemoveRoute(ctx, domain); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "REMOVE_ROUTE_FAILED",
+				Message:         fmt.Sprintf("failed to remove route for domain %s: %v", domain, err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"status": "ROUTE_REMOVED",
+			"domain": domain,
+		}
+		resJSONBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resJSONBytes),
+			Message:         fmt.Sprintf("Route for %s removed successfully", domain),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
 
 	// 5. provision_postgres
 	registry.Register("provision_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {

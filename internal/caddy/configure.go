@@ -55,20 +55,41 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 	if route == nil {
 		return "", fmt.Errorf("route config cannot be nil")
 	}
-	if strings.TrimSpace(route.Domain) == "" {
+	domain := strings.TrimSpace(route.Domain)
+	if domain == "" {
 		return "", fmt.Errorf("domain cannot be empty")
 	}
-	if strings.TrimSpace(route.Upstream) == "" {
+	upstream := strings.TrimSpace(route.Upstream)
+	if upstream == "" {
 		return "", fmt.Errorf("upstream cannot be empty")
 	}
+	upstream = strings.TrimPrefix(upstream, "http://")
+	upstream = strings.TrimPrefix(upstream, "https://")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s {\n", route.Domain))
-	if !route.TLS {
-		sb.WriteString("    tls off\n")
+	if route.TLS {
+		if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
+			sb.WriteString(fmt.Sprintf("http://%s, https://%s {\n", domain, domain))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s {\n", domain))
+		}
+		certPath := "/etc/primecloud/certs/origin.crt"
+		keyPath := "/etc/primecloud/certs/origin.key"
+		if _, err := os.Stat(certPath); err == nil {
+			sb.WriteString(fmt.Sprintf("    tls %s %s\n", certPath, keyPath))
+		} else {
+			sb.WriteString("    tls internal\n")
+		}
+	} else {
+		if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
+			sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s {\n", domain))
+		}
 	}
-	sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", route.Upstream))
-	sb.WriteString("        header_up Host {upstream_hostport}\n")
+
+	sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
+	sb.WriteString("        header_up Host {host}\n")
 	sb.WriteString("        header_up X-Real-IP {remote_host}\n")
 	sb.WriteString("        header_up X-Forwarded-For {remote_host}\n")
 	sb.WriteString("        header_up X-Forwarded-Proto {scheme}\n")
