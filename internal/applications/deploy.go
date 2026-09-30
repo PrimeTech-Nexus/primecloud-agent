@@ -126,8 +126,11 @@ func (d *Deployer) Deploy(
 		"secret_ref_keys", secretKeyList,
 	)
 
-	// Resolve Vault secrets (fail-closed if secrets required but client unconfigured)
+	// Resolve Vault secrets (fail-closed if secrets required but client unconfigured or project_id missing)
 	if len(secretRefs) > 0 {
+		if strings.TrimSpace(projectID) == "" {
+			return "", fmt.Errorf("cannot resolve %d secret reference(s): project_id is required but missing from deployment envelope", len(secretRefs))
+		}
 		if d.vaultClient == nil {
 			return "", fmt.Errorf("cannot resolve %d secret reference(s): vault client is not configured on agent", len(secretRefs))
 		}
@@ -290,6 +293,9 @@ func (d *Deployer) resolveSecret(ctx context.Context, envVar, ref string) (strin
 }
 
 func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map[string]interface{}, error) {
+	if strings.Contains(path, "tenants//") || strings.Contains(path, "/tenants//") {
+		return nil, fmt.Errorf("invalid tenant vault path with empty tenant ID: %s", path)
+	}
 	pathsToTry := []string{path}
 
 	// Cross-mount variations

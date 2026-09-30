@@ -97,13 +97,87 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 1. deploy_application
 	registry.Register("deploy_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		appID := op.ResourceId
-		if appID == "" {
+		payload := parsePayloadMap(op.PayloadJson)
+
+		// 1. Resolve resource_id: use payload.resource_id when present, otherwise fall back to payload.application_id
+		resourceID := op.ResourceId
+		if resourceID == "" {
+			if rID, ok := payload["resource_id"].(string); ok && rID != "" {
+				resourceID = rID
+			}
+		}
+		if resourceID == "" {
+			if aID, ok := payload["application_id"].(string); ok && aID != "" {
+				resourceID = aID
+			}
+		}
+
+		// 2. Resolve application_id: use payload.application_id; do NOT replace it with operation_id when application_id exists
+		appID := ""
+		if aID, ok := payload["application_id"].(string); ok && aID != "" {
+			appID = aID
+		} else if resourceID != "" {
+			appID = resourceID
+		} else {
 			appID = op.OperationId
 		}
+
+		if resourceID == "" {
+			resourceID = appID
+		}
+
+		// 3. Resolve project_id: use payload.project_id; if missing, inspect parameters for project_id;
+		// if still missing, fail clearly before Vault secret resolution rather than silently constructing an invalid tenant path
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pID, ok := payload["project_id"].(string); ok && pID != "" {
+				projectID = pID
+			}
+		}
+		if projectID == "" {
+			if params, ok := payload["parameters"].(map[string]interface{}); ok {
+				if pID, ok := params["project_id"].(string); ok && pID != "" {
+					projectID = pID
+				}
+			}
+		}
+
+		// Fail clearly if secrets exist but project_id is missing
+		hasSecrets := false
+		if sRefs, ok := payload["secret_refs"].(map[string]interface{}); ok && len(sRefs) > 0 {
+			hasSecrets = true
+		}
+		if envMap, ok := payload["env"].(map[string]interface{}); ok {
+			for _, v := range envMap {
+				if strV, ok := v.(string); ok && strings.HasPrefix(strV, "vault:") {
+					hasSecrets = true
+					break
+				}
+			}
+		}
+		if envVarsMap, ok := payload["env_vars"].(map[string]interface{}); ok {
+			for _, v := range envVarsMap {
+				if strV, ok := v.(string); ok && strings.HasPrefix(strV, "vault:") {
+					hasSecrets = true
+					break
+				}
+			}
+		}
+
+		if strings.TrimSpace(projectID) == "" && hasSecrets {
+			errMsg := "DEPLOYMENT_FAILED: project_id is required for secret resolution but was not provided in deployment operation payload"
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "MISSING_PROJECT_ID",
+				Message:         errMsg,
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("%s", errMsg)
+		}
+
 		instanceID := op.OperationId
 
-		containerID, err := deployer.Deploy(ctx, op.ProjectId, op.EnvironmentId, appID, instanceID, op.PayloadJson)
+		containerID, err := deployer.Deploy(ctx, projectID, op.EnvironmentId, appID, instanceID, op.PayloadJson)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,

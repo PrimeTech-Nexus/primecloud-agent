@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,70 +28,77 @@ func TestValkeyConsumer_FullFlow(t *testing.T) {
 	serverAddr := listener.Addr().String()
 
 	resultChan := make(chan map[string]interface{}, 1)
+	var opMu sync.Mutex
+	opEnqueued := false
 
-	// Mock server loop
+	// Mock server loop accepting connections
 	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		reader := bufio.NewReader(conn)
-		writer := bufio.NewWriter(conn)
-
-		opEnqueued := false
-
 		for {
-			cmd, err := parseRESP(reader)
+			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			cmdArr, ok := cmd.([]interface{})
-			if !ok || len(cmdArr) == 0 {
-				continue
-			}
-
-			cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
-
-			if cmdName == "BLPOP" {
-				if !opEnqueued {
-					opEnqueued = true
-					// Return fake operation envelope
-					itemObj := map[string]interface{}{
-						"id":    "op-valkey-test-001",
-						"queue": "queue:node:0191c001-0000-7000-8000-000000000001:operations",
-						"payload": map[string]interface{}{
-							"operation_id":   "op-valkey-test-001",
-							"operation_type": "test_op",
-							"resource_id":    "res-123",
-							"project_id":     "proj-123",
-							"environment_id": "env-123",
-							"payload_json":   `{"key":"val"}`,
-						},
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
 					}
-					itemBytes, _ := json.Marshal(itemObj)
-					itemStr := string(itemBytes)
-					keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
 
-					resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
-					writer.WriteString(resp)
-					writer.Flush()
-				} else {
-					// Timeout reply (nil array)
-					writer.WriteString("*-1\r\n")
-					writer.Flush()
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+
+					if cmdName == "BLPOP" {
+						opMu.Lock()
+						shouldEnqueue := !opEnqueued
+						if shouldEnqueue {
+							opEnqueued = true
+						}
+						opMu.Unlock()
+
+						if shouldEnqueue {
+							itemObj := map[string]interface{}{
+								"id":    "op-valkey-test-001",
+								"queue": "queue:node:0191c001-0000-7000-8000-000000000001:operations",
+								"payload": map[string]interface{}{
+									"operation_id":   "op-valkey-test-001",
+									"operation_type": "test_op",
+									"resource_id":    "res-123",
+									"project_id":     "proj-123",
+									"environment_id": "env-123",
+									"payload_json":   `{"key":"val"}`,
+								},
+							}
+							itemBytes, _ := json.Marshal(itemObj)
+							itemStr := string(itemBytes)
+							keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+
+							resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+							writer.WriteString(resp)
+							writer.Flush()
+						} else {
+							// Timeout reply (nil array)
+							writer.WriteString("*-1\r\n")
+							writer.Flush()
+						}
+					} else if cmdName == "SETEX" {
+						if len(cmdArr) >= 4 {
+							valStr := fmt.Sprintf("%v", cmdArr[3])
+							var resMap map[string]interface{}
+							_ = json.Unmarshal([]byte(valStr), &resMap)
+							resultChan <- resMap
+						}
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
 				}
-			} else if cmdName == "SETEX" {
-				if len(cmdArr) >= 4 {
-					valStr := fmt.Sprintf("%v", cmdArr[3])
-					var resMap map[string]interface{}
-					_ = json.Unmarshal([]byte(valStr), &resMap)
-					resultChan <- resMap
-				}
-				writer.WriteString("+OK\r\n")
-				writer.Flush()
-			}
+			}(conn)
 		}
 	}()
 
@@ -140,5 +148,296 @@ func TestValkeyConsumer_FullFlow(t *testing.T) {
 		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("timed out waiting for ValkeyConsumer to process operation and store result")
+	}
+}
+
+func TestValkeyConsumer_ReadErrorReconnect(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverAddr := listener.Addr().String()
+	resultChan := make(chan string, 1)
+	connCount := 0
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connCount++
+			currentConnIndex := connCount
+
+			go func(c net.Conn, idx int) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
+					}
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+
+					if cmdName == "BLPOP" {
+						if idx == 1 {
+							// Simulate sudden connection failure / reset on first connection
+							c.Close()
+							return
+						}
+						// On second connection, return valid operation
+						itemObj := map[string]interface{}{
+							"id": "op-reconnect-001",
+							"payload": map[string]interface{}{
+								"operation_id":   "op-reconnect-001",
+								"operation_type": "reconnect_test",
+								"application_id": "app-reconnect-123",
+							},
+						}
+						itemBytes, _ := json.Marshal(itemObj)
+						itemStr := string(itemBytes)
+						keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+						resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+						writer.WriteString(resp)
+						writer.Flush()
+					} else if cmdName == "SETEX" {
+						resultChan <- "reconnected_and_published"
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
+				}
+			}(conn, currentConnIndex)
+		}
+	}()
+
+	registry := operations.NewRegistry()
+	registry.Register("reconnect_test", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := operations.NewDispatcher(registry, nil, nil, logger)
+	consumer := NewValkeyConsumer(serverAddr, "0191c001-0000-7000-8000-000000000001", dispatcher, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = consumer.Start(ctx)
+	}()
+
+	select {
+	case res := <-resultChan:
+		if res != "reconnected_and_published" {
+			t.Errorf("unexpected result: %v", res)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for consumer to reconnect and process operation")
+	}
+}
+
+func TestValkeyConsumer_ParseErrorReconnect(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverAddr := listener.Addr().String()
+	resultChan := make(chan string, 1)
+	connCount := 0
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connCount++
+			currentConnIndex := connCount
+
+			go func(c net.Conn, idx int) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
+					}
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+
+					if cmdName == "BLPOP" {
+						if idx == 1 {
+							// Return corrupted RESP frame with invalid prefix to trigger parse error
+							writer.WriteString("!GARBAGE_RESP_PREFIX\r\n")
+							writer.Flush()
+							return
+						}
+						// On second connection, return valid operation
+						itemObj := map[string]interface{}{
+							"id": "op-parse-err-001",
+							"payload": map[string]interface{}{
+								"operation_id":   "op-parse-err-001",
+								"operation_type": "parse_test",
+								"application_id": "app-parse-123",
+							},
+						}
+						itemBytes, _ := json.Marshal(itemObj)
+						itemStr := string(itemBytes)
+						keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+						resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+						writer.WriteString(resp)
+						writer.Flush()
+					} else if cmdName == "SETEX" {
+						resultChan <- "recovered_after_parse_error"
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
+				}
+			}(conn, currentConnIndex)
+		}
+	}()
+
+	registry := operations.NewRegistry()
+	registry.Register("parse_test", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := operations.NewDispatcher(registry, nil, nil, logger)
+	consumer := NewValkeyConsumer(serverAddr, "0191c001-0000-7000-8000-000000000001", dispatcher, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = consumer.Start(ctx)
+	}()
+
+	select {
+	case res := <-resultChan:
+		if res != "recovered_after_parse_error" {
+			t.Errorf("unexpected result: %v", res)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for consumer to reset on parse error and recover")
+	}
+}
+
+func TestValkeyConsumer_EnvelopeFallback(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverAddr := listener.Addr().String()
+	receivedEnvelopeChan := make(chan *pb.OperationEnvelope, 1)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
+					}
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+					if cmdName == "BLPOP" {
+						// Payload with application_id and NO resource_id
+						itemObj := map[string]interface{}{
+							"id": "op-fallback-001",
+							"payload": map[string]interface{}{
+								"operation_id":   "op-fallback-001",
+								"operation_type": "fallback_test",
+								"application_id": "app-fallback-uuid",
+								"project_id":     "proj-fallback-uuid",
+								"parameters": map[string]interface{}{
+									"environment_id": "env-fallback-uuid",
+								},
+							},
+						}
+						itemBytes, _ := json.Marshal(itemObj)
+						itemStr := string(itemBytes)
+						keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+						resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+						writer.WriteString(resp)
+						writer.Flush()
+					} else if cmdName == "SETEX" {
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	registry := operations.NewRegistry()
+	registry.Register("fallback_test", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		receivedEnvelopeChan <- op
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := operations.NewDispatcher(registry, nil, nil, logger)
+	consumer := NewValkeyConsumer(serverAddr, "0191c001-0000-7000-8000-000000000001", dispatcher, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = consumer.Start(ctx)
+	}()
+
+	select {
+	case env := <-receivedEnvelopeChan:
+		if env.ResourceId != "app-fallback-uuid" {
+			t.Errorf("expected ResourceId to fall back to application_id 'app-fallback-uuid', got '%s'", env.ResourceId)
+		}
+		if env.ProjectId != "proj-fallback-uuid" {
+			t.Errorf("expected ProjectId 'proj-fallback-uuid', got '%s'", env.ProjectId)
+		}
+		if env.EnvironmentId != "env-fallback-uuid" {
+			t.Errorf("expected EnvironmentId 'env-fallback-uuid', got '%s'", env.EnvironmentId)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for envelope fallback test")
 	}
 }

@@ -43,6 +43,23 @@ func NewValkeyConsumer(queueURL, nodeID string, dispatcher *operations.Dispatche
 	}
 }
 
+func normalizeValkeyAddr(raw string) string {
+	addr := strings.TrimSpace(raw)
+	if strings.HasPrefix(addr, "redis://") {
+		addr = strings.TrimPrefix(addr, "redis://")
+	} else if strings.HasPrefix(addr, "valkey://") {
+		addr = strings.TrimPrefix(addr, "valkey://")
+	}
+	// Strip trailing slash and database index if present (e.g. /0)
+	if idx := strings.Index(addr, "/"); idx != -1 {
+		addr = addr[:idx]
+	}
+	if addr == "" {
+		addr = "127.0.0.1:6379"
+	}
+	return addr
+}
+
 // Start begins the consumer event loop, retrying connections automatically until context is cancelled.
 func (vc *ValkeyConsumer) Start(ctx context.Context) error {
 	vc.logger.Info("primecloud_operation_transport_starting",
@@ -50,6 +67,9 @@ func (vc *ValkeyConsumer) Start(ctx context.Context) error {
 		"node_id", vc.nodeID,
 		"queue_key", vc.queueKey,
 	)
+
+	backoff := 500 * time.Millisecond
+	maxBackoff := 5 * time.Second
 
 	for {
 		select {
@@ -61,24 +81,28 @@ func (vc *ValkeyConsumer) Start(ctx context.Context) error {
 
 		err := vc.runConsumerLoop(ctx)
 		if err != nil && ctx.Err() == nil {
-			vc.logger.Warn("valkey_consumer_connection_lost", "error", err, "reconnecting_in_sec", 2)
+			vc.logger.Warn("valkey_consumer_reconnecting",
+				"error", err.Error(),
+				"backoff", backoff.String(),
+				"queue_key", vc.queueKey,
+			)
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(2 * time.Second):
+			case <-time.After(backoff):
 			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		} else {
+			backoff = 500 * time.Millisecond
 		}
 	}
 }
 
 func (vc *ValkeyConsumer) runConsumerLoop(ctx context.Context) error {
-	addr := vc.queueURL
-	if strings.HasPrefix(addr, "redis://") {
-		addr = strings.TrimPrefix(addr, "redis://")
-	}
-	if strings.HasPrefix(addr, "valkey://") {
-		addr = strings.TrimPrefix(addr, "valkey://")
-	}
+	addr := normalizeValkeyAddr(vc.queueURL)
 
 	d := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", addr)
@@ -87,6 +111,7 @@ func (vc *ValkeyConsumer) runConsumerLoop(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	vc.logger.Info("valkey_consumer_connected", "queue_url", vc.queueURL, "addr", addr, "queue_key", vc.queueKey)
 	vc.logger.Info("primecloud_operation_transport_connected", "queue_url", vc.queueURL)
 	vc.logger.Info("primecloud_operation_consumer_ready", "queue_key", vc.queueKey)
 
@@ -104,43 +129,45 @@ func (vc *ValkeyConsumer) runConsumerLoop(ctx context.Context) error {
 		cmd := fmt.Sprintf("*3\r\n$5\r\nBLPOP\r\n$%d\r\n%s\r\n$1\r\n2\r\n", len(vc.queueKey), vc.queueKey)
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := writer.WriteString(cmd); err != nil {
-			return err
+			vc.logger.Error("valkey_consumer_read_error", "stage", "write_blpop", "error", err)
+			return fmt.Errorf("valkey consumer write error: %w", err)
 		}
 		if err := writer.Flush(); err != nil {
-			return err
+			vc.logger.Error("valkey_consumer_read_error", "stage", "flush_blpop", "error", err)
+			return fmt.Errorf("valkey consumer flush error: %w", err)
 		}
 
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// Read deadline must exceed the BLPOP 2-second timeout (e.g. 7 seconds).
+		// If deadline expires without response, connection is dead or hung; must reconnect.
+		conn.SetReadDeadline(time.Now().Add(7 * time.Second))
 		reply, err := parseRESP(reader)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			if err == io.EOF {
-				return err
-			}
-			continue
+			vc.logger.Error("valkey_consumer_read_error", "stage", "parse_resp", "error", err, "queue_key", vc.queueKey)
+			return fmt.Errorf("valkey consumer read/parse error: %w", err)
 		}
 
+		// Normal 2-second BLPOP timeout returns nil array (*-1\r\n) with no error.
 		if reply == nil {
 			continue
 		}
 
 		items, ok := reply.([]interface{})
 		if !ok || len(items) < 2 {
-			continue
+			vc.logger.Error("valkey_consumer_read_error", "stage", "invalid_blpop_reply_format", "reply", reply)
+			return fmt.Errorf("unexpected BLPOP response format: %v", reply)
 		}
 
 		rawItemStr, ok := items[1].(string)
 		if !ok || rawItemStr == "" {
+			vc.logger.Warn("valkey_consumer_empty_item", "reply", reply)
 			continue
 		}
 
-		vc.processItem(ctx, conn, writer, reader, rawItemStr)
+		vc.processItem(ctx, rawItemStr)
 	}
 }
 
-func (vc *ValkeyConsumer) processItem(ctx context.Context, conn net.Conn, writer *bufio.Writer, reader *bufio.Reader, rawItemStr string) {
+func (vc *ValkeyConsumer) processItem(ctx context.Context, rawItemStr string) {
 	startTime := time.Now()
 
 	var rawObj map[string]interface{}
@@ -161,14 +188,41 @@ func (vc *ValkeyConsumer) processItem(ctx context.Context, conn net.Conn, writer
 		}
 	}
 	opType, _ := payloadMap["operation_type"].(string)
+
 	resourceID, _ := payloadMap["resource_id"].(string)
+	if resourceID == "" {
+		resourceID, _ = payloadMap["application_id"].(string)
+	}
+	if resourceID == "" {
+		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
+			resourceID, _ = params["resource_id"].(string)
+			if resourceID == "" {
+				resourceID, _ = params["application_id"].(string)
+			}
+		}
+	}
+
 	projectID, _ := payloadMap["project_id"].(string)
+	if projectID == "" {
+		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
+			projectID, _ = params["project_id"].(string)
+		}
+	}
+
 	envID, _ := payloadMap["environment_id"].(string)
+	if envID == "" {
+		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
+			envID, _ = params["environment_id"].(string)
+		}
+	}
 
 	var payloadJSON string
 	if pjStr, ok := payloadMap["payload_json"].(string); ok {
 		payloadJSON = pjStr
 	} else if pObj, ok := payloadMap["payload_json"].(map[string]interface{}); ok {
+		b, _ := json.Marshal(pObj)
+		payloadJSON = string(b)
+	} else if pObj, ok := payloadMap["payload"].(map[string]interface{}); ok && len(pObj) > 0 {
 		b, _ := json.Marshal(pObj)
 		payloadJSON = string(b)
 	} else if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
@@ -250,12 +304,27 @@ func (vc *ValkeyConsumer) processItem(ctx context.Context, conn net.Conn, writer
 	}
 
 	resultBytes, _ := json.Marshal(resultData)
-	vc.publishResult(conn, writer, reader, env.OperationId, string(resultBytes))
+	vc.publishResult(env.OperationId, string(resultBytes))
 }
 
-func (vc *ValkeyConsumer) publishResult(conn net.Conn, writer *bufio.Writer, reader *bufio.Reader, opID, resultJSON string) {
+// publishResult writes correlated operation results using a dedicated connection,
+// ensuring the consumer BLPOP TCP stream is never contaminated.
+func (vc *ValkeyConsumer) publishResult(opID, resultJSON string) {
 	key := fmt.Sprintf("operation:%s:result", opID)
 	ttl := "300"
+	addr := normalizeValkeyAddr(vc.queueURL)
+
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		vc.logger.Error("valkey_consumer_publish_result_dial_failed", "operation_id", opID, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	writer := bufio.NewWriter(conn)
+	reader := bufio.NewReader(conn)
+
 	cmd := fmt.Sprintf("*4\r\n$5\r\nSETEX\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 		len(key), key, len(ttl), ttl, len(resultJSON), resultJSON)
 
@@ -270,7 +339,7 @@ func (vc *ValkeyConsumer) publishResult(conn net.Conn, writer *bufio.Writer, rea
 	}
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := parseRESP(reader)
+	_, err = parseRESP(reader)
 	if err != nil {
 		vc.logger.Error("valkey_consumer_publish_result_reply_failed", "operation_id", opID, "error", err)
 		return
@@ -283,7 +352,7 @@ func parseRESP(r *bufio.Reader) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	line = strings.TrimSuffix(line, "\r\n")
+	line = strings.TrimRight(line, "\r\n")
 	if len(line) == 0 {
 		return nil, nil
 	}
@@ -310,8 +379,11 @@ func parseRESP(r *bufio.Reader) (interface{}, error) {
 		return string(buf[:n]), nil
 	case '*':
 		n, err := strconv.Atoi(content)
-		if err != nil || n <= 0 {
+		if err != nil || n < 0 {
 			return nil, nil
+		}
+		if n == 0 {
+			return []interface{}{}, nil
 		}
 		arr := make([]interface{}, n)
 		for i := 0; i < n; i++ {
