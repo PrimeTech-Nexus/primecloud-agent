@@ -214,21 +214,33 @@ func (vc *ValkeyConsumer) processItem(ctx context.Context, rawItemStr string) {
 
 	// Determine payload map and preserve identity fields
 	var payloadMap map[string]interface{}
+	var innerParams map[string]interface{}
+
 	if params, ok := rawObj["parameters"].(map[string]interface{}); ok && len(params) > 0 {
-		payloadMap = make(map[string]interface{}, len(params)+4)
-		for k, v := range params {
-			payloadMap[k] = v
-		}
+		innerParams = params
 	} else if p, ok := rawObj["payload"].(map[string]interface{}); ok && len(p) > 0 {
-		payloadMap = make(map[string]interface{}, len(p)+4)
-		for k, v := range p {
-			payloadMap[k] = v
+		if params, ok := p["parameters"].(map[string]interface{}); ok && len(params) > 0 {
+			innerParams = params
+		} else if innerP, ok := p["payload"].(map[string]interface{}); ok && len(innerP) > 0 {
+			innerParams = innerP
+		} else {
+			innerParams = p
 		}
 	} else {
-		payloadMap = make(map[string]interface{}, len(rawObj))
-		for k, v := range rawObj {
-			payloadMap[k] = v
+		innerParams = rawObj
+	}
+
+	payloadMap = make(map[string]interface{}, len(innerParams)+8)
+	// If rawObj["payload"] exists, copy top-level payload metadata first
+	if p, ok := rawObj["payload"].(map[string]interface{}); ok && len(p) > 0 {
+		for k, v := range p {
+			if k != "parameters" && k != "payload" {
+				payloadMap[k] = v
+			}
 		}
+	}
+	for k, v := range innerParams {
+		payloadMap[k] = v
 	}
 
 	if projectID != "" {

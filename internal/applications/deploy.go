@@ -16,6 +16,7 @@ import (
 // DeployPayload defines the JSON payload schema for deploy_application operations.
 type DeployPayload struct {
 	Image            string                  `json:"image"`
+	ImageReference   string                  `json:"image_reference"`
 	ImageDigest      string                  `json:"image_digest"`
 	Env              map[string]string       `json:"env"`
 	EnvVars          map[string]string       `json:"env_vars"` // Backwards-compatible combined environment map
@@ -61,6 +62,13 @@ func (d *Deployer) Deploy(
 	imageToPull := strings.TrimSpace(payload.Image)
 	if strings.HasPrefix(imageToPull, "sha256:") {
 		imageToPull = ""
+	}
+
+	if imageToPull == "" {
+		ref := strings.TrimSpace(payload.ImageReference)
+		if ref != "" && !strings.HasPrefix(ref, "sha256:") {
+			imageToPull = ref
+		}
 	}
 
 	if imageToPull == "" {

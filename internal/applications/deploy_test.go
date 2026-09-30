@@ -419,4 +419,82 @@ func TestDeploy_ZeroSecretsPassThroughWithoutVault(t *testing.T) {
 	}
 }
 
+func TestDeploy_CanonicalImageWithOciDigestProvenance(t *testing.T) {
+	mockRT := &mockRuntime{
+		containerID: "cnt-canonical-image",
+	}
+	deployer := applications.NewDeployer(mockRT, nil, nil)
+	ctx := context.Background()
+
+	// Canonical payload required by Go Agent
+	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+		"image_reference": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+		"image_digest": "sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e"
+	}`
+
+	_, err := deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", payloadJSON)
+	if err != nil {
+		t.Fatalf("Deploy failed for canonical image payload: %v", err)
+	}
+
+	if !mockRT.pullImageCalled {
+		t.Fatal("expected PullImageWithAuth to be called")
+	}
+	if mockRT.pullImageRef != "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90" {
+		t.Fatalf("expected pulled image to be ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90, got: %s", mockRT.pullImageRef)
+	}
+	if mockRT.createImage != "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90" {
+		t.Fatalf("expected created container image to be ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90, got: %s", mockRT.createImage)
+	}
+}
+
+func TestDeploy_FallbackToImageReferenceWhenImageIsBareDigestOrEmpty(t *testing.T) {
+	mockRT := &mockRuntime{
+		containerID: "cnt-fallback-ref",
+	}
+	deployer := applications.NewDeployer(mockRT, nil, nil)
+	ctx := context.Background()
+
+	// Image is bare digest, image_reference has canonical registry reference
+	payloadJSON := `{
+		"image": "sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e",
+		"image_reference": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+		"image_digest": "sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e"
+	}`
+
+	_, err := deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", payloadJSON)
+	if err != nil {
+		t.Fatalf("Deploy failed with image_reference fallback: %v", err)
+	}
+
+	if mockRT.pullImageRef != "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90" {
+		t.Fatalf("expected fallback to image_reference, got: %s", mockRT.pullImageRef)
+	}
+}
+
+func TestDeploy_RejectsBareSha256DigestWithoutCanonicalReference(t *testing.T) {
+	mockRT := &mockRuntime{
+		containerID: "cnt-bare-digest",
+	}
+	deployer := applications.NewDeployer(mockRT, nil, nil)
+	ctx := context.Background()
+
+	payloadJSON := `{
+		"image": "sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e",
+		"image_digest": "sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e"
+	}`
+
+	_, err := deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", payloadJSON)
+	if err == nil {
+		t.Fatal("expected Deploy to fail when only bare sha256 digest is provided")
+	}
+
+	expectedErr := "invalid image reference: bare sha256 digest is not pullable; canonical registry reference required"
+	if !strings.Contains(err.Error(), expectedErr) {
+		t.Fatalf("expected error containing %q, got %q", expectedErr, err.Error())
+	}
+}
+
+
 

@@ -558,6 +558,9 @@ func TestValkeyConsumer_TopLevelIdentityWithNestedPayload(t *testing.T) {
 		if payloadMap["project_id"] != "0191proj-0000-7000-8000-000000000001" {
 			t.Errorf("expected payload project_id to be preserved, got '%v'", payloadMap["project_id"])
 		}
+		if payloadMap["image"] != "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90" {
+			t.Errorf("expected payload image to be preserved, got '%v'", payloadMap["image"])
+		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("timed out waiting for top-level identity test")
 	}
