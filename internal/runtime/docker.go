@@ -3,7 +3,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
@@ -58,9 +58,23 @@ func (d *DockerRuntime) Ping(ctx context.Context) error {
 	return err
 }
 
-type authConfig struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+// EncodeGHCRAuth formats registry credentials into standard base64url AuthConfig header.
+func EncodeGHCRAuth(username, password string) string {
+	if password == "" {
+		return ""
+	}
+	if username == "" {
+		username = "x-access-token"
+	}
+	authData, err := registry.EncodeAuthConfig(registry.AuthConfig{
+		ServerAddress: "ghcr.io",
+		Username:      username,
+		Password:      password,
+	})
+	if err == nil {
+		return authData
+	}
+	return ""
 }
 
 // GetGHCRAuth resolves GitHub Container Registry credentials from environment, credential files, or docker config.
@@ -77,9 +91,6 @@ func GetGHCRAuth() string {
 			tok := strings.TrimSpace(string(tokenBytes))
 			if tok != "" {
 				p = tok
-				if u == "" {
-					u = "x-access-token"
-				}
 			}
 		}
 	}
@@ -110,14 +121,8 @@ func GetGHCRAuth() string {
 		}
 	}
 
-	if u != "" && p != "" {
-		authData, err := json.Marshal(authConfig{
-			Username: u,
-			Password: p,
-		})
-		if err == nil {
-			return base64.URLEncoding.EncodeToString(authData)
-		}
+	if p != "" {
+		return EncodeGHCRAuth(u, p)
 	}
 	return ""
 }

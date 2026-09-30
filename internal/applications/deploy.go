@@ -104,7 +104,8 @@ func (d *Deployer) Deploy(
 
 	// 2. Pull container image before creation
 	d.logger.Info("docker_image_pulling", "image", imageToPull)
-	if err := d.rt.PullImage(ctx, imageToPull); err != nil {
+	authStr := d.resolveGHCRAuth(ctx)
+	if err := d.rt.PullImageWithAuth(ctx, imageToPull, authStr); err != nil {
 		d.logger.Error("docker_image_pull_failed", "image", imageToPull, "error", err)
 		return "", fmt.Errorf("failed to pull docker image %s: %w", imageToPull, err)
 	}
@@ -189,4 +190,27 @@ func (d *Deployer) resolveSecret(ctx context.Context, ref string) (string, error
 	}
 
 	return fmt.Sprintf("%v", val), nil
+}
+
+func (d *Deployer) resolveGHCRAuth(ctx context.Context) string {
+	// 1. Check environment variables, node credentials, or docker config
+	if auth := runtime.GetGHCRAuth(); auth != "" {
+		return auth
+	}
+
+	// 2. Fallback to HashiCorp Vault at primecloud/github/ghcr
+	if d.vaultClient != nil {
+		data, err := d.vaultClient.ReadSecret(ctx, "primecloud/github/ghcr")
+		if err == nil && data != nil {
+			u, _ := data["username"].(string)
+			p, _ := data["token"].(string)
+			if p == "" {
+				p, _ = data["password"].(string)
+			}
+			if p != "" {
+				return runtime.EncodeGHCRAuth(u, p)
+			}
+		}
+	}
+	return ""
 }
