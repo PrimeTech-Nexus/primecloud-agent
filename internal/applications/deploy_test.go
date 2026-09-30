@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
@@ -150,6 +151,48 @@ func TestDeploy_PullFailureAbortsBeforeCreate(t *testing.T) {
 	}
 }
 
+func TestDeploy_PassesGHCRAuthToPull(t *testing.T) {
+	origUser := os.Getenv("GHCR_USERNAME")
+	origTok := os.Getenv("GHCR_TOKEN")
+	defer func() {
+		os.Setenv("GHCR_USERNAME", origUser)
+		os.Setenv("GHCR_TOKEN", origTok)
+	}()
+
+	os.Setenv("GHCR_USERNAME", "deployer-user")
+	os.Setenv("GHCR_TOKEN", "ghp_mock_token_12345")
+
+	mockRT := &mockRuntime{
+		containerID: "cnt-auth-success-123",
+	}
+
+	deployer := applications.NewDeployer(mockRT, nil, nil)
+	ctx := context.Background()
+
+	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+		"ports": {"8080": "8080"}
+	}`
+
+	cid, err := deployer.Deploy(ctx, "proj-1", "env-1", "app-1", "inst-1", payloadJSON)
+	if err != nil {
+		t.Fatalf("unexpected deploy failure: %v", err)
+	}
+
+	if cid != "cnt-auth-success-123" {
+		t.Errorf("expected container id cnt-auth-success-123, got %s", cid)
+	}
+
+	if !mockRT.pullImageCalled {
+		t.Fatal("expected PullImageWithAuth to be called")
+	}
+
+	expectedAuth := runtime.EncodeGHCRAuth("deployer-user", "ghp_mock_token_12345")
+	if mockRT.pullAuthBase64 != expectedAuth {
+		t.Fatalf("expected pull auth %s, got %s", expectedAuth, mockRT.pullAuthBase64)
+	}
+}
+
 func TestDeploy_RejectsBareSha256(t *testing.T) {
 	mockRT := &mockRuntime{}
 	deployer := applications.NewDeployer(mockRT, nil, nil)
@@ -168,3 +211,5 @@ func TestDeploy_RejectsBareSha256(t *testing.T) {
 		t.Fatal("Neither PullImage nor CreateContainer should be invoked for bare sha256")
 	}
 }
+
+

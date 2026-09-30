@@ -105,6 +105,11 @@ func (d *Deployer) Deploy(
 	// 2. Pull container image before creation
 	d.logger.Info("docker_image_pulling", "image", imageToPull)
 	authStr := d.resolveGHCRAuth(ctx)
+	if authStr != "" {
+		d.logger.Info("registry_auth_resolved", "registry", "ghcr.io")
+	} else {
+		d.logger.Warn("registry_auth_unresolved", "registry", "ghcr.io")
+	}
 	if err := d.rt.PullImageWithAuth(ctx, imageToPull, authStr); err != nil {
 		d.logger.Error("docker_image_pull_failed", "image", imageToPull, "error", err)
 		return "", fmt.Errorf("failed to pull docker image %s: %w", imageToPull, err)

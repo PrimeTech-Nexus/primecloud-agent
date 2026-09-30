@@ -77,53 +77,81 @@ func EncodeGHCRAuth(username, password string) string {
 	return ""
 }
 
-// GetGHCRAuth resolves GitHub Container Registry credentials from environment, credential files, or docker config.
+// GetGHCRAuth resolves GitHub Container Registry credentials from environment, dedicated GHCR credential files, or docker config.
+// IMPORTANT: /etc/primecloud/credentials/github_artifact_token is EXCLUSIVELY an installation token for
+// the PrimeTech-Nexus/primecloud-agent repository (contents:read) and MUST NOT be used for GHCR container registry pulls.
 func GetGHCRAuth() string {
 	u := os.Getenv("GHCR_USERNAME")
+	if u == "" {
+		u = os.Getenv("PRIMECLOUD_GHCR_USERNAME")
+	}
 	p := os.Getenv("GHCR_TOKEN")
+	if p == "" {
+		p = os.Getenv("PRIMECLOUD_GHCR_TOKEN")
+	}
 	if p == "" {
 		p = os.Getenv("GITHUB_TOKEN")
 	}
 
-	// Fallback 1: check provisioned GitHub artifact token file on production node
-	if p == "" {
-		if tokenBytes, err := os.ReadFile("/etc/primecloud/credentials/github_artifact_token"); err == nil {
-			tok := strings.TrimSpace(string(tokenBytes))
-			if tok != "" {
-				p = tok
-			}
-		}
-	}
-
-	// Fallback 2: check host ~/.docker/config.json or /root/.docker/config.json
-	if p == "" {
-		dockerConfigPath := "/root/.docker/config.json"
-		if home, err := os.UserHomeDir(); err == nil {
-			userConfig := filepath.Join(home, ".docker", "config.json")
-			if _, err := os.Stat(userConfig); err == nil {
-				dockerConfigPath = userConfig
-			}
-		}
-		if data, err := os.ReadFile(dockerConfigPath); err == nil {
-			var cfg struct {
-				Auths map[string]struct {
-					Auth string `json:"auth"`
-				} `json:"auths"`
-			}
-			if err := json.Unmarshal(data, &cfg); err == nil {
-				if a, ok := cfg.Auths["ghcr.io"]; ok && a.Auth != "" {
-					return a.Auth
-				}
-				if a, ok := cfg.Auths["https://ghcr.io"]; ok && a.Auth != "" {
-					return a.Auth
-				}
-			}
-		}
-	}
-
+	// 1. If username and token are in environment, encode and return
 	if p != "" {
 		return EncodeGHCRAuth(u, p)
 	}
+
+	// 2. Check dedicated GHCR credentials JSON file (/etc/primecloud/credentials/ghcr_auth.json)
+	if data, err := os.ReadFile("/etc/primecloud/credentials/ghcr_auth.json"); err == nil {
+		var cred struct {
+			Username string `json:"username"`
+			Token    string `json:"token"`
+			Password string `json:"password"`
+		}
+		if err := json.Unmarshal(data, &cred); err == nil {
+			tok := cred.Token
+			if tok == "" {
+				tok = cred.Password
+			}
+			if tok != "" {
+				user := cred.Username
+				if user == "" {
+					user = u
+				}
+				return EncodeGHCRAuth(user, tok)
+			}
+		}
+	}
+
+	// 3. Check dedicated GHCR token file (/etc/primecloud/credentials/ghcr_token)
+	if tokenBytes, err := os.ReadFile("/etc/primecloud/credentials/ghcr_token"); err == nil {
+		tok := strings.TrimSpace(string(tokenBytes))
+		if tok != "" {
+			return EncodeGHCRAuth(u, tok)
+		}
+	}
+
+	// 4. Check host ~/.docker/config.json or /root/.docker/config.json
+	dockerConfigPath := "/root/.docker/config.json"
+	if home, err := os.UserHomeDir(); err == nil {
+		userConfig := filepath.Join(home, ".docker", "config.json")
+		if _, err := os.Stat(userConfig); err == nil {
+			dockerConfigPath = userConfig
+		}
+	}
+	if data, err := os.ReadFile(dockerConfigPath); err == nil {
+		var cfg struct {
+			Auths map[string]struct {
+				Auth string `json:"auth"`
+			} `json:"auths"`
+		}
+		if err := json.Unmarshal(data, &cfg); err == nil {
+			if a, ok := cfg.Auths["ghcr.io"]; ok && a.Auth != "" {
+				return a.Auth
+			}
+			if a, ok := cfg.Auths["https://ghcr.io"]; ok && a.Auth != "" {
+				return a.Auth
+			}
+		}
+	}
+
 	return ""
 }
 

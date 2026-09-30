@@ -90,6 +90,8 @@ func LoadConfig() (*Config, error) {
 		cfg.BootstrapToken = v
 	} else if v := os.Getenv("VAULT_TOKEN"); v != "" {
 		cfg.BootstrapToken = v
+	} else if tokBytes, err := os.ReadFile("/etc/primecloud/bootstrap-token"); err == nil {
+		cfg.BootstrapToken = strings.TrimSpace(string(tokBytes))
 	}
 	if v := os.Getenv("PRIMECLOUD_AGENT_CERT_DIR"); v != "" {
 		cfg.CertDir = v
