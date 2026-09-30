@@ -213,7 +213,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 2. restart_application
 	registry.Register("restart_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		containerID := op.ResourceId
+		containerID := resolveAppContainerTarget(ctx, rt, op)
 		if err := applications.RestartApplication(ctx, rt, containerID, 10); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -233,7 +233,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 3. remove_application
 	registry.Register("remove_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		containerID := op.ResourceId
+		containerID := resolveAppContainerTarget(ctx, rt, op)
 		if err := applications.RemoveApplication(ctx, rt, containerID, true); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -253,7 +253,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 4. health_check_application
 	registry.Register("health_check_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		containerID := op.ResourceId
+		containerID := resolveAppContainerTarget(ctx, rt, op)
 		if err := applications.WaitForContainerReady(ctx, rt, containerID, 10*time.Second); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -868,6 +868,35 @@ func extractResourceID(op *pb.OperationEnvelope, fallbackKeys ...string) string 
 		}
 	}
 	return op.OperationId
+}
+
+func resolveAppContainerTarget(ctx context.Context, rt runtime.ContainerRuntime, op *pb.OperationEnvelope) string {
+	payload := parsePayloadMap(op.PayloadJson)
+	if cID, ok := payload["container_id"].(string); ok && cID != "" {
+		if inspect, err := rt.InspectContainer(ctx, cID); err == nil && inspect != nil {
+			return cID
+		}
+	}
+
+	target := op.ResourceId
+	if target != "" {
+		if inspect, err := rt.InspectContainer(ctx, target); err == nil && inspect != nil {
+			return target
+		}
+		// Try standard pc-app- prefix for application UUIDs
+		prefixed := fmt.Sprintf("pc-app-%s", target)
+		if inspect, err := rt.InspectContainer(ctx, prefixed); err == nil && inspect != nil {
+			return prefixed
+		}
+	}
+
+	if cID, ok := payload["container_id"].(string); ok && cID != "" {
+		return cID
+	}
+	if target != "" {
+		return fmt.Sprintf("pc-app-%s", target)
+	}
+	return target
 }
 
 func parsePayloadMap(payloadJSON string) map[string]interface{} {
