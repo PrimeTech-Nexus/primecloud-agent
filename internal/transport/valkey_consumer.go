@@ -176,58 +176,75 @@ func (vc *ValkeyConsumer) processItem(ctx context.Context, rawItemStr string) {
 		return
 	}
 
-	payloadMap := rawObj
-	if p, ok := rawObj["payload"].(map[string]interface{}); ok {
-		payloadMap = p
-	}
-
-	opID, _ := payloadMap["operation_id"].(string)
-	if opID == "" {
-		if id, ok := rawObj["id"].(string); ok {
-			opID = id
-		}
-	}
-	opType, _ := payloadMap["operation_type"].(string)
-
-	resourceID, _ := payloadMap["resource_id"].(string)
-	if resourceID == "" {
-		resourceID, _ = payloadMap["application_id"].(string)
-	}
-	if resourceID == "" {
-		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
-			resourceID, _ = params["resource_id"].(string)
-			if resourceID == "" {
-				resourceID, _ = params["application_id"].(string)
+	// Authoritative identity extraction helper across rawObj, payload, and parameters
+	extractField := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := rawObj[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+			if p, ok := rawObj["payload"].(map[string]interface{}); ok {
+				if v, ok := p[k].(string); ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+				if innerP, ok := p["parameters"].(map[string]interface{}); ok {
+					if v, ok := innerP[k].(string); ok && strings.TrimSpace(v) != "" {
+						return strings.TrimSpace(v)
+					}
+				}
+			}
+			if p, ok := rawObj["parameters"].(map[string]interface{}); ok {
+				if v, ok := p[k].(string); ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+				if innerP, ok := p["payload"].(map[string]interface{}); ok {
+					if v, ok := innerP[k].(string); ok && strings.TrimSpace(v) != "" {
+						return strings.TrimSpace(v)
+					}
+				}
 			}
 		}
+		return ""
 	}
 
-	projectID, _ := payloadMap["project_id"].(string)
-	if projectID == "" {
-		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
-			projectID, _ = params["project_id"].(string)
+	opID := extractField("operation_id", "id")
+	opType := extractField("operation_type", "type")
+	resourceID := extractField("resource_id", "application_id")
+	projectID := extractField("project_id", "tenant_id")
+	envID := extractField("environment_id", "env_id")
+
+	// Determine payload map and preserve identity fields
+	var payloadMap map[string]interface{}
+	if params, ok := rawObj["parameters"].(map[string]interface{}); ok && len(params) > 0 {
+		payloadMap = make(map[string]interface{}, len(params)+4)
+		for k, v := range params {
+			payloadMap[k] = v
+		}
+	} else if p, ok := rawObj["payload"].(map[string]interface{}); ok && len(p) > 0 {
+		payloadMap = make(map[string]interface{}, len(p)+4)
+		for k, v := range p {
+			payloadMap[k] = v
+		}
+	} else {
+		payloadMap = make(map[string]interface{}, len(rawObj))
+		for k, v := range rawObj {
+			payloadMap[k] = v
 		}
 	}
 
-	envID, _ := payloadMap["environment_id"].(string)
-	if envID == "" {
-		if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
-			envID, _ = params["environment_id"].(string)
-		}
+	if projectID != "" {
+		payloadMap["project_id"] = projectID
+	}
+	if envID != "" {
+		payloadMap["environment_id"] = envID
+	}
+	if resourceID != "" {
+		payloadMap["resource_id"] = resourceID
+		payloadMap["application_id"] = resourceID
 	}
 
 	var payloadJSON string
-	if pjStr, ok := payloadMap["payload_json"].(string); ok {
+	if pjStr, ok := rawObj["payload_json"].(string); ok && strings.TrimSpace(pjStr) != "" {
 		payloadJSON = pjStr
-	} else if pObj, ok := payloadMap["payload_json"].(map[string]interface{}); ok {
-		b, _ := json.Marshal(pObj)
-		payloadJSON = string(b)
-	} else if pObj, ok := payloadMap["payload"].(map[string]interface{}); ok && len(pObj) > 0 {
-		b, _ := json.Marshal(pObj)
-		payloadJSON = string(b)
-	} else if params, ok := payloadMap["parameters"].(map[string]interface{}); ok {
-		b, _ := json.Marshal(params)
-		payloadJSON = string(b)
 	} else {
 		b, _ := json.Marshal(payloadMap)
 		payloadJSON = string(b)

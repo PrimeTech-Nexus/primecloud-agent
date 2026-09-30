@@ -441,3 +441,125 @@ func TestValkeyConsumer_EnvelopeFallback(t *testing.T) {
 		t.Fatal("timed out waiting for envelope fallback test")
 	}
 }
+
+func TestValkeyConsumer_TopLevelIdentityWithNestedPayload(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverAddr := listener.Addr().String()
+	receivedEnvelopeChan := make(chan *pb.OperationEnvelope, 1)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
+					}
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+					if cmdName == "BLPOP" {
+						// Authentic Control Plane AgentOperationPayload schema
+						itemObj := map[string]interface{}{
+							"operation_id":   "ebaa013b-007f-43a4-96ea-b2ea541703a8",
+							"operation_type": "deploy_application",
+							"node_id":        "0191c001-0000-7000-8000-000000000001",
+							"resource_id":    "01a0ea25-2887-7cf2-9bcd-2a7a18850df3",
+							"application_id": "01a0ea25-2887-7cf2-9bcd-2a7a18850df3",
+							"project_id":     "0191proj-0000-7000-8000-000000000001",
+							"environment_id": "0191env0-0000-7000-8000-000000000001",
+							"deployment_id":  "01a0f29f-1c84-7c25-8c43-ab9bb78edfc6",
+							"payload": map[string]interface{}{
+								"image": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+								"env": map[string]interface{}{
+									"PORT": "8080",
+								},
+								"secret_refs": map[string]interface{}{
+									"SECRET_KEY": "secret/data/primecloud/tenants/proj/app/env#SECRET_KEY",
+								},
+							},
+							"parameters": map[string]interface{}{
+								"image": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+								"port":  8080,
+							},
+						}
+						itemBytes, _ := json.Marshal(itemObj)
+						itemStr := string(itemBytes)
+						keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+						resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+						writer.WriteString(resp)
+						writer.Flush()
+					} else if cmdName == "SETEX" {
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	registry := operations.NewRegistry()
+	registry.Register("deploy_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		receivedEnvelopeChan <- op
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := operations.NewDispatcher(registry, nil, nil, logger)
+	consumer := NewValkeyConsumer(serverAddr, "0191c001-0000-7000-8000-000000000001", dispatcher, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = consumer.Start(ctx)
+	}()
+
+	select {
+	case env := <-receivedEnvelopeChan:
+		if env.OperationId != "ebaa013b-007f-43a4-96ea-b2ea541703a8" {
+			t.Errorf("expected OperationId 'ebaa013b-007f-43a4-96ea-b2ea541703a8', got '%s'", env.OperationId)
+		}
+		if env.OperationType != "deploy_application" {
+			t.Errorf("expected OperationType 'deploy_application', got '%s'", env.OperationType)
+		}
+		if env.ResourceId != "01a0ea25-2887-7cf2-9bcd-2a7a18850df3" {
+			t.Errorf("expected ResourceId '01a0ea25-2887-7cf2-9bcd-2a7a18850df3', got '%s'", env.ResourceId)
+		}
+		if env.ProjectId != "0191proj-0000-7000-8000-000000000001" {
+			t.Errorf("expected ProjectId '0191proj-0000-7000-8000-000000000001', got '%s'", env.ProjectId)
+		}
+		if env.EnvironmentId != "0191env0-0000-7000-8000-000000000001" {
+			t.Errorf("expected EnvironmentId '0191env0-0000-7000-8000-000000000001', got '%s'", env.EnvironmentId)
+		}
+
+		var payloadMap map[string]interface{}
+		if err := json.Unmarshal([]byte(env.PayloadJson), &payloadMap); err != nil {
+			t.Fatalf("failed to unmarshal payload JSON: %v", err)
+		}
+		if payloadMap["project_id"] != "0191proj-0000-7000-8000-000000000001" {
+			t.Errorf("expected payload project_id to be preserved, got '%v'", payloadMap["project_id"])
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for top-level identity test")
+	}
+}
+
