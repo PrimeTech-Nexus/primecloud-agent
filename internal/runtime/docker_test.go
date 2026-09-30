@@ -163,3 +163,40 @@ func TestGetGHCRAuth_FromDockerConfig(t *testing.T) {
 		t.Errorf("expected 'ZG9ja2VyY29uZmlndGVzdA==', got '%s'", auth)
 	}
 }
+
+func TestBuildEnvSlice_FormatsEntries(t *testing.T) {
+	env := map[string]string{
+		"PORT":        "8000",
+		"NODE_ENV":    "production",
+		"SECRET_KEY":  "real-secret-value",
+		"DATABASE_URL": "postgresql://user:pass@db:5432/app",
+	}
+
+	slice := runtime.BuildEnvSlice(env)
+	if len(slice) != 4 {
+		t.Fatalf("expected 4 entries in envSlice, got %d", len(slice))
+	}
+
+	foundMap := make(map[string]bool)
+	for _, entry := range slice {
+		foundMap[entry] = true
+	}
+
+	expected := []string{
+		"PORT=8000",
+		"NODE_ENV=production",
+		"SECRET_KEY=real-secret-value",
+		"DATABASE_URL=postgresql://user:pass@db:5432/app",
+	}
+
+	for _, exp := range expected {
+		if !foundMap[exp] {
+			t.Errorf("expected entry %s to be present in envSlice", exp)
+		}
+	}
+
+	emptySlice := runtime.BuildEnvSlice(nil)
+	if len(emptySlice) != 0 {
+		t.Errorf("expected 0 entries for nil env, got %d", len(emptySlice))
+	}
+}

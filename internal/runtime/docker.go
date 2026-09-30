@@ -178,6 +178,18 @@ func (d *DockerRuntime) PullImageWithAuth(ctx context.Context, imageRef string, 
 	return nil
 }
 
+// BuildEnvSlice converts an environment map into Docker's KEY=VALUE string slice.
+func BuildEnvSlice(env map[string]string) []string {
+	if len(env) == 0 {
+		return []string{}
+	}
+	envSlice := make([]string, 0, len(env))
+	for k, v := range env {
+		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
+	}
+	return envSlice
+}
+
 // CreateContainer creates a container applying mandatory labels, isolation profile, and resource limits.
 func (d *DockerRuntime) CreateContainer(
 	ctx context.Context,
@@ -198,10 +210,7 @@ func (d *DockerRuntime) CreateContainer(
 	cfg.EnsureMandatoryLabels()
 
 	// 1. Convert environment variables
-	envSlice := make([]string, 0, len(cfg.Env))
-	for k, v := range cfg.Env {
-		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
-	}
+	envSlice := BuildEnvSlice(cfg.Env)
 
 	// 2. Port mappings
 	exposedPorts := nat.PortSet{}

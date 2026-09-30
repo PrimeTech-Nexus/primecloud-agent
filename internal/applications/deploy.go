@@ -18,6 +18,7 @@ type DeployPayload struct {
 	Image            string                  `json:"image"`
 	ImageDigest      string                  `json:"image_digest"`
 	Env              map[string]string       `json:"env"`
+	EnvVars          map[string]string       `json:"env_vars"` // Backwards-compatible combined environment map
 	SecretRefs       map[string]string       `json:"secret_refs"` // ENV_VAR_NAME -> "path/in/vault#key"
 	Ports            map[string]string       `json:"ports"`
 	Command          []string                `json:"command"`
@@ -82,21 +83,71 @@ func (d *Deployer) Deploy(
 		"image", imageToRun,
 	)
 
-	// 1. Resolve Vault secrets and inject into environment
+	// 1. Resolve environment variables and Vault secrets
 	finalEnv := make(map[string]string)
+
+	// Populate from normal env map
 	for k, v := range payload.Env {
 		finalEnv[k] = v
 	}
 
-	if d.vaultClient != nil && len(payload.SecretRefs) > 0 {
-		for envVar, ref := range payload.SecretRefs {
-			val, err := d.resolveSecret(ctx, ref)
+	// Populate from backwards-compatible env_vars map if not already present
+	for k, v := range payload.EnvVars {
+		if _, exists := finalEnv[k]; !exists {
+			finalEnv[k] = v
+		}
+	}
+
+	// Consolidate secret references: from secret_refs map and any embedded "vault:" prefixes
+	secretRefs := make(map[string]string)
+	for k, ref := range payload.SecretRefs {
+		secretRefs[k] = ref
+	}
+	for k, v := range finalEnv {
+		if strings.HasPrefix(v, "vault:") {
+			secretRefs[k] = strings.TrimPrefix(v, "vault:")
+			delete(finalEnv, k) // Remove placeholder so raw vault: URI is never passed to container
+		}
+	}
+
+	// Safe diagnostics (keys and counts only - NEVER plaintext secret values)
+	envKeyList := make([]string, 0, len(finalEnv))
+	for k := range finalEnv {
+		envKeyList = append(envKeyList, k)
+	}
+	secretKeyList := make([]string, 0, len(secretRefs))
+	for k := range secretRefs {
+		secretKeyList = append(secretKeyList, k)
+	}
+	d.logger.Info("environment_handoff_received",
+		"normal_env_count", len(finalEnv),
+		"normal_env_keys", envKeyList,
+		"secret_ref_count", len(secretRefs),
+		"secret_ref_keys", secretKeyList,
+	)
+
+	// Resolve Vault secrets (fail-closed if secrets required but client unconfigured)
+	if len(secretRefs) > 0 {
+		if d.vaultClient == nil {
+			return "", fmt.Errorf("cannot resolve %d secret reference(s): vault client is not configured on agent", len(secretRefs))
+		}
+		for envVar, ref := range secretRefs {
+			val, err := d.resolveSecret(ctx, envVar, ref)
 			if err != nil {
 				return "", fmt.Errorf("failed to resolve secret for %s (%s): %w", envVar, ref, err)
 			}
 			finalEnv[envVar] = val
 		}
 	}
+
+	finalKeyList := make([]string, 0, len(finalEnv))
+	for k := range finalEnv {
+		finalKeyList = append(finalKeyList, k)
+	}
+	d.logger.Info("environment_resolution_completed",
+		"total_env_count", len(finalEnv),
+		"total_env_keys", finalKeyList,
+	)
 
 	if d.rt == nil {
 		return "", fmt.Errorf("container runtime is not configured")
@@ -171,15 +222,27 @@ func (d *Deployer) Deploy(
 	return containerID, nil
 }
 
-func (d *Deployer) resolveSecret(ctx context.Context, ref string) (string, error) {
-	// Format: "secret/path#key" or "path#key"
-	parts := strings.Split(ref, "#")
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid secret reference format %s (expected 'path#key')", ref)
+func (d *Deployer) resolveSecret(ctx context.Context, envVar, ref string) (string, error) {
+	// Strip optional "vault:" scheme prefix
+	cleanRef := strings.TrimPrefix(ref, "vault:")
+
+	var path, key string
+	if strings.Contains(cleanRef, "#") {
+		parts := strings.SplitN(cleanRef, "#", 2)
+		path = parts[0]
+		key = parts[1]
+	} else {
+		path = cleanRef
+		key = envVar
 	}
 
-	path := parts[0]
-	key := parts[1]
+	if key == "" {
+		key = envVar
+	}
+
+	if path == "" {
+		return "", fmt.Errorf("secret reference path is empty for variable %s", envVar)
+	}
 
 	data, err := d.vaultClient.ReadSecret(ctx, path)
 	if err != nil {
@@ -187,6 +250,11 @@ func (d *Deployer) resolveSecret(ctx context.Context, ref string) (string, error
 	}
 	if data == nil {
 		return "", fmt.Errorf("secret not found in vault at %s", path)
+	}
+
+	// HashiCorp Vault KV v2 wraps secret data under "data"
+	if nested, ok := data["data"].(map[string]interface{}); ok {
+		data = nested
 	}
 
 	val, exists := data[key]
