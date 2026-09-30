@@ -2,6 +2,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +19,8 @@ type Config struct {
 	ControlPlaneURL     string        `json:"control_plane_url"`
 	QueueURL            string        `json:"queue_url"`
 	VaultAddr           string        `json:"vault_addr"`
+	VaultRoleID         string        `json:"-"` // Never serialized in JSON
+	VaultSecretID       string        `json:"-"` // Never serialized in JSON
 	BootstrapToken      string        `json:"-"` // Never serialized in JSON
 	CertDir             string        `json:"cert_dir"`
 	ResourceDir         string        `json:"resource_dir"`
@@ -82,14 +85,57 @@ func LoadConfig() (*Config, error) {
 		cfg.QueueURL = v
 	}
 	if v := os.Getenv("VAULT_ADDR"); v != "" {
-		cfg.VaultAddr = v
+		cfg.VaultAddr = strings.TrimSpace(v)
 	} else if v := os.Getenv("PRIMECLOUD_AGENT_VAULT_ADDR"); v != "" {
-		cfg.VaultAddr = v
+		cfg.VaultAddr = strings.TrimSpace(v)
 	}
-	if v := os.Getenv("PRIMECLOUD_AGENT_BOOTSTRAP_TOKEN"); v != "" {
-		cfg.BootstrapToken = v
+
+	// 2a. Vault AppRole Credentials (preferred machine authentication)
+	if v := os.Getenv("PRIMECLOUD_AGENT_VAULT_ROLE_ID"); v != "" {
+		cfg.VaultRoleID = strings.TrimSpace(v)
+	} else if v := os.Getenv("VAULT_ROLE_ID"); v != "" {
+		cfg.VaultRoleID = strings.TrimSpace(v)
+	} else if idBytes, err := os.ReadFile("/etc/primecloud/credentials/vault_role_id"); err == nil {
+		cfg.VaultRoleID = strings.TrimSpace(string(idBytes))
+	}
+
+	if v := os.Getenv("PRIMECLOUD_AGENT_VAULT_SECRET_ID"); v != "" {
+		cfg.VaultSecretID = strings.TrimSpace(v)
+	} else if v := os.Getenv("VAULT_SECRET_ID"); v != "" {
+		cfg.VaultSecretID = strings.TrimSpace(v)
+	} else if secBytes, err := os.ReadFile("/etc/primecloud/credentials/vault_secret_id"); err == nil {
+		cfg.VaultSecretID = strings.TrimSpace(string(secBytes))
+	}
+
+	// Support dedicated AppRole JSON file (/etc/primecloud/credentials/vault_approle.json)
+	if cfg.VaultRoleID == "" || cfg.VaultSecretID == "" {
+		if appRoleData, err := os.ReadFile("/etc/primecloud/credentials/vault_approle.json"); err == nil {
+			var ar struct {
+				RoleID   string `json:"role_id"`
+				SecretID string `json:"secret_id"`
+			}
+			if err := json.Unmarshal(appRoleData, &ar); err == nil {
+				if cfg.VaultRoleID == "" {
+					cfg.VaultRoleID = strings.TrimSpace(ar.RoleID)
+				}
+				if cfg.VaultSecretID == "" {
+					cfg.VaultSecretID = strings.TrimSpace(ar.SecretID)
+				}
+			}
+		}
+	}
+
+	// 2b. Vault Token Fallback (direct scoped token)
+	if v := os.Getenv("PRIMECLOUD_AGENT_VAULT_TOKEN"); v != "" {
+		cfg.BootstrapToken = strings.TrimSpace(v)
+	} else if v := os.Getenv("PRIMECLOUD_AGENT_BOOTSTRAP_TOKEN"); v != "" {
+		cfg.BootstrapToken = strings.TrimSpace(v)
 	} else if v := os.Getenv("VAULT_TOKEN"); v != "" {
-		cfg.BootstrapToken = v
+		cfg.BootstrapToken = strings.TrimSpace(v)
+	} else if tokBytes, err := os.ReadFile("/etc/primecloud/credentials/vault_token"); err == nil {
+		cfg.BootstrapToken = strings.TrimSpace(string(tokBytes))
+	} else if tokBytes, err := os.ReadFile("/etc/primecloud/vault-token"); err == nil {
+		cfg.BootstrapToken = strings.TrimSpace(string(tokBytes))
 	} else if tokBytes, err := os.ReadFile("/etc/primecloud/bootstrap-token"); err == nil {
 		cfg.BootstrapToken = strings.TrimSpace(string(tokBytes))
 	}

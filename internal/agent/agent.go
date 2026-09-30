@@ -81,13 +81,25 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	var vaultClient *vault.Client
 	if cfg.VaultAddr != "" {
 		vClient, err := vault.NewClient(vault.Config{
-			Address: cfg.VaultAddr,
-			Token:   cfg.BootstrapToken,
+			Address:  cfg.VaultAddr,
+			Token:    cfg.BootstrapToken,
+			RoleID:   cfg.VaultRoleID,
+			SecretID: cfg.VaultSecretID,
 		})
 		if err != nil {
 			a.logger.Warn("vault_client_init_warning", "error", err)
 		} else {
 			vaultClient = vClient
+			authMode := "none"
+			if cfg.VaultRoleID != "" && cfg.VaultSecretID != "" {
+				authMode = "approle"
+			} else if cfg.BootstrapToken != "" {
+				authMode = "token"
+			}
+			a.logger.Info("vault_client_configured",
+				"address", cfg.VaultAddr,
+				"auth_mode", authMode,
+			)
 		}
 	}
 

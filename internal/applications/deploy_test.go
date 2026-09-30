@@ -2,6 +2,7 @@ package applications_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -495,6 +496,115 @@ func TestDeploy_RejectsBareSha256DigestWithoutCanonicalReference(t *testing.T) {
 		t.Fatalf("expected error containing %q, got %q", expectedErr, err.Error())
 	}
 }
+
+func TestDeploy_AppRoleAuthenticated_SecretResolution(t *testing.T) {
+	var vaultLoginCalled bool
+	var secretReadCalled bool
+
+	vaultSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/approle/login":
+			vaultLoginCalled = true
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["role_id"] != "agent-role-uuid" || body["secret_id"] != "agent-secret-uuid" {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprintln(w, `{"errors":["invalid approle credentials"]}`)
+				return
+			}
+			fmt.Fprintln(w, `{
+				"auth": {
+					"client_token": "s.agent-authenticated-token",
+					"lease_duration": 3600,
+					"policies": ["agent-policy"]
+				}
+			}`)
+		case "/v1/secret/data/primecloud/tenants/proj-prod/applications/platelikbackend/env":
+			secretReadCalled = true
+			token := r.Header.Get("X-Vault-Token")
+			if token != "s.agent-authenticated-token" {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprintln(w, `{"errors":["permission denied"]}`)
+				return
+			}
+			fmt.Fprintln(w, `{
+				"data": {
+					"data": {
+						"DATABASE_URL": "postgresql://prod_user:p4ssw0rd@db.internal:5432/proddb",
+						"PAYSTACK_SECRET": "sk_live_verysecretstring987"
+					}
+				}
+			}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer vaultSrv.Close()
+
+	vClient, err := vault.NewClient(vault.Config{
+		Address:  vaultSrv.URL,
+		RoleID:   "agent-role-uuid",
+		SecretID: "agent-secret-uuid",
+	})
+	if err != nil {
+		t.Fatalf("failed to create vault client: %v", err)
+	}
+
+	mockRT := &mockRuntime{
+		containerID: "cnt-approle-deploy-success",
+	}
+
+	deployer := applications.NewDeployer(mockRT, vClient, nil)
+	ctx := context.Background()
+
+	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/platelikbackend:013c8c90",
+		"env": {
+			"PORT": "8080",
+			"NODE_ENV": "production"
+		},
+		"secret_refs": {
+			"DATABASE_URL": "secret/data/primecloud/tenants/proj-prod/applications/platelikbackend/env#DATABASE_URL",
+			"PAYSTACK_SECRET": "secret/data/primecloud/tenants/proj-prod/applications/platelikbackend/env#PAYSTACK_SECRET"
+		}
+	}`
+
+	cid, err := deployer.Deploy(ctx, "proj-prod", "env-prod", "platelikbackend", "inst-1", payloadJSON)
+	if err != nil {
+		t.Fatalf("Deploy failed: %v", err)
+	}
+
+	if cid != "cnt-approle-deploy-success" {
+		t.Fatalf("expected container ID cnt-approle-deploy-success, got %s", cid)
+	}
+
+	if !vaultLoginCalled {
+		t.Fatal("expected AppRole login to be executed")
+	}
+	if !secretReadCalled {
+		t.Fatal("expected secret read to be executed")
+	}
+
+	if !mockRT.createContainerCalled || mockRT.createdConfig == nil {
+		t.Fatal("expected CreateContainer to be called with valid container config")
+	}
+
+	envMap := mockRT.createdConfig.Env
+	if envMap["PORT"] != "8080" {
+		t.Errorf("expected PORT=8080, got %q", envMap["PORT"])
+	}
+	if envMap["NODE_ENV"] != "production" {
+		t.Errorf("expected NODE_ENV=production, got %q", envMap["NODE_ENV"])
+	}
+	if envMap["DATABASE_URL"] != "postgresql://prod_user:p4ssw0rd@db.internal:5432/proddb" {
+		t.Errorf("expected DATABASE_URL to be resolved, got %q", envMap["DATABASE_URL"])
+	}
+	if envMap["PAYSTACK_SECRET"] != "sk_live_verysecretstring987" {
+		t.Errorf("expected PAYSTACK_SECRET to be resolved, got %q", envMap["PAYSTACK_SECRET"])
+	}
+}
+
 
 
 

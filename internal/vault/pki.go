@@ -30,6 +30,10 @@ func (c *Client) IssueAgentCertificate(ctx context.Context, role, commonName str
 		return nil, fmt.Errorf("%w: common name is required for certificate issuance", ErrInvalidConfig)
 	}
 
+	if err := c.EnsureAuthenticated(ctx); err != nil {
+		return nil, fmt.Errorf("vault certificate issuance authentication error: %w", err)
+	}
+
 	issuePath := fmt.Sprintf("pki_int/issue/%s", role)
 	reqData := map[string]interface{}{
 		"common_name": commonName,
