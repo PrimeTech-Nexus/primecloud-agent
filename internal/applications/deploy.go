@@ -315,12 +315,22 @@ func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map
 	}
 
 	if strings.HasPrefix(path, "secret/data/") {
-		pathsToTry = append(pathsToTry, strings.TrimPrefix(path, "secret/data/"))
-		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/data/", "secret/", 1))
+		// Preserve KV v2 API semantics when resolving across secret/ and primecloud/ mounts
+		// 1. primecloud/data/primecloud/... (if saved with subpath "primecloud/tenants/...")
+		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/data/", "primecloud/data/", 1))
+		// 2. primecloud/data/... (if saved with subpath "tenants/...")
+		if strings.HasPrefix(path, "secret/data/primecloud/") {
+			pathsToTry = append(pathsToTry, strings.Replace(path, "secret/data/primecloud/", "primecloud/data/", 1))
+		}
 	} else if strings.HasPrefix(path, "secret/") {
 		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/", "secret/data/", 1))
+		pathsToTry = append(pathsToTry, strings.Replace(path, "secret/", "primecloud/data/", 1))
+	} else if strings.HasPrefix(path, "primecloud/data/") {
+		pathsToTry = append(pathsToTry, strings.Replace(path, "primecloud/data/", "secret/data/", 1))
+		pathsToTry = append(pathsToTry, strings.Replace(path, "primecloud/data/", "secret/data/primecloud/", 1))
 	} else if strings.HasPrefix(path, "primecloud/tenants/") {
 		pathsToTry = append(pathsToTry, "secret/data/"+path)
+		pathsToTry = append(pathsToTry, "primecloud/data/"+strings.TrimPrefix(path, "primecloud/"))
 	}
 
 	// Legacy driver paths fallback (only if NOT an explicit tenant path)
@@ -412,9 +422,12 @@ func (d *Deployer) resolveGHCRAuth(ctx context.Context) string {
 		return auth
 	}
 
-	// 2. Fallback to HashiCorp Vault at primecloud/github/ghcr
+	// 2. Fallback to HashiCorp Vault KV v2 (primecloud/data/github/ghcr) with legacy fallback
 	if d.vaultClient != nil {
-		data, err := d.vaultClient.ReadSecret(ctx, "primecloud/github/ghcr")
+		data, err := d.vaultClient.ReadSecret(ctx, "primecloud/data/github/ghcr")
+		if err != nil || data == nil {
+			data, err = d.vaultClient.ReadSecret(ctx, "primecloud/github/ghcr")
+		}
 		if err == nil && data != nil {
 			u, _ := data["username"].(string)
 			p, _ := data["token"].(string)

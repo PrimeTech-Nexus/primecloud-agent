@@ -605,6 +605,85 @@ func TestDeploy_AppRoleAuthenticated_SecretResolution(t *testing.T) {
 	}
 }
 
+func TestDeploy_SecretResolution_CrossMountFallback_PreservesDataEndpoint(t *testing.T) {
+	// Mock Vault server where secret/ returns 404/403, but primecloud/data/primecloud/... contains the secret
+	var pathsRequested []string
+	vaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsRequested = append(pathsRequested, r.URL.Path)
 
+		if strings.HasPrefix(r.URL.Path, "/v1/secret/data/") {
+			// secret/ mount does not have it (simulating missing mount or migration state)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":["not found"]}`))
+			return
+		}
 
+		if strings.HasPrefix(r.URL.Path, "/v1/primecloud/data/primecloud/tenants/proj-cross/applications/app-cross/env") {
+			// Successfully served under primecloud KV v2 mount
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {
+					"data": {
+						"ARBITRARY_API_KEY": "arbitrary_val_12345",
+						"CUSTOM_VAR": "custom_val_67890"
+					}
+				}
+			}`))
+			return
+		}
 
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer vaultServer.Close()
+
+	vClient, err := vault.NewClient(vault.Config{
+		Address: vaultServer.URL,
+		Token:   "test-token",
+	})
+	if err != nil {
+		t.Fatalf("failed to create vault client: %v", err)
+	}
+
+	mockRT := &mockRuntime{
+		containerID: "cnt-cross-mount-success",
+	}
+
+	deployer := applications.NewDeployer(mockRT, vClient, nil)
+	ctx := context.Background()
+
+	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/app-cross:latest",
+		"secret_refs": {
+			"ARBITRARY_API_KEY": "secret/data/primecloud/tenants/proj-cross/applications/app-cross/env#ARBITRARY_API_KEY",
+			"CUSTOM_VAR": "secret/data/primecloud/tenants/proj-cross/applications/app-cross/env#CUSTOM_VAR"
+		}
+	}`
+
+	cid, err := deployer.Deploy(ctx, "proj-cross", "env-cross", "app-cross", "inst-cross", payloadJSON)
+	if err != nil {
+		t.Fatalf("Deploy with cross-mount fallback failed: %v", err)
+	}
+
+	if cid != "cnt-cross-mount-success" {
+		t.Fatalf("expected container ID cnt-cross-mount-success, got %s", cid)
+	}
+
+	if mockRT.createdConfig == nil {
+		t.Fatal("expected container config to be populated")
+	}
+
+	envMap := mockRT.createdConfig.Env
+	if envMap["ARBITRARY_API_KEY"] != "arbitrary_val_12345" {
+		t.Errorf("expected ARBITRARY_API_KEY=arbitrary_val_12345, got %q", envMap["ARBITRARY_API_KEY"])
+	}
+	if envMap["CUSTOM_VAR"] != "custom_val_67890" {
+		t.Errorf("expected CUSTOM_VAR=custom_val_67890, got %q", envMap["CUSTOM_VAR"])
+	}
+
+	// Verify that the requested tenant environment paths never stripped /data/ to bare primecloud/...
+	for _, p := range pathsRequested {
+		if strings.Contains(p, "tenants") && strings.HasPrefix(p, "/v1/primecloud/") && !strings.HasPrefix(p, "/v1/primecloud/data/") {
+			t.Errorf("Path requested %q violated KV v2 semantics by dropping /data/", p)
+		}
+	}
+}
