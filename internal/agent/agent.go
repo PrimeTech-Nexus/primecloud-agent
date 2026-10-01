@@ -202,34 +202,57 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			}, err
 		}
 
-		var hostPort int
-		var containerPort int
-		if inspect, err := rt.InspectContainer(ctx, containerID); err == nil && inspect != nil {
-			for cPortStr, hpStr := range inspect.Ports {
-				if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
-					hostPort = hp
-					cPortNum := strings.Split(cPortStr, "/")[0]
-					if cp, err := strconv.Atoi(cPortNum); err == nil && cp > 0 {
-						containerPort = cp
-					}
-					break
+		// Determine application container workload port (defaults to 8000)
+		containerPort := 8000
+		if pVal, ok := payload["port"]; ok && pVal != nil {
+			switch p := pVal.(type) {
+			case float64:
+				if p > 0 {
+					containerPort = int(p)
+				}
+			case int:
+				if p > 0 {
+					containerPort = p
+				}
+			case string:
+				if n, err := strconv.Atoi(strings.Split(strings.TrimSpace(p), "/")[0]); err == nil && n > 0 {
+					containerPort = n
 				}
 			}
 		}
 
-		if containerPort == 0 {
-			if p, ok := payload["port"].(float64); ok && p > 0 {
-				containerPort = int(p)
-			} else if p, ok := payload["port"].(int); ok && p > 0 {
-				containerPort = p
-			} else if pStr, ok := payload["port"].(string); ok {
-				containerPort, _ = strconv.Atoi(pStr)
+		// Requirement 6: Read actual dynamically allocated HostPort from ContainerInspect
+		var hostPort int
+		inspect, inspectErr := rt.InspectContainer(ctx, containerID)
+		if inspectErr == nil && inspect != nil && len(inspect.Ports) > 0 {
+			targetKeys := []string{
+				fmt.Sprintf("%d/tcp", containerPort),
+				strconv.Itoa(containerPort),
+				"8000/tcp",
+				"8000",
+			}
+			for _, key := range targetKeys {
+				if hpStr, ok := inspect.Ports[key]; ok && hpStr != "" {
+					if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+						hostPort = hp
+						break
+					}
+				}
+			}
+			if hostPort == 0 {
+				for _, hpStr := range inspect.Ports {
+					if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+						hostPort = hp
+						break
+					}
+				}
 			}
 		}
-		if containerPort == 0 {
-			containerPort = 8080
-		}
 
+		// Requirement 4, 5, 8:
+		// Do not use ApplicationConfig.port as HostPort.
+		// Do not fall back to payload["port"] as host_port.
+		// If Docker provides no host binding or binds to 8000, fail closed with DYNAMIC_PORT_ALLOCATION_FAILED.
 		if hostPort == 0 || hostPort == 8000 {
 			errMsg := fmt.Sprintf("DEPLOYMENT_FAILED: Docker runtime did not allocate a valid dynamic host port for container %s (resolved host_port: %d, container_port: %d)", containerID, hostPort, containerPort)
 			_ = rt.RemoveContainer(ctx, containerID, true)

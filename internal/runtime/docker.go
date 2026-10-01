@@ -190,6 +190,64 @@ func BuildEnvSlice(env map[string]string) []string {
 	return envSlice
 }
 
+// BuildPortConfig generates Docker ExposedPorts and HostConfig.PortBindings,
+// guaranteeing that container port 8000 (and any specified application ports)
+// have an explicit dynamic host port binding (HostIP: "0.0.0.0", HostPort: "").
+func BuildPortConfig(ports map[string]string) (nat.PortSet, nat.PortMap, error) {
+	exposedPorts := nat.PortSet{}
+	portBindings := nat.PortMap{}
+
+	effectivePorts := make(map[string]string)
+	for k, v := range ports {
+		effectivePorts[k] = v
+	}
+	if len(effectivePorts) == 0 {
+		effectivePorts["8000/tcp"] = ""
+	}
+
+	for cPort := range effectivePorts {
+		portNum := cPort
+		proto := "tcp"
+		if parts := strings.Split(cPort, "/"); len(parts) == 2 {
+			portNum = parts[0]
+			proto = parts[1]
+		}
+		if portNum == "" {
+			portNum = "8000"
+		}
+		if proto == "" {
+			proto = "tcp"
+		}
+
+		natPort, err := nat.NewPort(proto, portNum)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid port specification %s: %w", cPort, err)
+		}
+
+		exposedPorts[natPort] = struct{}{}
+		portBindings[natPort] = []nat.PortBinding{
+			{
+				HostIP:   "0.0.0.0",
+				HostPort: "", // Explicitly empty: Docker dynamically allocates an ephemeral host port
+			},
+		}
+	}
+
+	// Guarantee at least 8000/tcp is present
+	defaultPort := nat.Port("8000/tcp")
+	if _, ok := exposedPorts[defaultPort]; !ok && len(exposedPorts) == 0 {
+		exposedPorts[defaultPort] = struct{}{}
+		portBindings[defaultPort] = []nat.PortBinding{
+			{
+				HostIP:   "0.0.0.0",
+				HostPort: "",
+			},
+		}
+	}
+
+	return exposedPorts, portBindings, nil
+}
+
 // CreateContainer creates a container applying mandatory labels, isolation profile, and resource limits.
 func (d *DockerRuntime) CreateContainer(
 	ctx context.Context,
@@ -213,26 +271,9 @@ func (d *DockerRuntime) CreateContainer(
 	envSlice := BuildEnvSlice(cfg.Env)
 
 	// 2. Port mappings
-	exposedPorts := nat.PortSet{}
-	portBindings := nat.PortMap{}
-	for cPort, hPort := range cfg.Ports {
-		portNum := cPort
-		proto := "tcp"
-		if parts := strings.Split(cPort, "/"); len(parts) == 2 {
-			portNum = parts[0]
-			proto = parts[1]
-		}
-		natPort, err := nat.NewPort(proto, portNum)
-		if err == nil {
-			exposedPorts[natPort] = struct{}{}
-			effectiveHostPort := ""
-			if hPort != "" && hPort != "8000" && hPort != "0" && hPort != portNum {
-				effectiveHostPort = hPort
-			}
-			portBindings[natPort] = []nat.PortBinding{
-				{HostIP: "0.0.0.0", HostPort: effectiveHostPort},
-			}
-		}
+	exposedPorts, portBindings, err := BuildPortConfig(cfg.Ports)
+	if err != nil {
+		return "", fmt.Errorf("failed to configure port bindings: %w", err)
 	}
 
 	dockerConfig := &container.Config{

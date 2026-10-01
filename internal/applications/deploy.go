@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ type DeployPayload struct {
 	EnvVars          map[string]string       `json:"env_vars"` // Backwards-compatible combined environment map
 	SecretRefs       map[string]string       `json:"secret_refs"` // ENV_VAR_NAME -> "path/in/vault#key"
 	Port             interface{}             `json:"port"`
-	Ports            map[string]string       `json:"ports"`
+	Ports            interface{}             `json:"ports"`
 	Command          []string                `json:"command"`
 	HealthCheckCmd   []string                `json:"health_check_cmd"`
 	HealthTimeoutSec int                     `json:"health_timeout_sec"`
@@ -186,19 +187,81 @@ func (d *Deployer) Deploy(
 	}
 
 	portsMap := make(map[string]string)
-	for k, v := range payload.Ports {
-		portsMap[k] = v
+
+	parsePortInt := func(v interface{}) int {
+		if v == nil {
+			return 0
+		}
+		switch val := v.(type) {
+		case int:
+			return val
+		case int32:
+			return int(val)
+		case int64:
+			return int(val)
+		case float64:
+			return int(val)
+		case float32:
+			return int(val)
+		case json.Number:
+			if n, err := val.Int64(); err == nil {
+				return int(n)
+			}
+		case string:
+			clean := strings.TrimSpace(val)
+			clean = strings.Split(clean, "/")[0]
+			if n, err := strconv.Atoi(clean); err == nil {
+				return n
+			}
+		}
+		return 0
 	}
-	if len(portsMap) == 0 && payload.Port != nil {
-		var pNum int
-		if p, ok := payload.Port.(float64); ok && p > 0 {
-			pNum = int(p)
-		} else if p, ok := payload.Port.(int); ok && p > 0 {
-			pNum = p
+
+	if payload.Ports != nil {
+		switch pVal := payload.Ports.(type) {
+		case map[string]string:
+			for k := range pVal {
+				cleanK := strings.TrimSpace(k)
+				if !strings.Contains(cleanK, "/") {
+					cleanK = fmt.Sprintf("%s/tcp", cleanK)
+				}
+				portsMap[cleanK] = ""
+			}
+		case map[string]interface{}:
+			for k := range pVal {
+				cleanK := strings.TrimSpace(k)
+				if !strings.Contains(cleanK, "/") {
+					cleanK = fmt.Sprintf("%s/tcp", cleanK)
+				}
+				portsMap[cleanK] = ""
+			}
+		case []interface{}:
+			for _, item := range pVal {
+				if n := parsePortInt(item); n > 0 {
+					portsMap[fmt.Sprintf("%d/tcp", n)] = ""
+				}
+			}
+		case []string:
+			for _, item := range pVal {
+				if n := parsePortInt(item); n > 0 {
+					portsMap[fmt.Sprintf("%d/tcp", n)] = ""
+				}
+			}
 		}
-		if pNum > 0 {
-			portsMap[fmt.Sprintf("%d/tcp", pNum)] = ""
-		}
+	}
+
+	if pNum := parsePortInt(payload.Port); pNum > 0 {
+		portsMap[fmt.Sprintf("%d/tcp", pNum)] = ""
+	}
+
+	// Requirement 1: Application container port 8000 must be exposed as tcp/8000
+	if len(portsMap) == 0 {
+		portsMap["8000/tcp"] = ""
+	}
+
+	// Requirement 2 & 4: All host bindings MUST request dynamic ephemeral host port ("")
+	for k := range portsMap {
+		portsMap[k] = ""
 	}
 
 	cfg := &runtime.ContainerConfig{
