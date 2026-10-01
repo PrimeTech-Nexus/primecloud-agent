@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,8 @@ func (m *Manager) ConfigDir() string {
 	return m.configDir
 }
 
+var validDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+
 // GenerateSnippet renders a Caddyfile configuration block for the route.
 func GenerateSnippet(route *RouteConfig) (string, error) {
 	if route == nil {
@@ -66,6 +69,13 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 	if domain == "" {
 		return "", fmt.Errorf("domain cannot be empty")
 	}
+	domain = strings.TrimPrefix(domain, "http://")
+	domain = strings.TrimPrefix(domain, "https://")
+	domain = strings.TrimSuffix(domain, "/")
+	if !validDomainRegex.MatchString(domain) && domain != "localhost" && !strings.HasSuffix(domain, ".local") {
+		return "", fmt.Errorf("invalid domain format: %q", route.Domain)
+	}
+
 	upstream := strings.TrimSpace(route.Upstream)
 	if upstream == "" {
 		return "", fmt.Errorf("upstream cannot be empty")
@@ -75,11 +85,9 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 
 	var sb strings.Builder
 	if route.TLS {
-		if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
-			sb.WriteString(fmt.Sprintf("http://%s, https://%s {\n", domain, domain))
-		} else {
-			sb.WriteString(fmt.Sprintf("%s {\n", domain))
-		}
+		// In Caddy, an unqualified domain name (or https://domain) triggers standard TLS.
+		// Never combine http:// and https:// in a block that specifies tls directives.
+		sb.WriteString(fmt.Sprintf("%s {\n", domain))
 		certPath := "/etc/primecloud/certs/origin.crt"
 		keyPath := "/etc/primecloud/certs/origin.key"
 		if _, err := os.Stat(certPath); err == nil {
@@ -88,18 +96,12 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 			sb.WriteString("    tls internal\n")
 		}
 	} else {
-		if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
-			sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
-		} else {
-			sb.WriteString(fmt.Sprintf("%s {\n", domain))
-		}
+		sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
 	}
 
 	sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
 	sb.WriteString("        header_up Host {host}\n")
 	sb.WriteString("        header_up X-Real-IP {remote_host}\n")
-	sb.WriteString("        header_up X-Forwarded-For {remote_host}\n")
-	sb.WriteString("        header_up X-Forwarded-Proto {scheme}\n")
 
 	for k, v := range route.Headers {
 		sb.WriteString(fmt.Sprintf("        header_up %s %q\n", k, v))
@@ -122,6 +124,20 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if route == nil {
+		return fmt.Errorf("route config cannot be nil")
+	}
+	cleanDomain := strings.TrimSpace(route.Domain)
+	cleanDomain = strings.TrimPrefix(cleanDomain, "http://")
+	cleanDomain = strings.TrimPrefix(cleanDomain, "https://")
+	cleanDomain = strings.TrimSuffix(cleanDomain, "/")
+	if cleanDomain == "" {
+		return fmt.Errorf("domain cannot be empty")
+	}
+	if !validDomainRegex.MatchString(cleanDomain) && cleanDomain != "localhost" && !strings.HasSuffix(cleanDomain, ".local") {
+		return fmt.Errorf("invalid domain format: %q", route.Domain)
+	}
+
 	if err := os.MkdirAll(m.configDir, 0755); err != nil {
 		return fmt.Errorf("failed to create caddy config dir: %w", err)
 	}
@@ -135,7 +151,21 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 		return fmt.Errorf("invalid caddy snippet: %w", err)
 	}
 
-	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", route.Domain))
+	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", cleanDomain))
+	cleanConfigDir := filepath.Clean(m.configDir)
+	cleanTargetFile := filepath.Clean(targetFile)
+	if !strings.HasPrefix(cleanTargetFile, cleanConfigDir) {
+		return fmt.Errorf("path traversal detected: target file %q is outside config directory %q", cleanTargetFile, cleanConfigDir)
+	}
+
+	// Backup existing file if present, so failed reload leaves the previous valid configuration untouched
+	var existingContent []byte
+	hadExisting := false
+	if data, err := os.ReadFile(targetFile); err == nil {
+		existingContent = data
+		hadExisting = true
+	}
+
 	tmpFile := targetFile + ".tmp"
 
 	if err := os.WriteFile(tmpFile, []byte(snippet), 0644); err != nil {
@@ -147,12 +177,17 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 		return fmt.Errorf("failed to commit caddy config file: %w", err)
 	}
 
-	m.logger.Info("caddy_route_configured", "domain", route.Domain, "upstream", route.Upstream, "file", targetFile)
+	m.logger.Info("caddy_route_configured", "domain", cleanDomain, "upstream", route.Upstream, "file", targetFile)
 
 	// Trigger reload
 	if err := m.reloadInternal(ctx); err != nil {
-		_ = os.Remove(targetFile)
-		return fmt.Errorf("failed to reload caddy after configuring route for domain %s: %w", route.Domain, err)
+		if hadExisting {
+			_ = os.WriteFile(targetFile, existingContent, 0644)
+			_ = m.reloadInternal(ctx)
+		} else {
+			_ = os.Remove(targetFile)
+		}
+		return fmt.Errorf("failed to reload caddy after configuring route for domain %s: %w", cleanDomain, err)
 	}
 
 	return nil

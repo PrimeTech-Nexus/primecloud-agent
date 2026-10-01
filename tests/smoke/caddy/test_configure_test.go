@@ -23,7 +23,7 @@ func TestCaddy_ConfigureRemoveValidateReload(t *testing.T) {
 	// 1. Setup mock Caddy admin server
 	var reloadCalled bool
 	adminServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/load" && r.Method == http.MethodPost {
+		if (r.URL.Path == "/load" && r.Method == http.MethodPost) || (r.URL.Path == "/config/" && r.Method == http.MethodGet) {
 			reloadCalled = true
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
