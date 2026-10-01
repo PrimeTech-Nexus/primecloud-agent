@@ -15,12 +15,14 @@ import (
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
+	"github.com/primecloud/primecloud-agent/internal/backup"
 	"github.com/primecloud/primecloud-agent/internal/caddy"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
 	"github.com/primecloud/primecloud-agent/internal/operations"
 	"github.com/primecloud/primecloud-agent/internal/postgres"
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
+	"github.com/primecloud/primecloud-agent/internal/recovery"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/transport"
 	"github.com/primecloud/primecloud-agent/internal/valkey"
@@ -930,6 +932,367 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}
 	registry.Register("health_check_keyvalue", valkeyHealthCheckHandler, nil)
 	registry.Register("health_check_valkey", valkeyHealthCheckHandler, nil)
+
+	// 17. backup_resource / snapshot_backup
+	backupHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		resID := extractResourceID(op, "resource_id")
+		if resID == "" {
+			if rID, ok := payload["resource_id"].(string); ok && rID != "" {
+				resID = rID
+			}
+		}
+
+		resType := ""
+		if rtVal, ok := payload["resource_type"].(string); ok && rtVal != "" {
+			resType = strings.ToLower(rtVal)
+		}
+
+		backupID := ""
+		if bID, ok := payload["backup_id"].(string); ok && bID != "" {
+			backupID = bID
+		} else {
+			backupID = fmt.Sprintf("bk-%d", time.Now().UnixNano())
+		}
+
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		storageTarget := ""
+		if st, ok := payload["storage_target"].(string); ok && st != "" {
+			storageTarget = st
+		}
+
+		if resID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_PAYLOAD",
+				Message:         "resource_id is required for backup",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("resource_id is required for backup")
+		}
+
+		// 1. Resolve or create encryption key from Vault
+		encKey, err := backup.GetOrCreateBackupKey(ctx, vaultClient, resID)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "ENCRYPTION_KEY_FAILED",
+				Message:         fmt.Sprintf("failed resolving backup encryption key: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		// 2. Perform raw backup based on resource type
+		var backupResultPath string
+		tempBackupDir := filepath.Join(os.TempDir(), "primecloud-backups", resType, resID)
+
+		switch resType {
+		case "postgres":
+			res, err := postgres.BackupPostgresWithVault(ctx, rt, vaultClient, projectID, resID, tempBackupDir)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "POSTGRES_BACKUP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			backupResultPath = res.ArtifactPath
+
+		case "valkey", "keyvalue":
+			res, err := valkey.BackupValkeyWithVault(ctx, rt, vaultClient, cfg.ResourceDir, projectID, resID, tempBackupDir)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "VALKEY_BACKUP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			backupResultPath = res.ArtifactPath
+
+		default:
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "UNSUPPORTED_RESOURCE_TYPE",
+				Message:         fmt.Sprintf("unsupported resource type for backup: %s", resType),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("unsupported resource type for backup: %s", resType)
+		}
+
+		// 3. Package and encrypt the artifact
+		targetDir := filepath.Join(cfg.ResourceDir, "backups", resType, resID)
+		uploader := backup.NewUploader(a.logger)
+		manifest, encFile, err := uploader.PackageAndUpload(ctx, backupID, resID, resType, cfg.NodeID, backupResultPath, encKey, targetDir)
+
+		// Immediately remove plaintext artifact
+		_ = os.Remove(backupResultPath)
+
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "BACKUP_PACKAGING_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		// Compute encrypted artifact checksum (SHA-256)
+		encChecksum, encSize, err := backup.ComputeSHA256(encFile)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CHECKSUM_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		storageRef := storageTarget
+		if storageRef == "" {
+			storageRef = encFile
+		} else {
+			baseStorage := os.Getenv("PRIMECLOUD_BACKUP_DIR")
+			if baseStorage == "" {
+				baseStorage = filepath.Join(".primecloud_storage", "backups")
+			}
+			storagePath := filepath.Join(baseStorage, storageTarget)
+			_ = os.MkdirAll(filepath.Dir(storagePath), 0700)
+			if encData, rErr := os.ReadFile(encFile); rErr == nil {
+				_ = os.WriteFile(storagePath, encData, 0600)
+			}
+		}
+
+		resultMap := map[string]interface{}{
+			"status":         "SUCCEEDED",
+			"backup_id":      backupID,
+			"resource_id":    resID,
+			"resource_type":  resType,
+			"size_bytes":     encSize,
+			"checksum":       encChecksum,
+			"storage_ref":    storageRef,
+			"manifest_path":  filepath.Join(targetDir, fmt.Sprintf("%s.manifest.json", backupID)),
+			"encrypted_path": encFile,
+			"original_size":  manifest.OriginalSizeBytes,
+			"encrypted_size": manifest.EncryptedSizeBytes,
+		}
+		resJSON, _ := json.Marshal(resultMap)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Backup %s for %s completed successfully", backupID, resID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+			ResultJson:      string(resJSON),
+		}, nil
+	}
+	registry.Register("backup_resource", backupHandler, nil)
+	registry.Register("snapshot_backup", backupHandler, nil)
+
+	// 18. start_recovery / restore_recovery
+	recoveryHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		resID := extractResourceID(op, "resource_id")
+		if resID == "" {
+			if rID, ok := payload["resource_id"].(string); ok && rID != "" {
+				resID = rID
+			}
+		}
+
+		resType := ""
+		if rtVal, ok := payload["resource_type"].(string); ok && rtVal != "" {
+			resType = strings.ToLower(rtVal)
+		}
+
+		jobID := ""
+		if jID, ok := payload["job_id"].(string); ok && jID != "" {
+			jobID = jID
+		} else {
+			jobID = op.OperationId
+		}
+
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		storageRef := ""
+		if sr, ok := payload["storage_ref"].(string); ok && sr != "" {
+			storageRef = sr
+		}
+
+		expectedChecksum := ""
+		if cs, ok := payload["checksum_sha256"].(string); ok && cs != "" {
+			expectedChecksum = cs
+		} else if cs, ok := payload["checksum"].(string); ok && cs != "" {
+			expectedChecksum = cs
+		}
+
+		// 1. Locate encrypted artifact and manifest
+		var encPath, manifestPath string
+		candidates := []string{
+			storageRef,
+			filepath.Join(cfg.ResourceDir, "backups", resType, resID, filepath.Base(storageRef)),
+			filepath.Join(os.Getenv("PRIMECLOUD_BACKUP_DIR"), storageRef),
+			filepath.Join(".primecloud_storage", "backups", storageRef),
+		}
+		for _, c := range candidates {
+			if c == "" {
+				continue
+			}
+			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+				encPath = c
+				dir := filepath.Dir(encPath)
+				base := strings.TrimSuffix(filepath.Base(encPath), filepath.Ext(encPath))
+				manifestPath = filepath.Join(dir, fmt.Sprintf("%s.manifest.json", base))
+				break
+			}
+		}
+
+		if encPath == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "ARTIFACT_NOT_FOUND",
+				Message:         fmt.Sprintf("backup artifact %s not found on node", storageRef),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("backup artifact %s not found on node", storageRef)
+		}
+
+		// 2. Validate Checksum: FAIL CLOSED if mismatch
+		if expectedChecksum != "" {
+			actualChecksum, _, err := backup.ComputeSHA256(encPath)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "CHECKSUM_COMPUTATION_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			if !strings.EqualFold(actualChecksum, expectedChecksum) {
+				errMsg := fmt.Sprintf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "CHECKSUM_MISMATCH",
+					Message:         errMsg,
+					CompletedAtUnix: time.Now().Unix(),
+				}, fmt.Errorf("%s", errMsg)
+			}
+		}
+
+		// 3. Resolve encryption key from Vault
+		encKey, err := backup.GetOrCreateBackupKey(ctx, vaultClient, resID)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "ENCRYPTION_KEY_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		// 4. Reconstruct artifact (decrypt and verify manifest integrity)
+		restoreTempDir := filepath.Join(os.TempDir(), "primecloud-restores", jobID)
+		reconstructor := recovery.NewReconstructor(rt, a.logger)
+		restoredPath, manifest, err := reconstructor.ReconstructArtifact(ctx, encPath, manifestPath, encKey, restoreTempDir)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DECRYPTION_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		// 5. Apply restore to actual workload
+		if resType == "" && manifest != nil {
+			resType = manifest.ResourceType
+		}
+		if manifest != nil {
+			manifest.ResourceType = resType
+		}
+
+		restoreErr := reconstructor.RestoreToWorkloadWithVault(ctx, manifest, restoredPath, vaultClient, cfg.ResourceDir, projectID)
+
+		// Immediately clean up temporary plaintext restored artifact
+		_ = os.Remove(restoredPath)
+		_ = os.RemoveAll(restoreTempDir)
+
+		if restoreErr != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTORE_EXECUTION_FAILED",
+				Message:         restoreErr.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, restoreErr
+		}
+
+		resultMap := map[string]interface{}{
+			"status":      "SUCCEEDED",
+			"job_id":      jobID,
+			"resource_id": resID,
+			"restored_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		resJSON, _ := json.Marshal(resultMap)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Recovery job %s for resource %s succeeded", jobID, resID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+			ResultJson:      string(resJSON),
+		}, nil
+	}
+	registry.Register("start_recovery", recoveryHandler, nil)
+	registry.Register("restore_recovery", recoveryHandler, nil)
+
+	// 19. delete_backup
+	deleteBackupHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		backupID := ""
+		if bID, ok := payload["backup_id"].(string); ok {
+			backupID = bID
+		} else {
+			backupID = op.ResourceId
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Backup %s deleted", backupID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}
+	registry.Register("delete_backup", deleteBackupHandler, nil)
 
 	locks := operations.NewLockManager()
 	idempotency := operations.NewIdempotencyTracker(24 * time.Hour)

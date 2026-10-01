@@ -12,6 +12,7 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/postgres"
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/valkey"
+	"github.com/primecloud/primecloud-agent/internal/vault"
 )
 
 // Reconstructor orchestrates decryption and restoration of backup artifacts.
@@ -79,10 +80,26 @@ func (r *Reconstructor) RestoreToWorkload(ctx context.Context, manifest *backup.
 	switch manifest.ResourceType {
 	case "postgres":
 		return postgres.RestorePostgres(ctx, r.rt, manifest.ResourceID, artifactPath)
-	case "valkey":
+	case "valkey", "keyvalue":
 		return valkey.RestoreValkey(ctx, r.rt, manifest.ResourceID, artifactPath)
 	default:
 		r.logger.Info("generic_workload_restored", "resource_id", manifest.ResourceID)
 		return nil
 	}
 }
+
+// RestoreToWorkloadWithVault applies the reconstructed artifact to the database/service using Vault credentials and configuration.
+func (r *Reconstructor) RestoreToWorkloadWithVault(ctx context.Context, manifest *backup.Manifest, artifactPath string, vClient *vault.Client, baseResDir, projectID string) error {
+	r.logger.Info("restoring_to_workload", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
+
+	switch manifest.ResourceType {
+	case "postgres":
+		return postgres.RestorePostgresWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
+	case "valkey", "keyvalue":
+		return valkey.RestoreValkeyWithVault(ctx, r.rt, vClient, baseResDir, projectID, manifest.ResourceID, artifactPath)
+	default:
+		r.logger.Info("generic_workload_restored", "resource_id", manifest.ResourceID)
+		return nil
+	}
+}
+

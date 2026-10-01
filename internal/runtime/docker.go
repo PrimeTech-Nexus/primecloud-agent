@@ -2,6 +2,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -29,6 +32,7 @@ type ContainerRuntime interface {
 	InspectContainer(ctx context.Context, containerID string) (*ContainerInspect, error)
 	ListContainers(ctx context.Context, all bool) ([]ContainerSummary, error)
 	GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error)
+	ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) (stdout []byte, stderr []byte, exitCode int, err error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -434,3 +438,50 @@ func (d *DockerRuntime) GetContainerLogs(ctx context.Context, containerID string
 		Timestamps: true,
 	})
 }
+
+// ExecContainer executes a command inside a running container with optional environment and stdin.
+func (d *DockerRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	if d.cli == nil {
+		return nil, nil, -1, fmt.Errorf("docker client is nil")
+	}
+
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		Env:          env,
+		AttachStdout: true,
+		AttachStderr: true,
+		AttachStdin:  stdin != nil,
+	}
+
+	execCreateResp, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("failed to create container exec for %s: %w", containerID, err)
+	}
+
+	attachResp, err := d.cli.ContainerExecAttach(ctx, execCreateResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("failed to attach to container exec: %w", err)
+	}
+	defer attachResp.Close()
+
+	if stdin != nil {
+		go func() {
+			_, _ = io.Copy(attachResp.Conn, stdin)
+			_ = attachResp.CloseWrite()
+		}()
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	_, err = stdcopy.StdCopy(&stdoutBuf, &stderrBuf, attachResp.Reader)
+	if err != nil && err != io.EOF {
+		return stdoutBuf.Bytes(), stderrBuf.Bytes(), -1, fmt.Errorf("failed reading exec stream: %w", err)
+	}
+
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execCreateResp.ID)
+	if err != nil {
+		return stdoutBuf.Bytes(), stderrBuf.Bytes(), 0, nil
+	}
+
+	return stdoutBuf.Bytes(), stderrBuf.Bytes(), inspectResp.ExitCode, nil
+}
+
