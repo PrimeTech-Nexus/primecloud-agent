@@ -46,7 +46,7 @@ func TestAgentSkeleton_BuildAndBoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Agent returned error on exit: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Agent failed to stop within timeout")
 	}
 

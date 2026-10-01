@@ -18,7 +18,7 @@ func TestCaddy_ConfigureRemoveValidateReload(t *testing.T) {
 	defer cancel()
 
 	tempDir := t.TempDir()
-	confDir := filepath.Join(tempDir, "conf.d")
+	confDir := filepath.Join(tempDir, "sites-enabled")
 
 	// 1. Setup mock Caddy admin server
 	var reloadCalled bool

@@ -37,7 +37,7 @@ func ValidateConfig(content string) error {
 
 	// 3. Optional: if caddy CLI binary exists on PATH, run formal syntax validation
 	if caddyPath, err := exec.LookPath("caddy"); err == nil && caddyPath != "" {
-		cmd := exec.Command(caddyPath, "validate", "--adapter", "caddyfile")
+		cmd := exec.Command(caddyPath, "validate", "--adapter", "caddyfile", "--config", "-")
 		cmd.Stdin = strings.NewReader(trimmed)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("caddy validate failed: %s (%w)", string(out), err)

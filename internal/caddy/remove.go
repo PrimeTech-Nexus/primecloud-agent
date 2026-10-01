@@ -33,7 +33,7 @@ func (m *Manager) RemoveRoute(ctx context.Context, domain string) error {
 
 	// Trigger reload
 	if err := m.reloadInternal(ctx); err != nil {
-		m.logger.Warn("caddy_reload_notice", "domain", domain, "reason", err.Error())
+		return fmt.Errorf("failed to reload caddy after removing route for domain %s: %w", domain, err)
 	}
 
 	return nil

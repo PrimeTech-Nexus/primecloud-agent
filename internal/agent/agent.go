@@ -304,7 +304,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}, nil)
 
 	// Managed Services & Ingress Drivers
-	caddyMgr := caddy.NewManager("/etc/caddy/conf.d", "http://127.0.0.1:2019", a.logger)
+	caddyMgr := caddy.NewManager("/etc/caddy/sites-enabled", "http://127.0.0.1:2019", a.logger)
 	pgProv := postgres.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	pgLC := postgres.NewLifecycleManager(rt)
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)

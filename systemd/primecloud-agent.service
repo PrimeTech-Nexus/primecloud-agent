@@ -28,7 +28,7 @@ MemoryDenyWriteExecute=false
 LimitNOFILE=65536
 
 # State and Configuration Directories
-ReadWritePaths=/etc/primecloud /opt/primecloud /var/log/primecloud
+ReadWritePaths=/etc/primecloud /opt/primecloud /var/log/primecloud /etc/caddy
 EnvironmentFile=-/etc/primecloud/agent.env
 
 [Install]

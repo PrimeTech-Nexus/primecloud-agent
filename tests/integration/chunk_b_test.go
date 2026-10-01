@@ -77,7 +77,7 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 	tempDir := t.TempDir()
 	resDir := filepath.Join(tempDir, "resources")
 	backupDir := filepath.Join(tempDir, "backups")
-	caddyConfDir := filepath.Join(tempDir, "caddy.conf.d")
+	caddyConfDir := filepath.Join(tempDir, "caddy.sites-enabled")
 
 	// 1. Vault Dev Server Integration
 	vClient, _ := testenv.EnsureVaultDev(t)

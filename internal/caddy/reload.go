@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // Reload triggers a dynamic reload of Caddy configurations.
@@ -48,15 +49,30 @@ func (m *Manager) reloadInternal(ctx context.Context) error {
 		}
 	}
 
-	// Strategy 3: Check if Caddy Admin API is responding
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/config/", m.adminURL), nil)
-	if err == nil {
-		resp, getErr := m.httpClient.Do(req)
-		if getErr == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				m.logger.Info("caddy_admin_api_responsive", "admin_url", m.adminURL)
-				return nil
+	// Strategy 3: Check if Caddy Admin API is responding or trigger reload via /load
+	if m.adminURL != "" {
+		reqPost, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/load", m.adminURL), strings.NewReader("{}"))
+		if err == nil {
+			reqPost.Header.Set("Content-Type", "application/json")
+			resp, getErr := m.httpClient.Do(reqPost)
+			if getErr == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					m.logger.Info("caddy_admin_api_responsive", "admin_url", m.adminURL)
+					return nil
+				}
+			}
+		}
+
+		reqGet, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/config/", m.adminURL), nil)
+		if err == nil {
+			resp, getErr := m.httpClient.Do(reqGet)
+			if getErr == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					m.logger.Info("caddy_admin_api_responsive", "admin_url", m.adminURL)
+					return nil
+				}
 			}
 		}
 	}

@@ -34,7 +34,7 @@ type Manager struct {
 // NewManager constructs a Caddy Manager.
 func NewManager(configDir, adminURL string, logger *slog.Logger) *Manager {
 	if configDir == "" {
-		configDir = "/etc/caddy/conf.d"
+		configDir = "/etc/caddy/sites-enabled"
 	}
 	if adminURL == "" {
 		adminURL = "http://127.0.0.1:2019"
@@ -48,6 +48,13 @@ func NewManager(configDir, adminURL string, logger *slog.Logger) *Manager {
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		logger:     logger.With("component", "caddy_manager"),
 	}
+}
+
+// ConfigDir returns the active configuration directory.
+func (m *Manager) ConfigDir() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.configDir
 }
 
 // GenerateSnippet renders a Caddyfile configuration block for the route.
@@ -142,9 +149,10 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 
 	m.logger.Info("caddy_route_configured", "domain", route.Domain, "upstream", route.Upstream, "file", targetFile)
 
-	// Attempt reload (non-fatal if Caddy daemon is offline in dev)
+	// Trigger reload
 	if err := m.reloadInternal(ctx); err != nil {
-		m.logger.Warn("caddy_reload_notice", "domain", route.Domain, "reason", err.Error())
+		_ = os.Remove(targetFile)
+		return fmt.Errorf("failed to reload caddy after configuring route for domain %s: %w", route.Domain, err)
 	}
 
 	return nil
