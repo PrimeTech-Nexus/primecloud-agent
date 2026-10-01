@@ -216,13 +216,18 @@ func (d *DockerRuntime) CreateContainer(
 	exposedPorts := nat.PortSet{}
 	portBindings := nat.PortMap{}
 	for cPort, hPort := range cfg.Ports {
-		natPort, err := nat.NewPort("tcp", cPort)
+		portNum := cPort
+		proto := "tcp"
+		if parts := strings.Split(cPort, "/"); len(parts) == 2 {
+			portNum = parts[0]
+			proto = parts[1]
+		}
+		natPort, err := nat.NewPort(proto, portNum)
 		if err == nil {
 			exposedPorts[natPort] = struct{}{}
-			effectiveHostPort := hPort
-			if effectiveHostPort == "8000" {
-				// Port 8000 is reserved by primecloud-control-plane on host; assign ephemeral host port
-				effectiveHostPort = ""
+			effectiveHostPort := ""
+			if hPort != "" && hPort != "8000" && hPort != "0" && hPort != portNum {
+				effectiveHostPort = hPort
 			}
 			portBindings[natPort] = []nat.PortBinding{
 				{HostIP: "0.0.0.0", HostPort: effectiveHostPort},

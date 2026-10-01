@@ -21,6 +21,7 @@ type DeployPayload struct {
 	Env              map[string]string       `json:"env"`
 	EnvVars          map[string]string       `json:"env_vars"` // Backwards-compatible combined environment map
 	SecretRefs       map[string]string       `json:"secret_refs"` // ENV_VAR_NAME -> "path/in/vault#key"
+	Port             interface{}             `json:"port"`
 	Ports            map[string]string       `json:"ports"`
 	Command          []string                `json:"command"`
 	HealthCheckCmd   []string                `json:"health_check_cmd"`
@@ -184,13 +185,29 @@ func (d *Deployer) Deploy(
 		containerName = fmt.Sprintf("pc-app-%s", appID)
 	}
 
+	portsMap := make(map[string]string)
+	for k, v := range payload.Ports {
+		portsMap[k] = v
+	}
+	if len(portsMap) == 0 && payload.Port != nil {
+		var pNum int
+		if p, ok := payload.Port.(float64); ok && p > 0 {
+			pNum = int(p)
+		} else if p, ok := payload.Port.(int); ok && p > 0 {
+			pNum = p
+		}
+		if pNum > 0 {
+			portsMap[fmt.Sprintf("%d/tcp", pNum)] = ""
+		}
+	}
+
 	cfg := &runtime.ContainerConfig{
 		Name:           containerName,
 		Image:          imageToRun,
 		ImageDigest:    payload.ImageDigest,
 		Command:        payload.Command,
 		Env:            finalEnv,
-		Ports:          payload.Ports,
+		Ports:          portsMap,
 		HealthCheckCmd: payload.HealthCheckCmd,
 		ProjectID:      projectID,
 		EnvironmentID:  environmentID,

@@ -203,33 +203,52 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}
 
 		var hostPort int
+		var containerPort int
 		if inspect, err := rt.InspectContainer(ctx, containerID); err == nil && inspect != nil {
-			for _, hpStr := range inspect.Ports {
+			for cPortStr, hpStr := range inspect.Ports {
 				if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
 					hostPort = hp
+					cPortNum := strings.Split(cPortStr, "/")[0]
+					if cp, err := strconv.Atoi(cPortNum); err == nil && cp > 0 {
+						containerPort = cp
+					}
 					break
 				}
 			}
 		}
 
-		if hostPort == 0 {
+		if containerPort == 0 {
 			if p, ok := payload["port"].(float64); ok && p > 0 {
-				hostPort = int(p)
+				containerPort = int(p)
 			} else if p, ok := payload["port"].(int); ok && p > 0 {
-				hostPort = p
+				containerPort = p
 			} else if pStr, ok := payload["port"].(string); ok {
-				hostPort, _ = strconv.Atoi(pStr)
+				containerPort, _ = strconv.Atoi(pStr)
 			}
+		}
+		if containerPort == 0 {
+			containerPort = 8080
+		}
+
+		if hostPort == 0 || hostPort == 8000 {
+			errMsg := fmt.Sprintf("DEPLOYMENT_FAILED: Docker runtime did not allocate a valid dynamic host port for container %s (resolved host_port: %d, container_port: %d)", containerID, hostPort, containerPort)
+			_ = rt.RemoveContainer(ctx, containerID, true)
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DYNAMIC_PORT_ALLOCATION_FAILED",
+				Message:         errMsg,
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("%s", errMsg)
 		}
 
 		resMap := map[string]interface{}{
-			"container_id": containerID,
-			"status":       "RUNNING",
-			"node_id":      cfg.NodeID,
-		}
-		if hostPort > 0 {
-			resMap["port"] = hostPort
-			resMap["host_port"] = hostPort
+			"container_id":   containerID,
+			"status":         "RUNNING",
+			"node_id":        cfg.NodeID,
+			"container_port": containerPort,
+			"port":           containerPort,
+			"host_port":      hostPort,
 		}
 		resBytes, _ := json.Marshal(resMap)
 
