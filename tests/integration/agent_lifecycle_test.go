@@ -276,7 +276,7 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	// =========================================================================
 	t.Log("STEP 9/13: Provision PostgreSQL — Creating volume, generating credentials in Vault KV, booting datastore")
 	pgProv := postgres.NewProvisioner(nil, vClient, resDir, logger)
-	pgRes, err := pgProv.ProvisionWithProject(ctx, "lifecycle-project", "pg-lifecycle-db", "postgres:16-alpine", "")
+	pgRes, err := pgProv.ProvisionWithProject(ctx, "lifecycle-project", "", "pg-lifecycle-db", "postgres:16-alpine", "")
 	if err != nil {
 		t.Fatalf("PostgreSQL provision failed: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 
 	// Also provision Valkey for complete datastore coverage
 	vkProv := valkey.NewProvisioner(nil, vClient, resDir, logger)
-	vkRes, err := vkProv.ProvisionWithProject(ctx, "lifecycle-project", "vk-lifecycle-cache", "valkey/valkey:7.2-alpine", "")
+	vkRes, err := vkProv.ProvisionWithProject(ctx, "lifecycle-project", "", "vk-lifecycle-cache", "valkey/valkey:7.2-alpine", "")
 	if err != nil {
 		t.Fatalf("Valkey provision failed: %v", err)
 	}

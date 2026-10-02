@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
+	"github.com/primecloud/primecloud-agent/internal/network"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/vault"
 )
@@ -37,6 +38,7 @@ type Provisioner struct {
 	rt          runtime.ContainerRuntime
 	vaultClient *vault.Client
 	baseResDir  string
+	netMgr      *network.Manager
 	logger      *slog.Logger
 }
 
@@ -56,6 +58,11 @@ func NewProvisioner(rt runtime.ContainerRuntime, vaultClient *vault.Client, base
 	}
 }
 
+// SetNetworkManager sets the ManagedDataNetworkManager for network attachment.
+func (p *Provisioner) SetNetworkManager(mgr *network.Manager) {
+	p.netMgr = mgr
+}
+
 // GenerateCredentials generates a random auth token.
 func GenerateCredentials() (*Credentials, error) {
 	bytes := make([]byte, 24)
@@ -70,11 +77,13 @@ func GenerateCredentials() (*Credentials, error) {
 
 // Provision sets up storage, credentials in Vault, and starts the Valkey container.
 func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, hostPort string) (*ProvisionResult, error) {
-	return p.ProvisionWithProject(ctx, "default", resourceID, image, hostPort)
+	return p.ProvisionWithProject(ctx, "default", "", resourceID, image, hostPort)
 }
 
 // ProvisionWithProject sets up storage, credentials in Vault under the tenant path, and starts the Valkey container.
-func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resourceID, image, hostPort string) (*ProvisionResult, error) {
+// environmentID is the PrimeCloud environment UUID used to attach the container to the managed-data network.
+// Pass an empty string if no environment network attachment is required (e.g., tests without Docker).
+func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string) (*ProvisionResult, error) {
 	if resourceID == "" {
 		return nil, fmt.Errorf("resource_id cannot be empty")
 	}
@@ -99,8 +108,19 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 		return nil, err
 	}
 
-	host := fmt.Sprintf("pc-vk-%s", resourceID)
-	url := fmt.Sprintf("redis://default:%s@%s:%d", creds.AuthToken, host, creds.Port)
+	// Legacy host label (kept for backward compat in Vault and existing connection-string consumers)
+	legacyHost := fmt.Sprintf("pc-vk-%s", resourceID)
+	// Internal DNS hostname used inside pc-net-<environmentID> for container-to-container resolution
+	internalHost := fmt.Sprintf("valkey-%s.internal.primecloud", resourceID)
+
+	// Build the authoritative connection URL using the internal DNS hostname so that
+	// applications consuming this secret resolve correctly inside the managed-data network.
+	// When environmentID is empty (e.g. legacy or test path) fall back to the legacy host.
+	urlHost := internalHost
+	if environmentID == "" {
+		urlHost = legacyHost
+	}
+	url := fmt.Sprintf("redis://default:%s@%s:%d", creds.AuthToken, urlHost, creds.Port)
 
 	// 3. Store Credentials in Vault
 	tenantVaultRef := fmt.Sprintf("secret/data/primecloud/tenants/%s/keyvalue/%s", projectID, resourceID)
@@ -111,7 +131,7 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 			"username":   "default",
 			"password":   creds.AuthToken,
 			"auth_token": creds.AuthToken,
-			"host":       host,
+			"host":       legacyHost, // Legacy host preserved for compat; use url for connection
 			"port":       creds.Port,
 			"url":        url,
 		}
@@ -178,12 +198,35 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 		if err := applications.WaitForContainerReady(ctx, p.rt, containerID, 20*time.Second); err != nil {
 			return nil, fmt.Errorf("valkey container failed health check: %w", err)
 		}
+
+		// Attach container to the managed-data network (pc-net-<environmentID>) so that
+		// application containers in the same environment can resolve via internal DNS.
+		if p.netMgr != nil && environmentID != "" {
+			aliases := network.FormatValkeyAliases(resourceID)
+			if err := p.netMgr.AttachContainerToEnvironmentNetwork(ctx, environmentID, containerID, aliases); err != nil {
+				p.logger.Warn("valkey_network_attach_failed",
+					"resource_id", resourceID,
+					"environment_id", environmentID,
+					"container_id", containerID,
+					"error", err,
+				)
+				// Non-fatal: container is up and serving; network attachment will be retried
+				// by reconcile_managed_data_network.
+			} else {
+				p.logger.Info("valkey_network_attached",
+					"resource_id", resourceID,
+					"environment_id", environmentID,
+					"network", "pc-net-"+environmentID,
+					"aliases", aliases,
+				)
+			}
+		}
 	}
 
 	result := &ProvisionResult{
 		ResourceID:     resourceID,
 		ContainerID:    containerID,
-		Endpoint:       fmt.Sprintf("%s:6379", host),
+		Endpoint:       fmt.Sprintf("%s:6379", legacyHost),
 		VaultSecretRef: tenantVaultRef,
 		VolumePath:     volumePath,
 		Credentials:    creds,

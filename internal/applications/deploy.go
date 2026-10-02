@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/primecloud/primecloud-agent/internal/network"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/vault"
 )
@@ -34,6 +35,7 @@ type DeployPayload struct {
 type Deployer struct {
 	rt          runtime.ContainerRuntime
 	vaultClient *vault.Client
+	netMgr      *network.Manager
 	logger      *slog.Logger
 }
 
@@ -47,6 +49,11 @@ func NewDeployer(rt runtime.ContainerRuntime, vaultClient *vault.Client, logger 
 		vaultClient: vaultClient,
 		logger:      logger.With("component", "application_deployer"),
 	}
+}
+
+// SetNetworkManager sets the ManagedDataNetworkManager for environment network attachment.
+func (d *Deployer) SetNetworkManager(mgr *network.Manager) {
+	d.netMgr = mgr
 }
 
 // Deploy executes the deploy_application operation workflow.
@@ -307,6 +314,31 @@ func (d *Deployer) Deploy(
 		d.logger.Warn("application_healthcheck_failed", "container_id", containerID, "error", err)
 		// We do not silently drop; report error
 		return containerID, fmt.Errorf("container started but failed health check: %w", err)
+	}
+
+	// 6. Attach application container to the managed-data network (pc-net-<environmentID>).
+	// This enables the application to resolve Postgres and Valkey resources via internal DNS
+	// (e.g. postgres-<id>.internal.primecloud, valkey-<id>.internal.primecloud).
+	if d.netMgr != nil && environmentID != "" {
+		aliases := network.FormatApplicationAliases(appID, instanceID)
+		if err := d.netMgr.AttachContainerToEnvironmentNetwork(ctx, environmentID, containerID, aliases); err != nil {
+			d.logger.Warn("application_network_attach_failed",
+				"app_id", appID,
+				"instance_id", instanceID,
+				"environment_id", environmentID,
+				"container_id", containerID,
+				"error", err,
+			)
+			// Non-fatal: application is running; network attachment failure means it cannot
+			// yet resolve managed-data hostnames, but it is still reachable via Caddy.
+		} else {
+			d.logger.Info("application_network_attached",
+				"app_id", appID,
+				"environment_id", environmentID,
+				"network", "pc-net-"+environmentID,
+				"aliases", aliases,
+			)
+		}
 	}
 
 	d.logger.Info("application_deploy_succeeded", "container_id", containerID)

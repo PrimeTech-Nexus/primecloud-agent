@@ -24,7 +24,7 @@ func TestValkey_ProvisioningAndVaultCredentials(t *testing.T) {
 
 	resID := "res-vk-smoke-1"
 	projectID := "proj-vk-smoke"
-	result, err := provisioner.ProvisionWithProject(ctx, projectID, resID, "valkey/valkey:7.2-alpine", "")
+	result, err := provisioner.ProvisionWithProject(ctx, projectID, "", resID, "valkey/valkey:7.2-alpine", "")
 	if err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestValkey_ProvisioningAndVaultCredentials(t *testing.T) {
 		pingCtx, pCancel := context.WithTimeout(ctx, 2*time.Second)
 		if pingErr := rt.Ping(pingCtx); pingErr == nil {
 			liveProv := valkey.NewProvisioner(rt, vClient, baseResDir, nil)
-			liveRes, pErr := liveProv.ProvisionWithProject(ctx, "default", "live-vk-test", "valkey/valkey:7.2-alpine", "")
+			liveRes, pErr := liveProv.ProvisionWithProject(ctx, "default", "", "live-vk-test", "valkey/valkey:7.2-alpine", "")
 			if pErr == nil && liveRes.ContainerID != "" {
 				liveLM := valkey.NewLifecycleManager(rt)
 				_ = liveLM.Restart(ctx, liveRes.ContainerID, 5)

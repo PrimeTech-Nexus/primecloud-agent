@@ -19,6 +19,7 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/caddy"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
+	"github.com/primecloud/primecloud-agent/internal/network"
 	"github.com/primecloud/primecloud-agent/internal/operations"
 	"github.com/primecloud/primecloud-agent/internal/postgres"
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
@@ -80,6 +81,15 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		a.logger.Warn("docker_runtime_init_warning", "error", err)
 	}
 	a.runtime = rt
+
+	// Initialize Managed-Data Network Manager.
+	// The Manager uses the Docker client to create and manage pc-net-<environmentID> bridge networks
+	// that provide DNS-based isolation for PostgreSQL, Valkey and Application containers.
+	var netMgr *network.Manager
+	if rt != nil {
+		netMgr = network.NewManager(rt.Client(), cfg.NodeID, a.logger)
+		a.logger.Info("managed_data_network_manager_initialized", "node_id", cfg.NodeID)
+	}
 
 	// Initialize Vault client if specified
 	var vaultClient *vault.Client
@@ -354,6 +364,15 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	vkLC := valkey.NewLifecycleManager(rt)
 
+	// Wire the managed-data network manager into all provisioners and the deployer.
+	// When netMgr is non-nil, each provisioner and the deployer will attach containers
+	// to the appropriate pc-net-<environmentID> bridge network after startup.
+	if netMgr != nil {
+		pgProv.SetNetworkManager(netMgr)
+		vkProv.SetNetworkManager(netMgr)
+		deployer.SetNetworkManager(netMgr)
+	}
+
 	// 5. configure_route
 	registry.Register("configure_route", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		payload := parsePayloadMap(op.PayloadJson)
@@ -512,7 +531,16 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			projectID = "default"
 		}
 
-		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, resID, image, hostPort)
+		// Extract environment_id for managed-data network attachment.
+		// The control plane embeds it in the operation payload.
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -730,7 +758,16 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			projectID = "default"
 		}
 
-		provRes, err := vkProv.ProvisionWithProject(ctx, projectID, resID, image, hostPort)
+		// Extract environment_id for managed-data network attachment.
+		// The control plane embeds it in the operation payload.
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		provRes, err := vkProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1293,6 +1330,120 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}, nil
 	}
 	registry.Register("delete_backup", deleteBackupHandler, nil)
+
+	// 18. ensure_managed_data_network
+	registry.Register("ensure_managed_data_network", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		if netMgr == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "NETWORK_MANAGER_NOT_INITIALIZED",
+				Message:         "Network manager is not initialized (no Docker runtime?)",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("network manager not initialized")
+		}
+
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			payload := parsePayloadMap(op.PayloadJson)
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		if environmentID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "MISSING_ENVIRONMENT_ID",
+				Message:         "environment_id is required for ensure_managed_data_network",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("missing environment_id")
+		}
+
+		_, err := netMgr.EnsureEnvironmentNetwork(ctx, environmentID)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "ENSURE_NETWORK_FAILED",
+				Message:         fmt.Sprintf("Failed to ensure managed data network: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Managed data network for environment %s ensured successfully", environmentID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	// 19. reconcile_managed_data_network
+	registry.Register("reconcile_managed_data_network", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		if netMgr == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "NETWORK_MANAGER_NOT_INITIALIZED",
+				Message:         "Network manager is not initialized",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("network manager not initialized")
+		}
+
+		environmentID := op.EnvironmentId
+		payload := parsePayloadMap(op.PayloadJson)
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		if environmentID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "MISSING_ENVIRONMENT_ID",
+				Message:         "environment_id is required",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("missing environment_id")
+		}
+
+		var expectedContainers map[string][]string
+		if expected, ok := payload["expected_containers"].(map[string]interface{}); ok {
+			expectedContainers = make(map[string][]string)
+			for k, v := range expected {
+				if aliases, ok := v.([]interface{}); ok {
+					for _, alias := range aliases {
+						if a, ok := alias.(string); ok {
+							expectedContainers[k] = append(expectedContainers[k], a)
+						}
+					}
+				}
+			}
+		}
+
+		_, err := netMgr.ReconcileEnvironmentNetwork(ctx, environmentID, expectedContainers)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RECONCILE_NETWORK_FAILED",
+				Message:         fmt.Sprintf("Failed to reconcile network: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Managed data network for environment %s reconciled successfully", environmentID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
 
 	locks := operations.NewLockManager()
 	idempotency := operations.NewIdempotencyTracker(24 * time.Hour)

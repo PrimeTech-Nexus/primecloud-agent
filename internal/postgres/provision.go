@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
+	"github.com/primecloud/primecloud-agent/internal/network"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/vault"
 )
@@ -39,6 +40,7 @@ type Provisioner struct {
 	rt          runtime.ContainerRuntime
 	vaultClient *vault.Client
 	baseResDir  string
+	netMgr      *network.Manager
 	logger      *slog.Logger
 }
 
@@ -56,6 +58,11 @@ func NewProvisioner(rt runtime.ContainerRuntime, vaultClient *vault.Client, base
 		baseResDir:  baseResDir,
 		logger:      logger.With("component", "postgres_provisioner"),
 	}
+}
+
+// SetNetworkManager sets the ManagedDataNetworkManager for network attachment.
+func (p *Provisioner) SetNetworkManager(mgr *network.Manager) {
+	p.netMgr = mgr
 }
 
 // GenerateCredentials produces cryptographically secure credentials.
@@ -80,11 +87,13 @@ func GenerateCredentials(resourceID string) (*Credentials, error) {
 
 // Provision prepares storage, generates credentials, writes them to Vault, and starts the container.
 func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, hostPort string) (*ProvisionResult, error) {
-	return p.ProvisionWithProject(ctx, "default", resourceID, image, hostPort)
+	return p.ProvisionWithProject(ctx, "default", "", resourceID, image, hostPort)
 }
 
 // ProvisionWithProject prepares storage, generates credentials, writes them to Vault under the tenant path, and starts the container.
-func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resourceID, image, hostPort string) (*ProvisionResult, error) {
+// environmentID is the PrimeCloud environment UUID used to attach the container to the managed-data network.
+// Pass an empty string if no environment network attachment is required (e.g., tests without Docker).
+func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string) (*ProvisionResult, error) {
 	if resourceID == "" {
 		return nil, fmt.Errorf("resource_id cannot be empty")
 	}
@@ -109,8 +118,19 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 		return nil, err
 	}
 
-	host := fmt.Sprintf("pc-pg-%s", resourceID)
-	url := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s", creds.Username, creds.Password, host, creds.Port, creds.Database)
+	// Legacy host label (kept for backward compat in Vault and existing connection-string consumers)
+	legacyHost := fmt.Sprintf("pc-pg-%s", resourceID)
+	// Internal DNS hostname used inside pc-net-<environmentID> for container-to-container resolution
+	internalHost := fmt.Sprintf("postgres-%s.internal.primecloud", resourceID)
+
+	// Build the authoritative connection URL using the internal DNS hostname so that
+	// applications consuming this secret resolve correctly inside the managed-data network.
+	// When environmentID is empty (e.g. legacy or test path) fall back to the legacy host.
+	urlHost := internalHost
+	if environmentID == "" {
+		urlHost = legacyHost
+	}
+	url := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s", creds.Username, creds.Password, urlHost, creds.Port, creds.Database)
 
 	// 3. Store Credentials in Vault
 	tenantVaultRef := fmt.Sprintf("secret/data/primecloud/tenants/%s/postgres/%s", projectID, resourceID)
@@ -120,7 +140,7 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 			"username": creds.Username,
 			"password": creds.Password,
 			"database": creds.Database,
-			"host":     host,
+			"host":     legacyHost, // Legacy host preserved for compat; use url for connection
 			"port":     creds.Port,
 			"url":      url,
 		}
@@ -186,12 +206,35 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, resou
 		if err := applications.WaitForContainerReady(ctx, p.rt, containerID, 30*time.Second); err != nil {
 			return nil, fmt.Errorf("postgres container failed health check: %w", err)
 		}
+
+		// Attach container to the managed-data network (pc-net-<environmentID>) so that
+		// application containers in the same environment can resolve via internal DNS.
+		if p.netMgr != nil && environmentID != "" {
+			aliases := network.FormatPostgresAliases(resourceID)
+			if err := p.netMgr.AttachContainerToEnvironmentNetwork(ctx, environmentID, containerID, aliases); err != nil {
+				p.logger.Warn("postgres_network_attach_failed",
+					"resource_id", resourceID,
+					"environment_id", environmentID,
+					"container_id", containerID,
+					"error", err,
+				)
+				// Non-fatal: container is up and serving; network attachment will be retried
+				// by reconcile_managed_data_network.
+			} else {
+				p.logger.Info("postgres_network_attached",
+					"resource_id", resourceID,
+					"environment_id", environmentID,
+					"network", "pc-net-"+environmentID,
+					"aliases", aliases,
+				)
+			}
+		}
 	}
 
 	result := &ProvisionResult{
 		ResourceID:     resourceID,
 		ContainerID:    containerID,
-		Endpoint:       fmt.Sprintf("%s:5432", host),
+		Endpoint:       fmt.Sprintf("%s:5432", legacyHost),
 		VaultSecretRef: tenantVaultRef,
 		VolumePath:     volumePath,
 		Credentials:    creds,

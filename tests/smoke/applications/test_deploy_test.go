@@ -119,14 +119,14 @@ func TestApplications_Phase2_ConnectionInjection(t *testing.T) {
 
 	// 1. Provision PostgreSQL datastore
 	pgProv := postgres.NewProvisioner(nil, vClient, baseResDir, nil)
-	pgRes, err := pgProv.ProvisionWithProject(ctx, projectID, pgResID, "postgres:16-alpine", "")
+	pgRes, err := pgProv.ProvisionWithProject(ctx, projectID, "", pgResID, "postgres:16-alpine", "")
 	if err != nil {
 		t.Fatalf("PostgreSQL provision failed: %v", err)
 	}
 
 	// 2. Provision Customer Valkey datastore
 	vkProv := valkey.NewProvisioner(nil, vClient, baseResDir, nil)
-	vkRes, err := vkProv.ProvisionWithProject(ctx, projectID, vkResID, "valkey/valkey:7.2-alpine", "")
+	vkRes, err := vkProv.ProvisionWithProject(ctx, projectID, "", vkResID, "valkey/valkey:7.2-alpine", "")
 	if err != nil {
 		t.Fatalf("Valkey provision failed: %v", err)
 	}

@@ -157,7 +157,7 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 	// AG-07: PostgreSQL Provisioning & Backup
 	// ----------------------------------------------------
 	pgProv := postgres.NewProvisioner(nil, vClient, resDir, nil)
-	pgRes, err := pgProv.ProvisionWithProject(ctx, "proj-chunk-b", "pg-test-res", "postgres:16-alpine", "")
+	pgRes, err := pgProv.ProvisionWithProject(ctx, "proj-chunk-b", "", "pg-test-res", "postgres:16-alpine", "")
 	if err != nil {
 		t.Fatalf("Postgres provision failed: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 	// AG-08: Valkey Provisioning & Backup
 	// ----------------------------------------------------
 	vkProv := valkey.NewProvisioner(nil, vClient, resDir, nil)
-	vkRes, err := vkProv.ProvisionWithProject(ctx, "proj-chunk-b", "vk-test-res", "valkey/valkey:7.2-alpine", "")
+	vkRes, err := vkProv.ProvisionWithProject(ctx, "proj-chunk-b", "", "vk-test-res", "valkey/valkey:7.2-alpine", "")
 	if err != nil {
 		t.Fatalf("Valkey provision failed: %v", err)
 	}

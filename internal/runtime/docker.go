@@ -56,6 +56,14 @@ func (d *DockerRuntime) Close() error {
 	return d.cli.Close()
 }
 
+// Client returns the underlying Docker API client.
+func (d *DockerRuntime) Client() *client.Client {
+	if d == nil {
+		return nil
+	}
+	return d.cli
+}
+
 // Ping verifies connectivity to the Docker daemon.
 func (d *DockerRuntime) Ping(ctx context.Context) error {
 	_, err := d.cli.Ping(ctx)
