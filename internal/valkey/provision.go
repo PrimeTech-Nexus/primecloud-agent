@@ -170,6 +170,10 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 		HealthInterval: 3 * time.Second,
 		HealthTimeout:  2 * time.Second,
 		HealthRetries:  5,
+		Labels: map[string]string{
+			"primecloud.resource_id": resourceID,
+			"primecloud.managed":     "true",
+		},
 	}
 
 	if hostPort != "" {

@@ -66,10 +66,11 @@ type ContainerInspect struct {
 	State      string            `json:"state"`
 	Running    bool              `json:"running"`
 	ExitCode   int               `json:"exit_code"`
-	Health     string            `json:"health,omitempty"`
-	Labels     map[string]string `json:"labels"`
-	IPAddress  string            `json:"ip_address"`
-	Ports      map[string]string `json:"ports,omitempty"` // containerPort -> hostPort
-	StartedAt  time.Time         `json:"started_at"`
-	FinishedAt time.Time         `json:"finished_at"`
+	Health       string            `json:"health,omitempty"`
+	RestartCount int               `json:"restart_count,omitempty"`
+	Labels       map[string]string `json:"labels"`
+	IPAddress    string            `json:"ip_address"`
+	Ports        map[string]string `json:"ports,omitempty"` // containerPort -> hostPort
+	StartedAt    time.Time         `json:"started_at"`
+	FinishedAt   time.Time         `json:"finished_at"`
 }

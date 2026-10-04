@@ -32,6 +32,7 @@ type ContainerRuntime interface {
 	InspectContainer(ctx context.Context, containerID string) (*ContainerInspect, error)
 	ListContainers(ctx context.Context, all bool) ([]ContainerSummary, error)
 	GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error)
+	GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error)
 	ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) (stdout []byte, stderr []byte, exitCode int, err error)
 	Ping(ctx context.Context) error
 	Close() error
@@ -399,6 +400,7 @@ func (d *DockerRuntime) InspectContainer(ctx context.Context, containerID string
 	if inspect.State.Health != nil {
 		res.Health = inspect.State.Health.Status
 	}
+	res.RestartCount = inspect.RestartCount
 
 	if inspect.NetworkSettings != nil {
 		res.IPAddress = inspect.NetworkSettings.IPAddress
@@ -445,6 +447,15 @@ func (d *DockerRuntime) GetContainerLogs(ctx context.Context, containerID string
 		Follow:     false,
 		Timestamps: true,
 	})
+}
+
+// GetContainerStats returns a stream of container resource usage statistics.
+func (d *DockerRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	resp, err := d.cli.ContainerStats(ctx, containerID, false)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 // ExecContainer executes a command inside a running container with optional environment and stdin.

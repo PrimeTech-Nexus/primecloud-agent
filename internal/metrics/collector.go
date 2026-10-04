@@ -6,38 +6,64 @@ import (
 	"encoding/json"
 	"log/slog"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/primecloud/primecloud-agent/internal/protocol"
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
 )
 
 // MetricPayload encapsulates node and workload resource telemetry.
+
+type ContainerMetric struct {
+	ResourceID        string  `json:"resource_id,omitempty"`
+	Engine            string  `json:"engine,omitempty"`
+	State             string  `json:"state"`
+	CPUUsagePercent   float64 `json:"cpu_usage_percent"`
+	MemoryUsageBytes  int64   `json:"memory_usage_bytes"`
+	MemoryLimitBytes  int64   `json:"memory_limit_bytes"`
+	NetworkRxBytes    int64   `json:"network_rx_bytes"`
+	NetworkTxBytes    int64   `json:"network_tx_bytes"`
+	UptimeSeconds     int64   `json:"uptime_seconds"`
+	HealthStatus      string  `json:"health_status"`
+	RestartCount      int     `json:"restart_count"`
+	ActiveConnections int64   `json:"active_connections,omitempty"`
+	DatabaseSizeBytes int64   `json:"database_size_bytes,omitempty"`
+	TransactionCount  int64   `json:"transaction_count,omitempty"`
+	QueryHealth       string  `json:"query_health,omitempty"`
+	ConnectedClients  int64   `json:"connected_clients,omitempty"`
+	CommandsProcessed int64   `json:"commands_processed,omitempty"`
+	KeyCount          int64   `json:"key_count,omitempty"`
+	ReplicationStatus string  `json:"replication_status,omitempty"`
+}
+
 type MetricPayload struct {
-	NodeID             string            `json:"node_id"`
-	AgentID            string            `json:"agent_id"`
-	CPUUsagePercent    float64           `json:"cpu_usage_percent"`
-	MemoryUsagePercent float64           `json:"memory_usage_percent"`
-	DiskUsagePercent   float64           `json:"disk_usage_percent"`
-	AllocatedMemoryMB  int64             `json:"allocated_memory_mb"`
-	TotalMemoryMB      int64             `json:"total_memory_mb"`
-	ContainerCount     int               `json:"container_count"`
-	ContainerStats     map[string]string `json:"container_stats,omitempty"`
-	SampledAt          time.Time         `json:"sampled_at"`
+	NodeID             string                     `json:"node_id"`
+	AgentID            string                     `json:"agent_id"`
+	CPUUsagePercent    float64                    `json:"cpu_usage_percent"`
+	MemoryUsagePercent float64                    `json:"memory_usage_percent"`
+	DiskUsagePercent   float64                    `json:"disk_usage_percent"`
+	AllocatedMemoryMB  int64                      `json:"allocated_memory_mb"`
+	TotalMemoryMB      int64                      `json:"total_memory_mb"`
+	ContainerCount     int                        `json:"container_count"`
+	ContainerStats     map[string]ContainerMetric `json:"container_stats,omitempty"`
+	SampledAt          time.Time                  `json:"sampled_at"`
 }
 
 // Collector continuously samples metrics and transmits them to the Control Plane.
 type Collector struct {
-	mu           sync.Mutex
-	interval     time.Duration
-	nodeID       string
-	agentID      string
-	rt           agentruntime.ContainerRuntime
-	grpcClient   protocol.AgentServiceClient
-	logger       *slog.Logger
-	draining     bool
-	failedCount  int
+	mu          sync.Mutex
+	interval    time.Duration
+	nodeID      string
+	agentID     string
+	rt          agentruntime.ContainerRuntime
+	grpcClient  protocol.AgentServiceClient
+	logger      *slog.Logger
+	draining    bool
+	failedCount int
 }
 
 // NewCollector constructs a Collector instance.
@@ -92,13 +118,126 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 	}
 
 	containerCount := 0
-	containerStats := make(map[string]string)
+	containerStats := make(map[string]ContainerMetric)
+
+	var nodeCPU float64 = 0.0
+	var nodeDisk float64 = 0.0
+	// Real OS metrics would be collected here.
 
 	if c.rt != nil {
 		if containers, err := c.rt.ListContainers(ctx, true); err == nil {
 			containerCount = len(containers)
 			for _, cnt := range containers {
-				containerStats[cnt.ID[:min(12, len(cnt.ID))]] = cnt.State
+				shortID := cnt.ID[:min(12, len(cnt.ID))]
+				stat := ContainerMetric{State: cnt.State}
+
+				if cnt.State == "running" {
+					if statsReader, err := c.rt.GetContainerStats(ctx, cnt.ID); err == nil && statsReader != nil {
+						defer statsReader.Close()
+						var v types.StatsJSON
+						if err := json.NewDecoder(statsReader).Decode(&v); err == nil {
+							cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage) - float64(v.PreCPUStats.CPUUsage.TotalUsage)
+							systemDelta := float64(v.CPUStats.SystemUsage) - float64(v.PreCPUStats.SystemUsage)
+							if systemDelta > 0.0 && cpuDelta > 0.0 {
+								stat.CPUUsagePercent = (cpuDelta / systemDelta) * float64(len(v.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+							}
+							stat.MemoryUsageBytes = int64(v.MemoryStats.Usage)
+							stat.MemoryLimitBytes = int64(v.MemoryStats.Limit)
+							var rx, tx int64
+							for _, netStat := range v.Networks {
+								rx += int64(netStat.RxBytes)
+								tx += int64(netStat.TxBytes)
+							}
+							stat.NetworkRxBytes = rx
+							stat.NetworkTxBytes = tx
+						}
+						statsReader.Close()
+					}
+
+					if insp, err := c.rt.InspectContainer(ctx, cnt.ID); err == nil {
+						stat.HealthStatus = insp.Health
+						stat.RestartCount = insp.RestartCount
+						uptime := time.Since(insp.StartedAt).Seconds()
+						if uptime > 0 {
+							stat.UptimeSeconds = int64(uptime)
+						}
+						if insp.Labels != nil {
+							if rid, ok := insp.Labels["primecloud.resource_id"]; ok && rid != "" {
+								stat.ResourceID = rid
+							}
+						}
+
+						cntName := ""
+						if len(cnt.Names) > 0 {
+							cntName = cnt.Names[0]
+						}
+
+						// Fallback: extract resource ID from standard container name pc-pg-<uuid> / pc-vk-<uuid>
+						if stat.ResourceID == "" {
+							cleanName := strings.TrimPrefix(cntName, "/")
+							if strings.HasPrefix(cleanName, "pc-pg-") {
+								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-pg-")
+							} else if strings.HasPrefix(cleanName, "pc-vk-") {
+								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-vk-")
+							}
+						}
+
+						if isPostgres(cnt.Image) || isPostgres(cntName) {
+							stat.Engine = "postgres"
+							cmd := []string{"psql", "-U", "postgres", "-c", "SELECT count(*) FROM pg_stat_activity;"}
+							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
+							if err == nil && exit == 0 {
+								lines := strings.Split(string(stdout), "\n")
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if val, err := strconv.ParseInt(line, 10, 64); err == nil {
+										stat.ActiveConnections = val
+									}
+								}
+							}
+
+							cmd = []string{"psql", "-U", "postgres", "-c", "SELECT sum(pg_database_size(datname)) FROM pg_database;"}
+							stdout, _, exit, err = c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
+							if err == nil && exit == 0 {
+								lines := strings.Split(string(stdout), "\n")
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if val, err := strconv.ParseInt(line, 10, 64); err == nil {
+										stat.DatabaseSizeBytes = val
+									}
+								}
+							}
+						}
+
+						if isValkey(cnt.Image) || isValkey(cntName) {
+							stat.Engine = "valkey"
+							cmd := []string{"valkey-cli", "info"}
+							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
+							if err == nil && exit == 0 {
+								lines := strings.Split(string(stdout), "\n")
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if strings.HasPrefix(line, "connected_clients:") {
+										if val, err := strconv.ParseInt(strings.TrimPrefix(line, "connected_clients:"), 10, 64); err == nil {
+											stat.ConnectedClients = val
+										}
+									} else if strings.HasPrefix(line, "used_memory:") {
+										if val, err := strconv.ParseInt(strings.TrimPrefix(line, "used_memory:"), 10, 64); err == nil {
+											stat.MemoryUsageBytes = val
+										}
+									} else if strings.HasPrefix(line, "total_commands_processed:") {
+										if val, err := strconv.ParseInt(strings.TrimPrefix(line, "total_commands_processed:"), 10, 64); err == nil {
+											stat.CommandsProcessed = val
+										}
+									} else if strings.HasPrefix(line, "role:") {
+										stat.ReplicationStatus = strings.TrimPrefix(line, "role:")
+									}
+								}
+							}
+						}
+					}
+				}
+				containerStats[shortID] = stat
 			}
 		}
 	}
@@ -110,15 +249,16 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 	return &MetricPayload{
 		NodeID:             c.nodeID,
 		AgentID:            c.agentID,
-		CPUUsagePercent:    15.0,
+		CPUUsagePercent:    nodeCPU,
 		MemoryUsagePercent: memPercent,
-		DiskUsagePercent:   20.0,
+		DiskUsagePercent:   nodeDisk,
 		AllocatedMemoryMB:  allocatedMB,
 		TotalMemoryMB:      sysMB,
 		ContainerCount:     containerCount,
 		ContainerStats:     containerStats,
 		SampledAt:          time.Now(),
 	}, nil
+
 }
 
 // Start boots the continuous collection ticker in a background goroutine.
@@ -180,4 +320,12 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func isPostgres(name string) bool {
+	return strings.Contains(strings.ToLower(name), "postgres")
+}
+
+func isValkey(name string) bool {
+	return strings.Contains(strings.ToLower(name), "valkey")
 }
