@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -71,3 +73,32 @@ func TestReadCredentialsEmptyIDsFailsClosed(t *testing.T) {
 		t.Fatal("expected error with empty IDs, got nil")
 	}
 }
+
+func TestEnsurePostgresDataDir(t *testing.T) {
+	tempDir := t.TempDir()
+	volumePath := filepath.Join(tempDir, "postgres", "test-res-123")
+
+	if err := ensurePostgresDataDir(volumePath); err != nil {
+		t.Fatalf("ensurePostgresDataDir failed: %v", err)
+	}
+
+	// Verify volumePath exists
+	info, err := os.Stat(volumePath)
+	if err != nil {
+		t.Fatalf("volume directory not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("volume path is not a directory")
+	}
+
+	// Verify pgdata subdirectory exists
+	pgdata := filepath.Join(volumePath, "pgdata")
+	pgInfo, err := os.Stat(pgdata)
+	if err != nil {
+		t.Fatalf("pgdata directory not created: %v", err)
+	}
+	if !pgInfo.IsDir() {
+		t.Fatalf("pgdata path is not a directory")
+	}
+}
+

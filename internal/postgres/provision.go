@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -106,9 +105,9 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 
 	p.logger.Info("provisioning_postgres_starting", "project_id", projectID, "resource_id", resourceID, "image", image)
 
-	// 1. Create Volume Directory
+	// 1. Create Volume Directory with correct permissions for postgres (UID 999)
 	volumePath := filepath.Join(p.baseResDir, "postgres", resourceID)
-	if err := os.MkdirAll(volumePath, 0700); err != nil {
+	if err := ensurePostgresDataDir(volumePath); err != nil {
 		return nil, fmt.Errorf("failed to create postgres volume directory %s: %w", volumePath, err)
 	}
 
