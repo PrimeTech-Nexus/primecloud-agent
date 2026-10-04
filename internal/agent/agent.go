@@ -17,6 +17,7 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/applications"
 	"github.com/primecloud/primecloud-agent/internal/backup"
 	"github.com/primecloud/primecloud-agent/internal/caddy"
+	"github.com/primecloud/primecloud-agent/internal/haproxy"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
 	"github.com/primecloud/primecloud-agent/internal/network"
@@ -359,7 +360,17 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}, nil)
 
 	// Managed Services & Ingress Drivers
-	caddyMgr := caddy.NewManager("/etc/caddy/sites-enabled", "http://127.0.0.1:2019", a.logger)
+	caddySitesDir := os.Getenv("PRIMECLOUD_CADDY_CONFIG_DIR")
+	if caddySitesDir == "" {
+		caddySitesDir = "/etc/caddy/sites-enabled"
+	}
+	caddyMgr := caddy.NewManager(caddySitesDir, "http://127.0.0.1:2019", a.logger)
+
+	haproxyConfDir := os.Getenv("PRIMECLOUD_HAPROXY_CONFIG_DIR")
+	if haproxyConfDir == "" {
+		haproxyConfDir = "/etc/haproxy/conf.d"
+	}
+	haproxyMgr := haproxy.NewManager(haproxyConfDir, a.logger)
 	pgProv := postgres.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	pgLC := postgres.NewLifecycleManager(rt)
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
@@ -1448,7 +1459,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 20. enable_external_access
 	registry.Register("enable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		var payload caddy.TCPRouteConfig
+		var payload haproxy.TCPRouteConfig
 		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1479,8 +1490,11 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			}
 			for _, cName := range containerNames {
 				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
-					// Use 127.0.0.1 or localhost when routed via host ports or direct loopback
-					payload.ContainerIP = "127.0.0.1"
+					if insp.IPAddress != "" {
+						payload.ContainerIP = insp.IPAddress
+					} else {
+						payload.ContainerIP = "127.0.0.1"
+					}
 					break
 				}
 			}
@@ -1489,11 +1503,11 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			}
 		}
 
-		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
+		if err := haproxyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "CADDY_CONFIG_FAILED",
+				ErrorCode:       "HAPROXY_CONFIG_FAILED",
 				Message:         err.Error(),
 				CompletedAtUnix: time.Now().Unix(),
 			}, err
@@ -1509,11 +1523,11 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 21. disable_external_access
 	registry.Register("disable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		if err := caddyMgr.RemoveTCPRoute(ctx, op.ResourceId); err != nil {
+		if err := haproxyMgr.RemoveTCPRoute(ctx, op.ResourceId); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "CADDY_REMOVE_FAILED",
+				ErrorCode:       "HAPROXY_REMOVE_FAILED",
 				Message:         err.Error(),
 				CompletedAtUnix: time.Now().Unix(),
 			}, err
@@ -1529,7 +1543,7 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	// 22. reconcile_external_access
 	registry.Register("reconcile_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
-		var payload caddy.TCPRouteConfig
+		var payload haproxy.TCPRouteConfig
 		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1554,11 +1568,11 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			payload.ContainerIP = "127.0.0.1"
 		}
 
-		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
+		if err := haproxyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "CADDY_CONFIG_FAILED",
+				ErrorCode:       "HAPROXY_CONFIG_FAILED",
 				Message:         err.Error(),
 				CompletedAtUnix: time.Now().Unix(),
 			}, err

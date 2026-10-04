@@ -54,33 +54,3 @@ func (m *Manager) RemoveRoute(ctx context.Context, domain string) error {
 
 	return nil
 }
-
-// RemoveTCPRoute removes a TCP route configuration file for the given ID and reloads.
-func (m *Manager) RemoveTCPRoute(ctx context.Context, id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return fmt.Errorf("id cannot be empty")
-	}
-
-	targetFile := filepath.Join(m.configDir, fmt.Sprintf("tcp_%s.caddy", id))
-	if _, err := os.Stat(targetFile); os.IsNotExist(err) {
-		m.logger.Warn("caddy_tcp_route_not_found_on_remove", "id", id)
-		return nil
-	}
-
-	if err := os.Remove(targetFile); err != nil {
-		return fmt.Errorf("failed to remove caddy tcp route file %s: %w", targetFile, err)
-	}
-
-	m.logger.Info("caddy_tcp_route_removed", "id", id)
-
-	// Trigger reload
-	if err := m.reloadInternal(ctx); err != nil {
-		m.logger.Warn("caddy_reload_notice", "id", id, "reason", err.Error())
-	}
-
-	return nil
-}
