@@ -88,6 +88,9 @@ func (m *mockRuntime) ExecContainer(ctx context.Context, containerID string, cmd
 	return nil, nil, 0, nil
 }
 
+func (m *mockRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
 
 func (m *mockRuntime) Ping(ctx context.Context) error {
 	return nil
