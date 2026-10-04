@@ -51,6 +51,9 @@ func (m *MockRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.C
 func (m *MockRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
 	return nil, nil, 0, nil
 }
+func (m *MockRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
 func (m *MockRuntime) Ping(ctx context.Context) error { return nil }
 func (m *MockRuntime) Close() error { return nil }
 
