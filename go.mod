@@ -1,6 +1,6 @@
 module github.com/primecloud/primecloud-agent
 
-go 1.22
+go 1.25.0
 
 require (
 	github.com/docker/docker v26.1.5+incompatible
