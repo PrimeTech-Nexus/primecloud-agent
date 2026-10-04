@@ -1,6 +1,6 @@
 # PrimeCloud Agent Production Container
 # Multi-stage, statically linked Go binary on Alpine Linux
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
