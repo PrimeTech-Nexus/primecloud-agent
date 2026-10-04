@@ -25,6 +25,7 @@ import (
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
 	"github.com/primecloud/primecloud-agent/internal/recovery"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
+	"github.com/primecloud/primecloud-agent/internal/terminal"
 	"github.com/primecloud/primecloud-agent/internal/transport"
 	"github.com/primecloud/primecloud-agent/internal/valkey"
 	"github.com/primecloud/primecloud-agent/internal/vault"
@@ -1442,6 +1443,164 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			Message:         fmt.Sprintf("Managed data network for environment %s reconciled successfully", environmentID),
 			CompletedAtUnix: time.Now().Unix(),
 			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	// 20. enable_external_access
+	registry.Register("enable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		var payload caddy.TCPRouteConfig
+		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_PAYLOAD",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		if payload.ID == "" {
+			payload.ID = op.ResourceId
+		}
+
+		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CADDY_CONFIG_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("External access enabled for %s", op.ResourceId),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 21. disable_external_access
+	registry.Register("disable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		if err := caddyMgr.RemoveTCPRoute(ctx, op.ResourceId); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CADDY_REMOVE_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("External access disabled for %s", op.ResourceId),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 22. reconcile_external_access
+	registry.Register("reconcile_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		var payload caddy.TCPRouteConfig
+		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_PAYLOAD",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		if payload.ID == "" {
+			payload.ID = op.ResourceId
+		}
+
+		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CADDY_CONFIG_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("External access reconciled for %s", op.ResourceId),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	shellMgr := terminal.NewDatabaseShellManager(rt, a.logger)
+
+	// 23. create_shell_session
+	registry.Register("create_shell_session", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		var cfg terminal.SessionConfig
+		if err := json.Unmarshal([]byte(op.PayloadJson), &cfg); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_PAYLOAD",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		if cfg.SessionID == "" {
+			cfg.SessionID = op.OperationId
+		}
+		if cfg.ResourceID == "" {
+			cfg.ResourceID = op.ResourceId
+		}
+
+		sess, err := shellMgr.CreateSession(ctx, &cfg)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "SHELL_CREATE_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Shell session %s created", sess.SessionID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 24. close_shell_session
+	registry.Register("close_shell_session", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payload := parsePayloadMap(op.PayloadJson)
+		sessionID := op.ResourceId
+		if sid, ok := payload["session_id"].(string); ok && sid != "" {
+			sessionID = sid
+		}
+
+		err := shellMgr.CloseSession(sessionID, "closed_by_request")
+		if err != nil && err != terminal.ErrSessionNotFound {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "SHELL_CLOSE_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Shell session %s closed", sessionID),
+			CompletedAtUnix: time.Now().Unix(),
 		}, nil
 	}, nil)
 
