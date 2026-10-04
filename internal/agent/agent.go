@@ -1612,6 +1612,14 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			CompletedAtUnix: time.Now().Unix(),
 		}, nil
 	}, nil)
+	// Register alias for Control Plane compatibility
+	registry.Register("shell_session_create", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		h, _, ok := registry.Get("create_shell_session")
+		if !ok {
+			return nil, fmt.Errorf("create_shell_session handler not found")
+		}
+		return h(ctx, op)
+	}, nil)
 
 	// 24. close_shell_session
 	registry.Register("close_shell_session", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
