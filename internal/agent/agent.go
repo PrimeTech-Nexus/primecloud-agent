@@ -1462,6 +1462,32 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		if payload.ID == "" {
 			payload.ID = op.ResourceId
 		}
+		if payload.TargetPort <= 0 {
+			// Check if resource is postgres or valkey from resource_type / ID
+			if strings.Contains(strings.ToLower(op.OperationType), "valkey") || strings.Contains(strings.ToLower(op.ResourceId), "vk") {
+				payload.TargetPort = 6379
+			} else {
+				payload.TargetPort = 5432
+			}
+		}
+		if payload.ContainerIP == "" {
+			// Resolve container IP from container inspection if running
+			containerNames := []string{
+				fmt.Sprintf("pc-pg-%s", payload.ID),
+				fmt.Sprintf("pc-vk-%s", payload.ID),
+				payload.ID,
+			}
+			for _, cName := range containerNames {
+				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
+					// Use 127.0.0.1 or localhost when routed via host ports or direct loopback
+					payload.ContainerIP = "127.0.0.1"
+					break
+				}
+			}
+			if payload.ContainerIP == "" {
+				payload.ContainerIP = "127.0.0.1"
+			}
+		}
 
 		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
 			return &pb.OperationResponse{
@@ -1516,6 +1542,16 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 		if payload.ID == "" {
 			payload.ID = op.ResourceId
+		}
+		if payload.TargetPort <= 0 {
+			if strings.Contains(strings.ToLower(op.OperationType), "valkey") || strings.Contains(strings.ToLower(op.ResourceId), "vk") {
+				payload.TargetPort = 6379
+			} else {
+				payload.TargetPort = 5432
+			}
+		}
+		if payload.ContainerIP == "" {
+			payload.ContainerIP = "127.0.0.1"
 		}
 
 		if err := caddyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
