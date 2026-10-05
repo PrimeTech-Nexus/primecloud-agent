@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
@@ -107,5 +108,82 @@ func TestPostgres_ProvisioningAndVaultCredentials(t *testing.T) {
 		}
 		pCancel()
 		_ = rt.Close()
+	}
+}
+
+// mockCaptureRuntime captures ContainerConfig during CreateContainer.
+type mockCaptureRuntime struct {
+	lastConfig *runtime.ContainerConfig
+}
+
+func (m *mockCaptureRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *mockCaptureRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
+	return nil
+}
+func (m *mockCaptureRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
+	m.lastConfig = cfg
+	return "mock-cid", nil
+}
+func (m *mockCaptureRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *mockCaptureRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+	return nil
+}
+func (m *mockCaptureRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	return nil
+}
+func (m *mockCaptureRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+	return &runtime.ContainerInspect{ID: id, Running: true, Health: "healthy"}, nil
+}
+func (m *mockCaptureRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockCaptureRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+func (m *mockCaptureRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	return nil, nil, 0, nil
+}
+func (m *mockCaptureRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockCaptureRuntime) Ping(ctx context.Context) error { return nil }
+func (m *mockCaptureRuntime) Close() error                   { return nil }
+
+func TestPostgres_ContainerConfig_NoPort8000Inherited(t *testing.T) {
+	mockRT := &mockCaptureRuntime{}
+	tempDir := t.TempDir()
+	baseResDir := filepath.Join(tempDir, "resources")
+
+	provisioner := postgres.NewProvisioner(mockRT, nil, baseResDir, nil)
+	_, err := provisioner.ProvisionWithProject(context.Background(), "test-proj", "test-env", "test-res", "postgres:16-alpine", "")
+	if err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	if mockRT.lastConfig == nil {
+		t.Fatal("Expected CreateContainer to be called")
+	}
+
+	if mockRT.lastConfig.WorkloadType != runtime.WorkloadTypeManagedPostgres {
+		t.Errorf("Expected WorkloadTypeManagedPostgres, got %s", mockRT.lastConfig.WorkloadType)
+	}
+
+	// Verify that BuildPortConfigForWorkload with this config does NOT contain 8000/tcp
+	exposed, bindings, err := runtime.BuildPortConfigForWorkload(mockRT.lastConfig.WorkloadType, mockRT.lastConfig.Ports)
+	if err != nil {
+		t.Fatalf("BuildPortConfigForWorkload failed: %v", err)
+	}
+
+	if _, ok := exposed["8000/tcp"]; ok {
+		t.Errorf("Managed postgres container must NOT expose 8000/tcp!")
+	}
+	if _, ok := bindings["8000/tcp"]; ok {
+		t.Errorf("Managed postgres container must NOT bind 8000/tcp!")
+	}
+	if _, ok := exposed["5432/tcp"]; !ok {
+		t.Errorf("Managed postgres container must expose 5432/tcp")
+	}
+	if len(bindings) != 0 {
+		t.Errorf("Managed postgres container must NOT have host port bindings when hostPort is empty, got %v", bindings)
 	}
 }

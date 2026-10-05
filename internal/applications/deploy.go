@@ -21,7 +21,7 @@ type DeployPayload struct {
 	ImageReference   string                  `json:"image_reference"`
 	ImageDigest      string                  `json:"image_digest"`
 	Env              map[string]string       `json:"env"`
-	EnvVars          map[string]string       `json:"env_vars"` // Backwards-compatible combined environment map
+	EnvVars          map[string]string       `json:"env_vars"`    // Backwards-compatible combined environment map
 	SecretRefs       map[string]string       `json:"secret_refs"` // ENV_VAR_NAME -> "path/in/vault#key"
 	Port             interface{}             `json:"port"`
 	Ports            interface{}             `json:"ports"`
@@ -283,6 +283,7 @@ func (d *Deployer) Deploy(
 		EnvironmentID:  environmentID,
 		ApplicationID:  appID,
 		InstanceID:     instanceID,
+		WorkloadType:   runtime.WorkloadTypeApplication,
 	}
 
 	limits := payload.Limits

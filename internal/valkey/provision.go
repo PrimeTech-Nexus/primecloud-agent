@@ -174,6 +174,7 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 			"primecloud.resource_id": resourceID,
 			"primecloud.managed":     "true",
 		},
+		WorkloadType: runtime.WorkloadTypeManagedValkey,
 	}
 
 	if hostPort != "" {

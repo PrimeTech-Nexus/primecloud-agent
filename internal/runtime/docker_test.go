@@ -166,9 +166,9 @@ func TestGetGHCRAuth_FromDockerConfig(t *testing.T) {
 
 func TestBuildEnvSlice_FormatsEntries(t *testing.T) {
 	env := map[string]string{
-		"PORT":        "8000",
-		"NODE_ENV":    "production",
-		"SECRET_KEY":  "real-secret-value",
+		"PORT":         "8000",
+		"NODE_ENV":     "production",
+		"SECRET_KEY":   "real-secret-value",
 		"DATABASE_URL": "postgresql://user:pass@db:5432/app",
 	}
 
@@ -198,5 +198,84 @@ func TestBuildEnvSlice_FormatsEntries(t *testing.T) {
 	emptySlice := runtime.BuildEnvSlice(nil)
 	if len(emptySlice) != 0 {
 		t.Errorf("expected 0 entries for nil env, got %d", len(emptySlice))
+	}
+}
+
+func TestBuildPortConfigForWorkload_ManagedPostgres(t *testing.T) {
+	// Managed Postgres without hostPort: exposed 5432/tcp, NO port 8000, NO host port bindings
+	exposed, bindings, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeManagedPostgres, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := exposed["5432/tcp"]; !ok {
+		t.Errorf("expected 5432/tcp in exposed ports, got %v", exposed)
+	}
+	if _, ok := exposed["8000/tcp"]; ok {
+		t.Errorf("8000/tcp must NOT be exposed for managed postgres")
+	}
+	if len(bindings) != 0 {
+		t.Errorf("expected NO host port bindings for managed postgres without hostPort, got %v", bindings)
+	}
+
+	// Managed Postgres with explicit hostPort
+	exposedHP, bindingsHP, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeManagedPostgres, map[string]string{
+		"5432": "30005",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(bindingsHP["5432/tcp"]) != 1 || bindingsHP["5432/tcp"][0].HostPort != "30005" {
+		t.Errorf("expected host port binding 30005, got %v", bindingsHP["5432/tcp"])
+	}
+	if _, ok := exposedHP["8000/tcp"]; ok {
+		t.Errorf("8000/tcp must NOT be exposed for managed postgres with hostPort")
+	}
+}
+
+func TestBuildPortConfigForWorkload_ManagedValkey(t *testing.T) {
+	// Managed Valkey without hostPort: exposed 6379/tcp, NO port 8000, NO host port bindings
+	exposed, bindings, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeManagedValkey, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := exposed["6379/tcp"]; !ok {
+		t.Errorf("expected 6379/tcp in exposed ports, got %v", exposed)
+	}
+	if _, ok := exposed["8000/tcp"]; ok {
+		t.Errorf("8000/tcp must NOT be exposed for managed valkey")
+	}
+	if len(bindings) != 0 {
+		t.Errorf("expected NO host port bindings for managed valkey without hostPort, got %v", bindings)
+	}
+
+	// Managed Valkey with explicit hostPort
+	exposedHP, bindingsHP, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeManagedValkey, map[string]string{
+		"6379": "30010",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(bindingsHP["6379/tcp"]) != 1 || bindingsHP["6379/tcp"][0].HostPort != "30010" {
+		t.Errorf("expected host port binding 30010, got %v", bindingsHP["6379/tcp"])
+	}
+	if _, ok := exposedHP["8000/tcp"]; ok {
+		t.Errorf("8000/tcp must NOT be exposed for managed valkey with hostPort")
+	}
+}
+
+func TestBuildPortConfigForWorkload_Application(t *testing.T) {
+	// Application workloads must default to 8000/tcp with dynamic host port binding
+	exposed, bindings, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeApplication, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := exposed["8000/tcp"]; !ok {
+		t.Errorf("expected 8000/tcp in exposed ports for application, got %v", exposed)
+	}
+	if len(bindings["8000/tcp"]) != 1 || bindings["8000/tcp"][0].HostPort != "" {
+		t.Errorf("expected dynamic ephemeral host port binding for 8000/tcp, got %v", bindings["8000/tcp"])
 	}
 }

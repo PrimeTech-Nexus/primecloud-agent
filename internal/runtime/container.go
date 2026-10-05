@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// WorkloadType defines the classification of a container workload for runtime policies.
+type WorkloadType string
+
+const (
+	// WorkloadTypeApplication is a generic user/customer application workload.
+	WorkloadTypeApplication WorkloadType = "APPLICATION"
+	// WorkloadTypeManagedPostgres is a managed PostgreSQL database container.
+	WorkloadTypeManagedPostgres WorkloadType = "MANAGED_POSTGRES"
+	// WorkloadTypeManagedValkey is a managed Valkey key-value cache/store container.
+	WorkloadTypeManagedValkey WorkloadType = "MANAGED_VALKEY"
+)
+
 // ContainerConfig defines specifications for creating and running a workload container.
 type ContainerConfig struct {
 	Name           string            `json:"name"`
@@ -25,6 +37,7 @@ type ContainerConfig struct {
 	InstanceID     string            `json:"instance_id"`
 	User           string            `json:"user,omitempty"`
 	NetworkMode    string            `json:"network_mode,omitempty"`
+	WorkloadType   WorkloadType      `json:"workload_type,omitempty"`
 }
 
 // EnsureMandatoryLabels sets standard PrimeCloud system labels.
@@ -60,12 +73,12 @@ type ContainerSummary struct {
 
 // ContainerInspect contains detailed container status and configuration.
 type ContainerInspect struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Image      string            `json:"image"`
-	State      string            `json:"state"`
-	Running    bool              `json:"running"`
-	ExitCode   int               `json:"exit_code"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Image        string            `json:"image"`
+	State        string            `json:"state"`
+	Running      bool              `json:"running"`
+	ExitCode     int               `json:"exit_code"`
 	Health       string            `json:"health,omitempty"`
 	RestartCount int               `json:"restart_count,omitempty"`
 	Labels       map[string]string `json:"labels"`
