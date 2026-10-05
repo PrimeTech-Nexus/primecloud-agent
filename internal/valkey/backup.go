@@ -159,10 +159,8 @@ func BackupValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vCl
 		}
 	}
 
-	// Fallback for mock/testing environments without active container
 	if len(rdbBytes) == 0 {
-		rdbHeader := []byte("REDIS0011\xfa\tredis-ver\x057.2.0\xfa\nprimecloud\x05agent\xff\x00\x00\x00\x00\x00\x00\x00\x00")
-		rdbBytes = rdbHeader
+		return nil, fmt.Errorf("failed to extract RDB from container or host volume")
 	}
 
 	// Verify RDB header magic number
