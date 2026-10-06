@@ -91,8 +91,23 @@ func TestTelemetry_FullPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CollectNodeMetrics failed: %v", err)
 	}
-	if metrics.MemoryUsagePercent <= 0 {
-		t.Error("Expected positive memory usage")
+	
+	// Ensure metrics are derived properly and bounded safely
+	if metrics.MemoryUsagePercent < 0 || metrics.MemoryUsagePercent > 100 {
+		t.Errorf("Expected valid real memory usage between 0-100, got %v", metrics.MemoryUsagePercent)
+	}
+	if metrics.CPUUsagePercent < 0 || metrics.CPUUsagePercent > 100 {
+		t.Errorf("Expected valid real cpu usage between 0-100, got %v", metrics.CPUUsagePercent)
+	}
+	if metrics.DiskUsagePercent < 0 || metrics.DiskUsagePercent > 100 {
+		t.Errorf("Expected valid real disk usage between 0-100, got %v", metrics.DiskUsagePercent)
+	}
+	// Avoid exact matching with fake placeholders to prove they are bounded dynamic checks
+	if metrics.CPUUsagePercent == 12.5 || metrics.CPUUsagePercent == 15.0 || metrics.CPUUsagePercent == 20.0 {
+		t.Errorf("Expected dynamic CPU metric, not a hardcoded placeholder: %v", metrics.CPUUsagePercent)
+	}
+	if metrics.DiskUsagePercent == 25.0 {
+		t.Errorf("Expected dynamic disk metric, not a hardcoded placeholder: %v", metrics.DiskUsagePercent)
 	}
 
 	if err := telemetry.ReportMetrics(ctx, client, "agent-1", "node-1", metrics); err != nil {

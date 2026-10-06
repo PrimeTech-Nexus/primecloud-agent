@@ -3,6 +3,7 @@ package valkey_test
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -78,8 +79,12 @@ func TestValkey_ProvisioningAndVaultCredentials(t *testing.T) {
 		t.Errorf("Auth token mismatch in legacy compat Vault")
 	}
 
-	// Test Backup
-	backupRes, err := valkey.BackupValkey(ctx, nil, resID, filepath.Join(tempDir, "backups"))
+	// Test Backup - Create a dummy RDB file in host volume to simulate
+	rdbPath := filepath.Join(baseResDir, "valkey", resID, "dump.rdb")
+	os.MkdirAll(filepath.Dir(rdbPath), 0700)
+	os.WriteFile(rdbPath, []byte("REDIS0009fake"), 0600)
+	
+	backupRes, err := valkey.BackupValkeyWithVault(ctx, nil, nil, baseResDir, projectID, resID, filepath.Join(tempDir, "backups"))
 	if err != nil {
 		t.Fatalf("BackupValkey failed: %v", err)
 	}
