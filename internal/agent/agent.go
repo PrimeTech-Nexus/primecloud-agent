@@ -63,6 +63,11 @@ type Agent struct {
 
 // NewAgent constructs a new Agent daemon instance.
 func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
+	return NewAgentWithRuntime(cfg, nil, logger)
+}
+
+// NewAgentWithRuntime constructs a new Agent daemon instance with an optional custom ContainerRuntime.
+func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger *slog.Logger) (*Agent, error) {
 	if cfg == nil {
 		return nil, ErrInvalidConfig
 	}
@@ -78,9 +83,14 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	a.state.Store(StateInitializing)
 
 	// Initialize Container Runtime
-	rt, err := runtime.NewDockerRuntime()
-	if err != nil {
-		a.logger.Warn("docker_runtime_init_warning", "error", err)
+	rt := customRT
+	if rt == nil {
+		dockerRT, err := runtime.NewDockerRuntime()
+		if err != nil {
+			a.logger.Warn("docker_runtime_init_warning", "error", err)
+		} else {
+			rt = dockerRT
+		}
 	}
 	a.runtime = rt
 
@@ -88,8 +98,8 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	// The Manager uses the Docker client to create and manage pc-net-<environmentID> bridge networks
 	// that provide DNS-based isolation for PostgreSQL, Valkey and Application containers.
 	var netMgr *network.Manager
-	if rt != nil {
-		netMgr = network.NewManager(rt.Client(), cfg.NodeID, a.logger)
+	if dRT, ok := rt.(*runtime.DockerRuntime); ok && dRT != nil {
+		netMgr = network.NewManager(dRT.Client(), cfg.NodeID, a.logger)
 		a.logger.Info("managed_data_network_manager_initialized", "node_id", cfg.NodeID)
 	}
 
@@ -521,6 +531,22 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		resID := extractResourceID(op, "postgres_id")
 		payload := parsePayloadMap(op.PayloadJson)
 
+		// Validate external access settings upfront
+		extAccessEnabled := isExternalAccessEnabled(payload)
+		var extPort int
+		if extAccessEnabled {
+			extPort = extractExternalPort(payload)
+			if extPort <= 0 || extPort > 65535 {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "HAPROXY_CONFIG_FAILED",
+					Message:         fmt.Sprintf("failed to generate haproxy snippet: invalid external port %d (must be between 1 and 65535)", extPort),
+					CompletedAtUnix: time.Now().Unix(),
+				}, fmt.Errorf("failed to generate haproxy snippet: invalid external port %d (must be between 1 and 65535)", extPort)
+			}
+		}
+
 		image := "postgres:16-alpine"
 		if img, ok := payload["image"].(string); ok && img != "" {
 			image = img
@@ -572,6 +598,47 @@ func NewAgent(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			"status":           "AVAILABLE",
 			"node_id":          cfg.NodeID,
 		}
+
+		// Configure HAProxy external access gateway ONLY when external access is enabled.
+		// If external access is disabled: DO NOT call HAProxy, DO NOT generate snippet, DO NOT require external_port.
+		if extAccessEnabled {
+			containerIP := "127.0.0.1"
+			containerNames := []string{
+				fmt.Sprintf("pc-pg-%s", resID),
+				provRes.ContainerID,
+				resID,
+			}
+			for _, cName := range containerNames {
+				if cName == "" {
+					continue
+				}
+				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
+					if insp.IPAddress != "" {
+						containerIP = insp.IPAddress
+					}
+					break
+				}
+			}
+
+			routeCfg := &haproxy.TCPRouteConfig{
+				ID:          resID,
+				Port:        extPort,
+				ContainerIP: containerIP,
+				TargetPort:  5432,
+			}
+			if err := haproxyMgr.ConfigureTCPRoute(ctx, routeCfg); err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "HAPROXY_CONFIG_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			resData["external_port"] = extPort
+			resData["external_access"] = true
+		}
+
 		resBytes, _ := json.Marshal(resData)
 
 		return &pb.OperationResponse{
@@ -1842,5 +1909,67 @@ func parsePayloadMap(payloadJSON string) map[string]interface{} {
 		_ = json.Unmarshal([]byte(payloadJSON), &m)
 	}
 	return m
+}
+
+func isExternalAccessEnabled(payload map[string]interface{}) bool {
+	if val, ok := payload["external_access"]; ok {
+		switch v := val.(type) {
+		case bool:
+			return v
+		case string:
+			lower := strings.ToLower(strings.TrimSpace(v))
+			return lower == "true" || lower == "enabled" || lower == "1"
+		case map[string]interface{}:
+			if en, ok := v["enabled"].(bool); ok {
+				return en
+			}
+			if enStr, ok := v["enabled"].(string); ok {
+				lower := strings.ToLower(strings.TrimSpace(enStr))
+				return lower == "true" || lower == "enabled" || lower == "1"
+			}
+		}
+	}
+	if val, ok := payload["enable_external_access"]; ok {
+		switch v := val.(type) {
+		case bool:
+			return v
+		case string:
+			lower := strings.ToLower(strings.TrimSpace(v))
+			return lower == "true" || lower == "enabled" || lower == "1"
+		}
+	}
+	return false
+}
+
+func extractExternalPort(payload map[string]interface{}) int {
+	extract := func(v interface{}) int {
+		switch val := v.(type) {
+		case float64:
+			return int(val)
+		case int:
+			return val
+		case string:
+			if p, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+				return p
+			}
+		}
+		return 0
+	}
+
+	if p, ok := payload["external_port"]; ok {
+		return extract(p)
+	}
+	if p, ok := payload["port"]; ok {
+		return extract(p)
+	}
+	if extMap, ok := payload["external_access"].(map[string]interface{}); ok {
+		if p, ok := extMap["port"]; ok {
+			return extract(p)
+		}
+		if p, ok := extMap["external_port"]; ok {
+			return extract(p)
+		}
+	}
+	return 0
 }
 
