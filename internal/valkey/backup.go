@@ -137,24 +137,27 @@ func BackupValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vCl
 				return nil, fmt.Errorf("timed out waiting for Valkey BGSAVE to complete on %s", containerName)
 			}
 
-			// 3. Extract dump.rdb
-			// Check host volume path first if available
-			if baseResDir != "" {
-				hostRdbPath := filepath.Join(baseResDir, "valkey", resourceID, "dump.rdb")
-				if data, rErr := os.ReadFile(hostRdbPath); rErr == nil && len(data) > 0 {
-					rdbBytes = data
-				}
+			// Extract directly from container /data/dump.rdb
+			catCmd := []string{"cat", "/data/dump.rdb"}
+			cStdout, _, cCode, cErr := rt.ExecContainer(ctx, containerName, catCmd, nil, nil)
+			if cErr == nil && cCode == 0 && len(cStdout) > 0 {
+				rdbBytes = cStdout
 			}
+		}
+	}
 
-			// If host path wasn't read, read directly from container /data/dump.rdb
-			if len(rdbBytes) == 0 {
-				catCmd := []string{"cat", "/data/dump.rdb"}
-				cStdout, cStderr, cCode, cErr := rt.ExecContainer(ctx, containerName, catCmd, nil, nil)
-				if cErr == nil && cCode == 0 && len(cStdout) > 0 {
-					rdbBytes = cStdout
-				} else {
-					return nil, fmt.Errorf("failed reading RDB from /data/dump.rdb: %w (stderr: %s)", cErr, string(cStderr))
-				}
+	// 3. Extract dump.rdb from host volume if available (or if container extract wasn't used)
+	if len(rdbBytes) == 0 {
+		searchDirs := []string{}
+		if baseResDir != "" {
+			searchDirs = append(searchDirs, baseResDir)
+		}
+		searchDirs = append(searchDirs, "/opt/primecloud/resources", filepath.Join(os.TempDir(), "primecloud-resources"))
+		for _, dir := range searchDirs {
+			hostRdbPath := filepath.Join(dir, "valkey", resourceID, "dump.rdb")
+			if data, rErr := os.ReadFile(hostRdbPath); rErr == nil && len(data) > 0 {
+				rdbBytes = data
+				break
 			}
 		}
 	}

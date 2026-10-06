@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -185,7 +186,9 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 		t.Fatalf("Valkey credentials missing in Vault: %v", err)
 	}
 
-	vkBackup, err := valkey.BackupValkey(ctx, nil, "vk-test-res", backupDir)
+	rdbVkPath := filepath.Join(resDir, "valkey", "vk-test-res", "dump.rdb")
+	_ = os.WriteFile(rdbVkPath, []byte("REDIS0009fake"), 0600)
+	vkBackup, err := valkey.BackupValkeyWithVault(ctx, nil, nil, resDir, "proj-chunk-b", "vk-test-res", backupDir)
 	if err != nil || vkBackup.SizeBytes == 0 {
 		t.Fatalf("Valkey backup failed: %v", err)
 	}
