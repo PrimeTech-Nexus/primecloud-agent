@@ -61,8 +61,8 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 			defer fileReader.Close()
 
 			var cmd []string
-			if bytes.HasPrefix(data, []byte("PGDMP")) {
-				// PostgreSQL custom dump format -> use pg_restore
+			if bytes.HasPrefix(data, []byte("PGDMP")) || (len(data) >= 262 && string(data[257:262]) == "ustar") {
+				// PostgreSQL custom dump format or tar archive -> use pg_restore
 				cmd = []string{
 					"pg_restore",
 					"-U", creds.Username,
