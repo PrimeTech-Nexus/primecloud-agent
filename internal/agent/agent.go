@@ -578,11 +578,6 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 
-		// If external access is enabled upfront, pass extPort as hostPort to publish <extPort>:5432 directly on container.
-		if extAccessEnabled && hostPort == "" && extPort > 0 {
-			hostPort = strconv.Itoa(extPort)
-		}
-
 		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
@@ -1499,92 +1494,76 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		payloadMap := parsePayloadMap(op.PayloadJson)
 		resID := op.ResourceId
 		if resID == "" {
-			resID = extractResourceID(op, "postgres_id")
+			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id")
 		}
 
-		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
-		if isPostgres {
-			extPort := extractExternalPort(payloadMap)
-			if extPort <= 0 || extPort > 65535 {
-				return &pb.OperationResponse{
-					OperationId:     op.OperationId,
-					Status:          "FAILED",
-					ErrorCode:       "INVALID_EXTERNAL_PORT",
-					Message:         fmt.Sprintf("invalid external port %d (must be between 1 and 65535)", extPort),
-					CompletedAtUnix: time.Now().Unix(),
-				}, fmt.Errorf("invalid external port %d", extPort)
-			}
-
-			projectID := op.ProjectId
-			if projectID == "" {
-				if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
-					projectID = pid
-				}
-			}
-			environmentID := op.EnvironmentId
-			if environmentID == "" {
-				if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
-					environmentID = eid
-				}
-			}
-
-			if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, strconv.Itoa(extPort)); err != nil {
-				return &pb.OperationResponse{
-					OperationId:     op.OperationId,
-					Status:          "FAILED",
-					ErrorCode:       "ENABLE_EXTERNAL_ACCESS_FAILED",
-					Message:         err.Error(),
-					CompletedAtUnix: time.Now().Unix(),
-				}, err
-			}
-
-			return &pb.OperationResponse{
-				OperationId:     op.OperationId,
-				Status:          "SUCCEEDED",
-				Message:         fmt.Sprintf("External access enabled for %s on port %d", resID, extPort),
-				CompletedAtUnix: time.Now().Unix(),
-			}, nil
-		}
-
-		var payload haproxy.TCPRouteConfig
-		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
+		extPort := extractExternalPort(payloadMap)
+		if extPort <= 0 || extPort > 65535 {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "INVALID_PAYLOAD",
-				Message:         err.Error(),
+				ErrorCode:       "INVALID_EXTERNAL_PORT",
+				Message:         fmt.Sprintf("invalid external port %d (must be between 1 and 65535)", extPort),
 				CompletedAtUnix: time.Now().Unix(),
-			}, err
+			}, fmt.Errorf("invalid external port %d", extPort)
 		}
 
-		if payload.ID == "" {
-			payload.ID = op.ResourceId
+		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") &&
+			!strings.Contains(strings.ToLower(op.OperationType), "keyvalue") &&
+			!strings.Contains(strings.ToLower(resID), "vk")
+
+		targetPort := 6379
+		if isPostgres {
+			targetPort = 5432
 		}
-		if payload.TargetPort <= 0 {
-			payload.TargetPort = 6379
+		if tp, ok := payloadMap["target_port"].(float64); ok && int(tp) > 0 {
+			targetPort = int(tp)
+		} else if tp, ok := payloadMap["target_port"].(int); ok && tp > 0 {
+			targetPort = tp
 		}
-		if payload.ContainerIP == "" {
-			// Resolve container IP from container inspection if running
-			containerNames := []string{
-				fmt.Sprintf("pc-vk-%s", payload.ID),
-				payload.ID,
+
+		// Resolve target container IP via container runtime inspection
+		containerIP := ""
+		if cIP, ok := payloadMap["container_ip"].(string); ok && cIP != "" {
+			containerIP = cIP
+		}
+
+		if containerIP == "" && rt != nil {
+			var containerCandidates []string
+			if isPostgres {
+				containerCandidates = []string{
+					fmt.Sprintf("pc-pg-%s", resID),
+					resID,
+				}
+			} else {
+				containerCandidates = []string{
+					fmt.Sprintf("pc-vk-%s", resID),
+					resID,
+				}
 			}
-			for _, cName := range containerNames {
+
+			for _, cName := range containerCandidates {
 				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
 					if insp.IPAddress != "" {
-						payload.ContainerIP = insp.IPAddress
-					} else {
-						payload.ContainerIP = "127.0.0.1"
+						containerIP = insp.IPAddress
 					}
 					break
 				}
 			}
-			if payload.ContainerIP == "" {
-				payload.ContainerIP = "127.0.0.1"
-			}
 		}
 
-		if err := haproxyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
+		if containerIP == "" {
+			containerIP = "127.0.0.1"
+		}
+
+		routeCfg := &haproxy.TCPRouteConfig{
+			ID:          resID,
+			Port:        extPort,
+			ContainerIP: containerIP,
+			TargetPort:  targetPort,
+		}
+
+		if err := haproxyMgr.ConfigureTCPRoute(ctx, routeCfg); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
@@ -1594,10 +1573,18 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}, err
 		}
 
+		resData := map[string]interface{}{
+			"resource_id": resID,
+			"port":        extPort,
+			"status":      "ENABLED",
+		}
+		resJSON, _ := json.Marshal(resData)
+
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
-			Message:         fmt.Sprintf("External access enabled for %s", op.ResourceId),
+			ResultJson:      string(resJSON),
+			Message:         fmt.Sprintf("External access enabled for %s on port %d via HAProxy TCP gateway", resID, extPort),
 			CompletedAtUnix: time.Now().Unix(),
 		}, nil
 	}, nil)
@@ -1606,43 +1593,10 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	registry.Register("disable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		resID := op.ResourceId
 		if resID == "" {
-			resID = extractResourceID(op, "postgres_id")
-		}
-		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
-		if isPostgres {
-			payloadMap := parsePayloadMap(op.PayloadJson)
-			projectID := op.ProjectId
-			if projectID == "" {
-				if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
-					projectID = pid
-				}
-			}
-			environmentID := op.EnvironmentId
-			if environmentID == "" {
-				if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
-					environmentID = eid
-				}
-			}
-
-			if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, ""); err != nil {
-				return &pb.OperationResponse{
-					OperationId:     op.OperationId,
-					Status:          "FAILED",
-					ErrorCode:       "DISABLE_EXTERNAL_ACCESS_FAILED",
-					Message:         err.Error(),
-					CompletedAtUnix: time.Now().Unix(),
-				}, err
-			}
-
-			return &pb.OperationResponse{
-				OperationId:     op.OperationId,
-				Status:          "SUCCEEDED",
-				Message:         fmt.Sprintf("External access disabled for %s", resID),
-				CompletedAtUnix: time.Now().Unix(),
-			}, nil
+			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id")
 		}
 
-		if err := haproxyMgr.RemoveTCPRoute(ctx, op.ResourceId); err != nil {
+		if err := haproxyMgr.RemoveTCPRoute(ctx, resID); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
@@ -1652,90 +1606,100 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}, err
 		}
 
+		resData := map[string]interface{}{
+			"resource_id": resID,
+			"status":      "DISABLED",
+		}
+		resJSON, _ := json.Marshal(resData)
+
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
-			Message:         fmt.Sprintf("External access disabled for %s", op.ResourceId),
+			ResultJson:      string(resJSON),
+			Message:         fmt.Sprintf("External access disabled for %s via HAProxy TCP gateway", resID),
 			CompletedAtUnix: time.Now().Unix(),
 		}, nil
 	}, nil)
 
 	// 22. reconcile_external_access
 	registry.Register("reconcile_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payloadMap := parsePayloadMap(op.PayloadJson)
 		resID := op.ResourceId
 		if resID == "" {
-			resID = extractResourceID(op, "postgres_id")
+			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id")
 		}
-		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
-		if isPostgres {
-			payloadMap := parsePayloadMap(op.PayloadJson)
-			extPort := extractExternalPort(payloadMap)
-			if extPort > 0 {
-				projectID := op.ProjectId
-				if projectID == "" {
-					if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
-						projectID = pid
+
+		extPort := extractExternalPort(payloadMap)
+		if extPort > 0 {
+			isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") &&
+				!strings.Contains(strings.ToLower(op.OperationType), "keyvalue") &&
+				!strings.Contains(strings.ToLower(resID), "vk")
+
+			targetPort := 6379
+			if isPostgres {
+				targetPort = 5432
+			}
+			if tp, ok := payloadMap["target_port"].(float64); ok && int(tp) > 0 {
+				targetPort = int(tp)
+			} else if tp, ok := payloadMap["target_port"].(int); ok && tp > 0 {
+				targetPort = tp
+			}
+
+			containerIP := ""
+			if cIP, ok := payloadMap["container_ip"].(string); ok && cIP != "" {
+				containerIP = cIP
+			}
+
+			if containerIP == "" && rt != nil {
+				var containerCandidates []string
+				if isPostgres {
+					containerCandidates = []string{
+						fmt.Sprintf("pc-pg-%s", resID),
+						resID,
+					}
+				} else {
+					containerCandidates = []string{
+						fmt.Sprintf("pc-vk-%s", resID),
+						resID,
 					}
 				}
-				environmentID := op.EnvironmentId
-				if environmentID == "" {
-					if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
-						environmentID = eid
+
+				for _, cName := range containerCandidates {
+					if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
+						if insp.IPAddress != "" {
+							containerIP = insp.IPAddress
+						}
+						break
 					}
-				}
-				if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, strconv.Itoa(extPort)); err != nil {
-					return &pb.OperationResponse{
-						OperationId:     op.OperationId,
-						Status:          "FAILED",
-						ErrorCode:       "RECONCILE_EXTERNAL_ACCESS_FAILED",
-						Message:         err.Error(),
-						CompletedAtUnix: time.Now().Unix(),
-					}, err
 				}
 			}
-			return &pb.OperationResponse{
-				OperationId:     op.OperationId,
-				Status:          "SUCCEEDED",
-				Message:         fmt.Sprintf("External access reconciled for %s", resID),
-				CompletedAtUnix: time.Now().Unix(),
-			}, nil
-		}
 
-		var payload haproxy.TCPRouteConfig
-		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
-			return &pb.OperationResponse{
-				OperationId:     op.OperationId,
-				Status:          "FAILED",
-				ErrorCode:       "INVALID_PAYLOAD",
-				Message:         err.Error(),
-				CompletedAtUnix: time.Now().Unix(),
-			}, err
-		}
+			if containerIP == "" {
+				containerIP = "127.0.0.1"
+			}
 
-		if payload.ID == "" {
-			payload.ID = op.ResourceId
-		}
-		if payload.TargetPort <= 0 {
-			payload.TargetPort = 6379
-		}
-		if payload.ContainerIP == "" {
-			payload.ContainerIP = "127.0.0.1"
-		}
+			routeCfg := &haproxy.TCPRouteConfig{
+				ID:          resID,
+				Port:        extPort,
+				ContainerIP: containerIP,
+				TargetPort:  targetPort,
+			}
 
-		if err := haproxyMgr.ConfigureTCPRoute(ctx, &payload); err != nil {
-			return &pb.OperationResponse{
-				OperationId:     op.OperationId,
-				Status:          "FAILED",
-				ErrorCode:       "HAPROXY_CONFIG_FAILED",
-				Message:         err.Error(),
-				CompletedAtUnix: time.Now().Unix(),
-			}, err
+			if err := haproxyMgr.ConfigureTCPRoute(ctx, routeCfg); err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "HAPROXY_CONFIG_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
 		}
 
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
-			Message:         fmt.Sprintf("External access reconciled for %s", op.ResourceId),
+			Message:         fmt.Sprintf("External access reconciled for %s via HAProxy TCP gateway", resID),
 			CompletedAtUnix: time.Now().Unix(),
 		}, nil
 	}, nil)

@@ -28,6 +28,8 @@ type Manager struct {
 	mu        sync.RWMutex
 	configDir string
 	logger    *slog.Logger
+	reloadFn  func(ctx context.Context) error
+	verifyFn  func(ctx context.Context, id string, port int) error
 }
 
 // NewManager constructs an HAProxy Manager.
@@ -42,6 +44,20 @@ func NewManager(configDir string, logger *slog.Logger) *Manager {
 		configDir: configDir,
 		logger:    logger.With("component", "haproxy_manager"),
 	}
+}
+
+// SetReloadFunc sets a custom reload function (useful for tests or custom environments).
+func (m *Manager) SetReloadFunc(fn func(ctx context.Context) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reloadFn = fn
+}
+
+// SetVerifyFunc sets a custom route verification function (useful for tests or custom environments).
+func (m *Manager) SetVerifyFunc(fn func(ctx context.Context, id string, port int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifyFn = fn
 }
 
 // ConfigDir returns the active configuration directory.
@@ -160,6 +176,18 @@ func (m *Manager) ConfigureTCPRoute(ctx context.Context, route *TCPRouteConfig) 
 		return fmt.Errorf("failed to reload haproxy after configuring route %s: %w", route.ID, err)
 	}
 
+	// Verify route
+	if err := m.verifyInternal(ctx, route.ID, route.Port); err != nil {
+		if hadExisting {
+			_ = os.WriteFile(targetFile, existingContent, 0644)
+			_ = m.reloadInternal(ctx)
+		} else {
+			_ = os.Remove(targetFile)
+			_ = m.reloadInternal(ctx)
+		}
+		return fmt.Errorf("failed to verify haproxy route %s: %w", route.ID, err)
+	}
+
 	return nil
 }
 
@@ -205,7 +233,29 @@ func (m *Manager) RemoveTCPRoute(ctx context.Context, id string) error {
 	return nil
 }
 
+// VerifyRoute checks whether an HAProxy route is configured and verified.
+func (m *Manager) VerifyRoute(ctx context.Context, id string, port int) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.verifyInternal(ctx, id, port)
+}
+
+func (m *Manager) verifyInternal(ctx context.Context, id string, port int) error {
+	if m.verifyFn != nil {
+		return m.verifyFn(ctx, id, port)
+	}
+	targetFile := filepath.Join(m.configDir, fmt.Sprintf("tcp_%s.cfg", id))
+	if _, err := os.Stat(targetFile); err != nil {
+		return fmt.Errorf("route config file does not exist: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) reloadInternal(ctx context.Context) error {
+	if m.reloadFn != nil {
+		return m.reloadFn(ctx)
+	}
+
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		cmd := exec.CommandContext(ctx, "systemctl", "reload", "haproxy")
 		if output, err := cmd.CombinedOutput(); err != nil {
