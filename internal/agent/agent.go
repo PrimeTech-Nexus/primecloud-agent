@@ -1958,6 +1958,16 @@ func parsePayloadMap(payloadJSON string) map[string]interface{} {
 	m := make(map[string]interface{})
 	if payloadJSON != "" {
 		_ = json.Unmarshal([]byte(payloadJSON), &m)
+		if innerJSON, ok := m["payload_json"].(string); ok && strings.TrimSpace(innerJSON) != "" {
+			var innerMap map[string]interface{}
+			if err := json.Unmarshal([]byte(innerJSON), &innerMap); err == nil {
+				for k, v := range innerMap {
+					if _, exists := m[k]; !exists {
+						m[k] = v
+					}
+				}
+			}
+		}
 	}
 	return m
 }

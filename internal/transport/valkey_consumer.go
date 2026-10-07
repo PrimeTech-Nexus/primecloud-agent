@@ -257,9 +257,19 @@ func (vc *ValkeyConsumer) processItem(ctx context.Context, rawItemStr string) {
 	var payloadJSON string
 	if pjStr, ok := rawObj["payload_json"].(string); ok && strings.TrimSpace(pjStr) != "" {
 		payloadJSON = pjStr
-	} else {
-		b, _ := json.Marshal(payloadMap)
-		payloadJSON = string(b)
+	} else if p, ok := rawObj["payload"].(map[string]interface{}); ok {
+		if pjStr, ok := p["payload_json"].(string); ok && strings.TrimSpace(pjStr) != "" {
+			payloadJSON = pjStr
+		}
+	}
+
+	if payloadJSON == "" {
+		if pjStr, ok := payloadMap["payload_json"].(string); ok && strings.TrimSpace(pjStr) != "" {
+			payloadJSON = pjStr
+		} else {
+			b, _ := json.Marshal(payloadMap)
+			payloadJSON = string(b)
+		}
 	}
 
 	env := &pb.OperationEnvelope{

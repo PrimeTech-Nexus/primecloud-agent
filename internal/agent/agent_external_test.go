@@ -395,3 +395,56 @@ func TestHAProxy_RouteVerificationFailureCausesOperationFailure(t *testing.T) {
 		t.Fatalf("expected config file to be rolled back on verify failure")
 	}
 }
+
+func TestPostgresExternalAccess_NestedPayloadJsonDecodesPort30001(t *testing.T) {
+	tempConfDir := t.TempDir()
+	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
+
+	mockRT := &recordingMockRuntime{}
+	cfg := DefaultConfig()
+	cfg.VaultAddr = ""
+	cfg.ResourceDir = t.TempDir()
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
+	if err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	// Envelope where payload has nested payload_json string containing external_port=30001
+	innerPayloadJSON, _ := json.Marshal(map[string]interface{}{
+		"postgres_id":   "pg-nested-30001",
+		"external_port": 30001,
+		"port":          30001,
+	})
+	outerPayload := map[string]interface{}{
+		"operation_id":   "op-nested-30001",
+		"operation_type": "enable_external_access",
+		"payload_json":   string(innerPayloadJSON),
+	}
+	outerBytes, _ := json.Marshal(outerPayload)
+
+	op := &pb.OperationEnvelope{
+		OperationId:   "op-nested-30001",
+		OperationType: "enable_external_access",
+		ResourceId:    "pg-nested-30001",
+		PayloadJson:   string(outerBytes),
+	}
+
+	res, err := agent.dispatcher.Dispatch(context.Background(), op)
+	if err != nil {
+		t.Fatalf("expected dispatch to succeed with decoded 30001, got err: %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Fatalf("expected SUCCEEDED status, got %s (code: %s, msg: %s)", res.Status, res.ErrorCode, res.Message)
+	}
+
+	// Verify HAProxy route file was created with port 30001
+	cfgFile := filepath.Join(tempConfDir, "tcp_pg-nested-30001.cfg")
+	data, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("expected HAProxy cfg file to exist: %v", err)
+	}
+	if !strings.Contains(string(data), "bind *:30001") {
+		t.Fatalf("expected HAProxy cfg file to contain 'bind *:30001', got:\n%s", string(data))
+	}
+}
+

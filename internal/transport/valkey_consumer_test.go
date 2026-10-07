@@ -566,3 +566,128 @@ func TestValkeyConsumer_TopLevelIdentityWithNestedPayload(t *testing.T) {
 	}
 }
 
+func TestValkeyConsumer_RealQueueEnvelopePreservesExternalPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverAddr := listener.Addr().String()
+	receivedEnvelopeChan := make(chan *pb.OperationEnvelope, 1)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				writer := bufio.NewWriter(c)
+				for {
+					cmd, err := parseRESP(reader)
+					if err != nil {
+						return
+					}
+					cmdArr, ok := cmd.([]interface{})
+					if !ok || len(cmdArr) == 0 {
+						continue
+					}
+					cmdName := strings.ToUpper(fmt.Sprintf("%v", cmdArr[0]))
+					if cmdName == "BLPOP" {
+						// Authentic Control Plane queue item produced by QueueClient.enqueue:
+						// {"id": "<job_id>", "queue": "node:<id>:operations", "payload": {<envelope>}}
+						// where envelope contains "payload_json" as a serialized string containing external_port: 30001
+						innerPayloadJSON, _ := json.Marshal(map[string]interface{}{
+							"postgres_id":   "01a114c4-b0df-7ef2-a680-8fef961e8daa",
+							"resource_id":   "01a114c4-b0df-7ef2-a680-8fef961e8daa",
+							"external_port": 30001,
+							"port":          30001,
+							"node_id":       "0191c001-0000-7000-8000-000000000001",
+						})
+						itemObj := map[string]interface{}{
+							"id":    "job-enable-ext-30001",
+							"queue": "queue:node:0191c001-0000-7000-8000-000000000001:operations",
+							"payload": map[string]interface{}{
+								"operation_id":   "01a1187b-f08d-7fc1-a8fa-4abf88ce688d",
+								"operation_type": "enable_external_access",
+								"resource_id":    "01a114c4-b0df-7ef2-a680-8fef961e8daa",
+								"project_id":     "proj-001",
+								"environment_id": "env-001",
+								"payload_json":   string(innerPayloadJSON),
+							},
+						}
+						itemBytes, _ := json.Marshal(itemObj)
+						itemStr := string(itemBytes)
+						keyName := "queue:node:0191c001-0000-7000-8000-000000000001:operations"
+						resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(keyName), keyName, len(itemStr), itemStr)
+						writer.WriteString(resp)
+						writer.Flush()
+					} else if cmdName == "SETEX" {
+						writer.WriteString("+OK\r\n")
+						writer.Flush()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	registry := operations.NewRegistry()
+	registry.Register("enable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		receivedEnvelopeChan <- op
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := operations.NewDispatcher(registry, nil, nil, logger)
+	consumer := NewValkeyConsumer(serverAddr, "0191c001-0000-7000-8000-000000000001", dispatcher, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = consumer.Start(ctx)
+	}()
+
+	select {
+	case env := <-receivedEnvelopeChan:
+		if env.OperationId != "01a1187b-f08d-7fc1-a8fa-4abf88ce688d" {
+			t.Errorf("expected OperationId '01a1187b-f08d-7fc1-a8fa-4abf88ce688d', got '%s'", env.OperationId)
+		}
+		if env.OperationType != "enable_external_access" {
+			t.Errorf("expected OperationType 'enable_external_access', got '%s'", env.OperationType)
+		}
+
+		var payloadMap map[string]interface{}
+		if err := json.Unmarshal([]byte(env.PayloadJson), &payloadMap); err != nil {
+			t.Fatalf("failed to unmarshal payload JSON: %v", err)
+		}
+
+		// Verify external_port is present and exactly 30001 (never 0)
+		extPort, ok := payloadMap["external_port"]
+		if !ok {
+			t.Fatalf("expected payload_json to contain 'external_port', keys found: %v", payloadMap)
+		}
+		if int(extPort.(float64)) != 30001 {
+			t.Errorf("expected external_port 30001, got %v", extPort)
+		}
+
+		port, ok := payloadMap["port"]
+		if !ok {
+			t.Fatalf("expected payload_json to contain 'port', keys found: %v", payloadMap)
+		}
+		if int(port.(float64)) != 30001 {
+			t.Errorf("expected port 30001, got %v", port)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for real queue envelope test")
+	}
+}
+
+
