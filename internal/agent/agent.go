@@ -578,6 +578,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 
+		// If external access is enabled upfront, pass extPort as hostPort to publish <extPort>:5432 directly on container.
+		if extAccessEnabled && hostPort == "" && extPort > 0 {
+			hostPort = strconv.Itoa(extPort)
+		}
+
 		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
 		if err != nil {
 			return &pb.OperationResponse{
@@ -599,42 +604,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			"node_id":          cfg.NodeID,
 		}
 
-		// Configure HAProxy external access gateway ONLY when external access is enabled.
-		// If external access is disabled: DO NOT call HAProxy, DO NOT generate snippet, DO NOT require external_port.
 		if extAccessEnabled {
-			containerIP := "127.0.0.1"
-			containerNames := []string{
-				fmt.Sprintf("pc-pg-%s", resID),
-				provRes.ContainerID,
-				resID,
-			}
-			for _, cName := range containerNames {
-				if cName == "" {
-					continue
-				}
-				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
-					if insp.IPAddress != "" {
-						containerIP = insp.IPAddress
-					}
-					break
-				}
-			}
-
-			routeCfg := &haproxy.TCPRouteConfig{
-				ID:          resID,
-				Port:        extPort,
-				ContainerIP: containerIP,
-				TargetPort:  5432,
-			}
-			if err := haproxyMgr.ConfigureTCPRoute(ctx, routeCfg); err != nil {
-				return &pb.OperationResponse{
-					OperationId:     op.OperationId,
-					Status:          "FAILED",
-					ErrorCode:       "HAPROXY_CONFIG_FAILED",
-					Message:         err.Error(),
-					CompletedAtUnix: time.Now().Unix(),
-				}, err
-			}
 			resData["external_port"] = extPort
 			resData["external_access"] = true
 		}
@@ -1526,6 +1496,56 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 
 	// 20. enable_external_access
 	registry.Register("enable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		payloadMap := parsePayloadMap(op.PayloadJson)
+		resID := op.ResourceId
+		if resID == "" {
+			resID = extractResourceID(op, "postgres_id")
+		}
+
+		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
+		if isPostgres {
+			extPort := extractExternalPort(payloadMap)
+			if extPort <= 0 || extPort > 65535 {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "INVALID_EXTERNAL_PORT",
+					Message:         fmt.Sprintf("invalid external port %d (must be between 1 and 65535)", extPort),
+					CompletedAtUnix: time.Now().Unix(),
+				}, fmt.Errorf("invalid external port %d", extPort)
+			}
+
+			projectID := op.ProjectId
+			if projectID == "" {
+				if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
+					projectID = pid
+				}
+			}
+			environmentID := op.EnvironmentId
+			if environmentID == "" {
+				if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
+					environmentID = eid
+				}
+			}
+
+			if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, strconv.Itoa(extPort)); err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "ENABLE_EXTERNAL_ACCESS_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "SUCCEEDED",
+				Message:         fmt.Sprintf("External access enabled for %s on port %d", resID, extPort),
+				CompletedAtUnix: time.Now().Unix(),
+			}, nil
+		}
+
 		var payload haproxy.TCPRouteConfig
 		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
 			return &pb.OperationResponse{
@@ -1541,17 +1561,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			payload.ID = op.ResourceId
 		}
 		if payload.TargetPort <= 0 {
-			// Check if resource is postgres or valkey from resource_type / ID
-			if strings.Contains(strings.ToLower(op.OperationType), "valkey") || strings.Contains(strings.ToLower(op.ResourceId), "vk") {
-				payload.TargetPort = 6379
-			} else {
-				payload.TargetPort = 5432
-			}
+			payload.TargetPort = 6379
 		}
 		if payload.ContainerIP == "" {
 			// Resolve container IP from container inspection if running
 			containerNames := []string{
-				fmt.Sprintf("pc-pg-%s", payload.ID),
 				fmt.Sprintf("pc-vk-%s", payload.ID),
 				payload.ID,
 			}
@@ -1590,6 +1604,44 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 
 	// 21. disable_external_access
 	registry.Register("disable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := op.ResourceId
+		if resID == "" {
+			resID = extractResourceID(op, "postgres_id")
+		}
+		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
+		if isPostgres {
+			payloadMap := parsePayloadMap(op.PayloadJson)
+			projectID := op.ProjectId
+			if projectID == "" {
+				if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
+					projectID = pid
+				}
+			}
+			environmentID := op.EnvironmentId
+			if environmentID == "" {
+				if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
+					environmentID = eid
+				}
+			}
+
+			if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, ""); err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "DISABLE_EXTERNAL_ACCESS_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "SUCCEEDED",
+				Message:         fmt.Sprintf("External access disabled for %s", resID),
+				CompletedAtUnix: time.Now().Unix(),
+			}, nil
+		}
+
 		if err := haproxyMgr.RemoveTCPRoute(ctx, op.ResourceId); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1610,6 +1662,45 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 
 	// 22. reconcile_external_access
 	registry.Register("reconcile_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := op.ResourceId
+		if resID == "" {
+			resID = extractResourceID(op, "postgres_id")
+		}
+		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") && !strings.Contains(strings.ToLower(resID), "vk")
+		if isPostgres {
+			payloadMap := parsePayloadMap(op.PayloadJson)
+			extPort := extractExternalPort(payloadMap)
+			if extPort > 0 {
+				projectID := op.ProjectId
+				if projectID == "" {
+					if pid, ok := payloadMap["project_id"].(string); ok && pid != "" {
+						projectID = pid
+					}
+				}
+				environmentID := op.EnvironmentId
+				if environmentID == "" {
+					if eid, ok := payloadMap["environment_id"].(string); ok && eid != "" {
+						environmentID = eid
+					}
+				}
+				if err := pgProv.SetHostPort(ctx, projectID, environmentID, resID, strconv.Itoa(extPort)); err != nil {
+					return &pb.OperationResponse{
+						OperationId:     op.OperationId,
+						Status:          "FAILED",
+						ErrorCode:       "RECONCILE_EXTERNAL_ACCESS_FAILED",
+						Message:         err.Error(),
+						CompletedAtUnix: time.Now().Unix(),
+					}, err
+				}
+			}
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "SUCCEEDED",
+				Message:         fmt.Sprintf("External access reconciled for %s", resID),
+				CompletedAtUnix: time.Now().Unix(),
+			}, nil
+		}
+
 		var payload haproxy.TCPRouteConfig
 		if err := json.Unmarshal([]byte(op.PayloadJson), &payload); err != nil {
 			return &pb.OperationResponse{
@@ -1625,11 +1716,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			payload.ID = op.ResourceId
 		}
 		if payload.TargetPort <= 0 {
-			if strings.Contains(strings.ToLower(op.OperationType), "valkey") || strings.Contains(strings.ToLower(op.ResourceId), "vk") {
-				payload.TargetPort = 6379
-			} else {
-				payload.TargetPort = 5432
-			}
+			payload.TargetPort = 6379
 		}
 		if payload.ContainerIP == "" {
 			payload.ContainerIP = "127.0.0.1"

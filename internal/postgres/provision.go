@@ -248,6 +248,118 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 	return result, nil
 }
 
+// SetHostPort reconfigures the PostgreSQL container with a new published host port (or removes port publishing if hostPort is empty).
+// It stops and removes the existing container while preserving the underlying persistent data volume,
+// recreates the container with the updated port bindings, and reattaches it to the managed network.
+func (p *Provisioner) SetHostPort(ctx context.Context, projectID, environmentID, resourceID string, hostPort string) error {
+	if resourceID == "" {
+		return fmt.Errorf("resource_id cannot be empty")
+	}
+	if projectID == "" {
+		projectID = "default"
+	}
+
+	containerName := fmt.Sprintf("pc-pg-%s", resourceID)
+	volumePath := filepath.Join(p.baseResDir, "postgres", resourceID)
+
+	image := "postgres:16-alpine"
+	var creds *Credentials
+	if p.vaultClient != nil {
+		if c, err := resolvePostgresCredentials(ctx, p.vaultClient, projectID, resourceID); err == nil && c != nil {
+			creds = c
+		}
+	}
+	if creds == nil {
+		// Fallback to derive or read existing container env if possible
+		if p.rt != nil {
+			if insp, err := p.rt.InspectContainer(ctx, containerName); err == nil && insp != nil && insp.Image != "" {
+				image = insp.Image
+			}
+		}
+		// If credentials still missing, generate default based on resource ID
+		sanitizedID := stringsFilterAlpha(resourceID)
+		if len(sanitizedID) > 8 {
+			sanitizedID = sanitizedID[:8]
+		}
+		creds = &Credentials{
+			Username: fmt.Sprintf("pc_user_%s", sanitizedID),
+			Database: fmt.Sprintf("pc_db_%s", sanitizedID),
+			Port:     5432,
+		}
+	}
+
+	cfg := &runtime.ContainerConfig{
+		Name:  containerName,
+		Image: image,
+		Env: map[string]string{
+			"POSTGRES_USER":     creds.Username,
+			"POSTGRES_PASSWORD": creds.Password,
+			"POSTGRES_DB":       creds.Database,
+			"PGDATA":            "/var/lib/postgresql/data/pgdata",
+		},
+		Binds: []string{
+			fmt.Sprintf("%s:/var/lib/postgresql/data:rw", volumePath),
+		},
+		HealthCheckCmd: []string{
+			"CMD-SHELL",
+			fmt.Sprintf("pg_isready -U %s -d %s", creds.Username, creds.Database),
+		},
+		HealthInterval: 3 * time.Second,
+		HealthTimeout:  2 * time.Second,
+		HealthRetries:  5,
+		Labels: map[string]string{
+			"primecloud.resource_id": resourceID,
+			"primecloud.managed":     "true",
+		},
+		WorkloadType: runtime.WorkloadTypeManagedPostgres,
+	}
+
+	if hostPort != "" {
+		cfg.Ports = map[string]string{
+			"5432": hostPort,
+		}
+	}
+
+	limits := runtime.DefaultResourceLimits()
+	profile := runtime.DefaultHardenedProfile()
+	profile.User = "999:999"
+
+	if p.rt != nil {
+		timeout := 5
+		_ = p.rt.StopContainer(ctx, containerName, &timeout)
+		_ = p.rt.RemoveContainer(ctx, containerName, true)
+
+		containerID, err := p.rt.CreateContainer(ctx, cfg, limits, profile)
+		if err != nil {
+			return fmt.Errorf("failed to recreate postgres container: %w", err)
+		}
+
+		if err := p.rt.StartContainer(ctx, containerID); err != nil {
+			_ = p.rt.RemoveContainer(ctx, containerID, true)
+			return fmt.Errorf("failed to start postgres container: %w", err)
+		}
+
+		if err := applications.WaitForContainerReady(ctx, p.rt, containerID, 30*time.Second); err != nil {
+			return fmt.Errorf("postgres container failed health check: %w", err)
+		}
+
+		if p.netMgr != nil && environmentID != "" {
+			aliases := network.FormatPostgresAliases(resourceID)
+			if err := p.netMgr.AttachContainerToEnvironmentNetwork(ctx, environmentID, containerID, aliases); err != nil {
+				p.logger.Warn("postgres_network_attach_failed",
+					"resource_id", resourceID,
+					"environment_id", environmentID,
+					"container_id", containerID,
+					"error", err,
+				)
+			}
+		}
+	}
+
+	p.logger.Info("postgres_host_port_updated", "resource_id", resourceID, "host_port", hostPort)
+	return nil
+}
+
 func stringsFilterAlpha(s string) string {
 	var out []rune
 	for _, r := range s {

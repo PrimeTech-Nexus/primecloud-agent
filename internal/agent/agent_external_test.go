@@ -30,17 +30,17 @@ func TestAgentExternalGatewayIntegration(t *testing.T) {
 	}
 
 	payload := haproxy.TCPRouteConfig{
-		ID:          "test-db",
+		ID:          "test-vk",
 		Port:        30005,
 		ContainerIP: "10.0.0.99",
-		TargetPort:  5432,
+		TargetPort:  6379,
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	op := &pb.OperationEnvelope{
 		OperationId:   "op-1",
 		OperationType: "enable_external_access",
-		ResourceId:    "test-db",
+		ResourceId:    "test-vk",
 		PayloadJson:   string(payloadBytes),
 	}
 
@@ -53,7 +53,7 @@ func TestAgentExternalGatewayIntegration(t *testing.T) {
 	}
 
 	// Verify HAProxy configuration file was created
-	cfgFile := filepath.Join(tempConfDir, "tcp_test-db.cfg")
+	cfgFile := filepath.Join(tempConfDir, "tcp_test-vk.cfg")
 	data, err := os.ReadFile(cfgFile)
 	if err != nil {
 		t.Fatalf("expected HAProxy cfg file to exist: %v", err)
@@ -67,7 +67,7 @@ func TestAgentExternalGatewayIntegration(t *testing.T) {
 	opDisable := &pb.OperationEnvelope{
 		OperationId:   "op-2",
 		OperationType: "disable_external_access",
-		ResourceId:    "test-db",
+		ResourceId:    "test-vk",
 	}
 	res2, err := agent.dispatcher.Dispatch(context.Background(), opDisable)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestAgentExternalGatewayIntegration(t *testing.T) {
 	opReconcile := &pb.OperationEnvelope{
 		OperationId:   "op-3",
 		OperationType: "reconcile_external_access",
-		ResourceId:    "test-db",
+		ResourceId:    "test-vk",
 		PayloadJson:   string(payloadBytes),
 	}
 	res3, err := agent.dispatcher.Dispatch(context.Background(), opReconcile)
@@ -101,52 +101,56 @@ func TestAgentExternalGatewayIntegration(t *testing.T) {
 	}
 }
 
-type mockAgentRuntime struct{}
+type recordingMockRuntime struct {
+	createdConfigs []*runtime.ContainerConfig
+	removedIDs     []string
+	stoppedIDs     []string
+}
 
-func (m *mockAgentRuntime) PullImage(ctx context.Context, ref string) error { return nil }
-func (m *mockAgentRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
+func (m *recordingMockRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *recordingMockRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
 	return nil
 }
-func (m *mockAgentRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
-	return "mock-cid-pg", nil
+func (m *recordingMockRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
+	m.createdConfigs = append(m.createdConfigs, cfg)
+	return "mock-cid-" + cfg.Name, nil
 }
-func (m *mockAgentRuntime) StartContainer(ctx context.Context, id string) error { return nil }
-func (m *mockAgentRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+func (m *recordingMockRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *recordingMockRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+	m.stoppedIDs = append(m.stoppedIDs, id)
 	return nil
 }
-func (m *mockAgentRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+func (m *recordingMockRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	m.removedIDs = append(m.removedIDs, id)
 	return nil
 }
-func (m *mockAgentRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+func (m *recordingMockRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
 	return &runtime.ContainerInspect{ID: id, Running: true, Health: "healthy", IPAddress: "10.0.0.99"}, nil
 }
-func (m *mockAgentRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
+func (m *recordingMockRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
 	return nil, nil
 }
-func (m *mockAgentRuntime) GetContainerLogs(ctx context.Context, id string) (io.ReadCloser, error) {
+func (m *recordingMockRuntime) GetContainerLogs(ctx context.Context, id string) (io.ReadCloser, error) {
 	return nil, nil
 }
-func (m *mockAgentRuntime) GetContainerStats(ctx context.Context, id string) (io.ReadCloser, error) {
+func (m *recordingMockRuntime) GetContainerStats(ctx context.Context, id string) (io.ReadCloser, error) {
 	return nil, nil
 }
-func (m *mockAgentRuntime) ExecContainer(ctx context.Context, id string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+func (m *recordingMockRuntime) ExecContainer(ctx context.Context, id string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
 	return nil, nil, 0, nil
 }
-func (m *mockAgentRuntime) Ping(ctx context.Context) error { return nil }
-func (m *mockAgentRuntime) Close() error                   { return nil }
+func (m *recordingMockRuntime) Ping(ctx context.Context) error { return nil }
+func (m *recordingMockRuntime) Close() error                   { return nil }
 
-func TestPostgresProvisioning_PrivateDoesNotCallHAProxy(t *testing.T) {
-	tempConfDir, err := os.MkdirTemp("", "agent_haproxy_priv_test")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempConfDir)
+func TestPostgresProvisioning_PrivateDoesNotPublishPort(t *testing.T) {
+	tempConfDir := t.TempDir()
 	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
 
+	mockRT := &recordingMockRuntime{}
 	cfg := DefaultConfig()
 	cfg.VaultAddr = ""
 	cfg.ResourceDir = t.TempDir()
-	agent, err := NewAgentWithRuntime(cfg, &mockAgentRuntime{}, nil)
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
 	if err != nil {
 		t.Fatalf("failed to create agent: %v", err)
 	}
@@ -173,6 +177,14 @@ func TestPostgresProvisioning_PrivateDoesNotCallHAProxy(t *testing.T) {
 		t.Fatalf("expected SUCCEEDED, got %s (msg: %s, code: %s)", res.Status, res.Message, res.ErrorCode)
 	}
 
+	if len(mockRT.createdConfigs) == 0 {
+		t.Fatalf("expected container to be created")
+	}
+	lastCfg := mockRT.createdConfigs[len(mockRT.createdConfigs)-1]
+	if len(lastCfg.Ports) != 0 {
+		t.Errorf("expected no published host ports for private postgres, got: %v", lastCfg.Ports)
+	}
+
 	// Verify HAProxy configuration file was NOT created
 	cfgFile := filepath.Join(tempConfDir, "tcp_pg-private-1.cfg")
 	if _, err := os.Stat(cfgFile); !os.IsNotExist(err) {
@@ -180,18 +192,15 @@ func TestPostgresProvisioning_PrivateDoesNotCallHAProxy(t *testing.T) {
 	}
 }
 
-func TestPostgresProvisioning_EnabledRequiresValidPort(t *testing.T) {
-	tempConfDir, err := os.MkdirTemp("", "agent_haproxy_enabled_test")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempConfDir)
+func TestPostgresProvisioning_ExternalAccessPublishesDirectPort(t *testing.T) {
+	tempConfDir := t.TempDir()
 	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
 
+	mockRT := &recordingMockRuntime{}
 	cfg := DefaultConfig()
 	cfg.VaultAddr = ""
 	cfg.ResourceDir = t.TempDir()
-	agent, err := NewAgentWithRuntime(cfg, &mockAgentRuntime{}, nil)
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
 	if err != nil {
 		t.Fatalf("failed to create agent: %v", err)
 	}
@@ -218,29 +227,109 @@ func TestPostgresProvisioning_EnabledRequiresValidPort(t *testing.T) {
 		t.Fatalf("expected SUCCEEDED, got %s (msg: %s, code: %s)", res.Status, res.Message, res.ErrorCode)
 	}
 
-	// Verify HAProxy configuration file WAS created with valid port
-	cfgFile := filepath.Join(tempConfDir, "tcp_pg-ext-valid-1.cfg")
-	data, err := os.ReadFile(cfgFile)
-	if err != nil {
-		t.Fatalf("expected HAProxy cfg file to exist: %v", err)
+	if len(mockRT.createdConfigs) == 0 {
+		t.Fatalf("expected container to be created")
 	}
-	content := string(data)
-	if !strings.Contains(content, "bind *:30010") {
-		t.Fatalf("expected config to bind to 30010, got:\n%s", content)
+	lastCfg := mockRT.createdConfigs[len(mockRT.createdConfigs)-1]
+	if lastCfg.Ports["5432"] != "30010" {
+		t.Errorf("expected direct container port 5432 published to host port 30010, got: %v", lastCfg.Ports)
+	}
+
+	// Verify HAProxy is bypassed for postgres
+	cfgFile := filepath.Join(tempConfDir, "tcp_pg-ext-valid-1.cfg")
+	if _, err := os.Stat(cfgFile); !os.IsNotExist(err) {
+		t.Fatalf("expected HAProxy to be bypassed for direct postgres port publishing")
+	}
+}
+
+func TestPostgresExternalAccess_EnableAndDisableDirectPort(t *testing.T) {
+	tempConfDir := t.TempDir()
+	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
+
+	mockRT := &recordingMockRuntime{}
+	cfg := DefaultConfig()
+	cfg.VaultAddr = ""
+	cfg.ResourceDir = t.TempDir()
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
+	if err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	// 1. Initially provision Private Only
+	provPayload := map[string]interface{}{
+		"postgres_id":     "pg-lifecycle-1",
+		"external_access": false,
+		"external_port":   30005, // allocated port exists, but external access is disabled
+	}
+	provBytes, _ := json.Marshal(provPayload)
+	opProv := &pb.OperationEnvelope{
+		OperationId:   "op-p-1",
+		OperationType: "provision_postgres",
+		ResourceId:    "pg-lifecycle-1",
+		PayloadJson:   string(provBytes),
+	}
+	resProv, err := agent.dispatcher.Dispatch(context.Background(), opProv)
+	if err != nil || resProv.Status != "SUCCEEDED" {
+		t.Fatalf("provision failed: %v, res: %+v", err, resProv)
+	}
+
+	initialCfg := mockRT.createdConfigs[len(mockRT.createdConfigs)-1]
+	if len(initialCfg.Ports) != 0 {
+		t.Errorf("expected no published port initially, got: %v", initialCfg.Ports)
+	}
+
+	// 2. Explicitly Enable External Access
+	enablePayload := map[string]interface{}{
+		"postgres_id":   "pg-lifecycle-1",
+		"external_port": 30005,
+	}
+	enableBytes, _ := json.Marshal(enablePayload)
+	opEnable := &pb.OperationEnvelope{
+		OperationId:   "op-enable-1",
+		OperationType: "enable_external_access",
+		ResourceId:    "pg-lifecycle-1",
+		PayloadJson:   string(enableBytes),
+	}
+	resEnable, err := agent.dispatcher.Dispatch(context.Background(), opEnable)
+	if err != nil || resEnable.Status != "SUCCEEDED" {
+		t.Fatalf("enable_external_access failed: %v, res: %+v", err, resEnable)
+	}
+
+	enabledCfg := mockRT.createdConfigs[len(mockRT.createdConfigs)-1]
+	if enabledCfg.Ports["5432"] != "30005" {
+		t.Errorf("expected host port 30005 on container recreation, got: %v", enabledCfg.Ports)
+	}
+
+	// 3. Explicitly Disable External Access
+	disablePayload := map[string]interface{}{
+		"postgres_id": "pg-lifecycle-1",
+	}
+	disableBytes, _ := json.Marshal(disablePayload)
+	opDisable := &pb.OperationEnvelope{
+		OperationId:   "op-disable-1",
+		OperationType: "disable_external_access",
+		ResourceId:    "pg-lifecycle-1",
+		PayloadJson:   string(disableBytes),
+	}
+	resDisable, err := agent.dispatcher.Dispatch(context.Background(), opDisable)
+	if err != nil || resDisable.Status != "SUCCEEDED" {
+		t.Fatalf("disable_external_access failed: %v, res: %+v", err, resDisable)
+	}
+
+	disabledCfg := mockRT.createdConfigs[len(mockRT.createdConfigs)-1]
+	if len(disabledCfg.Ports) != 0 {
+		t.Errorf("expected no host ports after disabling external access, got: %v", disabledCfg.Ports)
 	}
 }
 
 func TestPostgresProvisioning_Port0RejectedWhenExternalAccessEnabled(t *testing.T) {
-	tempConfDir, err := os.MkdirTemp("", "agent_haproxy_zero_test")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempConfDir)
+	tempConfDir := t.TempDir()
 	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
 
+	mockRT := &recordingMockRuntime{}
 	cfg := DefaultConfig()
 	cfg.ResourceDir = t.TempDir()
-	agent, err := NewAgentWithRuntime(cfg, &mockAgentRuntime{}, nil)
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
 	if err != nil {
 		t.Fatalf("failed to create agent: %v", err)
 	}
@@ -263,16 +352,7 @@ func TestPostgresProvisioning_Port0RejectedWhenExternalAccessEnabled(t *testing.
 	if err == nil && res.Status == "SUCCEEDED" {
 		t.Fatalf("expected failure for external access with port 0, but got SUCCEEDED")
 	}
-	if res.ErrorCode != "HAPROXY_CONFIG_FAILED" {
-		t.Errorf("expected ErrorCode HAPROXY_CONFIG_FAILED, got %s", res.ErrorCode)
-	}
 	if !strings.Contains(res.Message, "invalid external port 0") {
 		t.Errorf("expected message mentioning invalid external port 0, got: %s", res.Message)
-	}
-
-	// Verify HAProxy configuration file was NOT created
-	cfgFile := filepath.Join(tempConfDir, "tcp_pg-ext-zero-1.cfg")
-	if _, err := os.Stat(cfgFile); !os.IsNotExist(err) {
-		t.Fatalf("expected HAProxy cfg file to NOT exist when port 0 is rejected")
 	}
 }

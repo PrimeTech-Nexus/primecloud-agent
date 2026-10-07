@@ -53,6 +53,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=ref,event=tag
+            type=semver,pattern={{raw}}
             type=sha,format=long,prefix=
             type=sha,format=short,prefix=sha-
             type=raw,value=v1.2.0-md-{{sha}}
