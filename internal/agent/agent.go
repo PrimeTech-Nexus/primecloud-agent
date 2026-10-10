@@ -1780,6 +1780,10 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}, nil
 	}, nil)
 
+	// Register canonical PostgreSQL migration operations (migration-contract-v1)
+	migMgr := postgres.NewMigrationManager(rt, vaultClient, cfg.ResourceDir, a.logger)
+	operations.RegisterMigrationOperations(registry, migMgr, a.logger)
+
 	locks := operations.NewLockManager()
 	idempotency := operations.NewIdempotencyTracker(24 * time.Hour)
 	a.dispatcher = operations.NewDispatcher(registry, locks, idempotency, a.logger)
