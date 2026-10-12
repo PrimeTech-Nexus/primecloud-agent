@@ -74,6 +74,18 @@ func TestGenerateSnippet(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "wildcard fallback returns 404",
+			route: &RouteConfig{
+				Domain: "*.primecloud.cloud",
+				TLS:    true,
+			},
+			wantContain: []string{
+				"*.primecloud.cloud {",
+				"respond \"Application Not Found\" 404",
+			},
+			wantErr: false,
+		},
+		{
 			name:    "nil config",
 			route:   nil,
 			wantErr: true,
@@ -135,11 +147,18 @@ func TestValidateConfig(t *testing.T) {
 		t.Errorf("ValidateConfig(mismatched) expected error, got nil")
 	}
 
-	noProxy := `app.example.com {
-    respond "hello"
+	validRespond := `app.example.com {
+    respond "Application Not Found" 404
 }`
-	if err := ValidateConfig(noProxy); err == nil {
-		t.Errorf("ValidateConfig(noProxy) expected error, got nil")
+	if err := ValidateConfig(validRespond); err != nil {
+		t.Errorf("ValidateConfig(validRespond) error = %v", err)
+	}
+
+	noRouting := `app.example.com {
+    header_up Host {host}
+}`
+	if err := ValidateConfig(noRouting); err == nil {
+		t.Errorf("ValidateConfig(noRouting) expected error, got nil")
 	}
 
 	empty := `   `

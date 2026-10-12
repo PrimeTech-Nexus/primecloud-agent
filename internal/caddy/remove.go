@@ -22,7 +22,11 @@ func (m *Manager) RemoveRoute(ctx context.Context, domain string) error {
 		return fmt.Errorf("domain cannot be empty")
 	}
 
-	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", domain))
+	fileName := domain
+	if strings.HasPrefix(fileName, "*.") {
+		fileName = "wildcard_" + strings.TrimPrefix(fileName, "*.")
+	}
+	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", fileName))
 	cleanConfigDir := filepath.Clean(m.configDir)
 	cleanTargetFile := filepath.Clean(targetFile)
 	if !strings.HasPrefix(cleanTargetFile, cleanConfigDir) {

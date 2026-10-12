@@ -30,9 +30,9 @@ func ValidateConfig(content string) error {
 		return fmt.Errorf("unclosed brace '{' in caddy config (unclosed count: %d)", openBraces)
 	}
 
-	// 2. Check for required reverse_proxy directive
-	if !strings.Contains(trimmed, "reverse_proxy") {
-		return fmt.Errorf("caddy route config missing reverse_proxy directive")
+	// 2. Check for required routing directive (reverse_proxy or respond)
+	if !strings.Contains(trimmed, "reverse_proxy") && !strings.Contains(trimmed, "respond") {
+		return fmt.Errorf("caddy route config missing reverse_proxy or respond directive")
 	}
 
 	// 3. Optional: if caddy CLI binary exists on PATH, run formal syntax validation

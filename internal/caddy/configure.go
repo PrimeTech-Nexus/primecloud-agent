@@ -72,12 +72,14 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 	domain = strings.TrimPrefix(domain, "http://")
 	domain = strings.TrimPrefix(domain, "https://")
 	domain = strings.TrimSuffix(domain, "/")
-	if !validDomainRegex.MatchString(domain) && domain != "localhost" && !strings.HasSuffix(domain, ".local") {
+	isWildcard := strings.HasPrefix(domain, "*.")
+	cleanCheck := strings.TrimPrefix(domain, "*.")
+	if !validDomainRegex.MatchString(domain) && !validDomainRegex.MatchString(cleanCheck) && domain != "localhost" && !strings.HasSuffix(domain, ".local") {
 		return "", fmt.Errorf("invalid domain format: %q", route.Domain)
 	}
 
 	upstream := strings.TrimSpace(route.Upstream)
-	if upstream == "" {
+	if !isWildcard && upstream == "" {
 		return "", fmt.Errorf("upstream cannot be empty")
 	}
 	upstream = strings.TrimPrefix(upstream, "http://")
@@ -99,21 +101,26 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 		sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
 	}
 
-	sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
-	sb.WriteString("        header_up Host {host}\n")
-	sb.WriteString("        header_up X-Real-IP {remote_host}\n")
+	if isWildcard {
+		// Wildcard fallback: unconfigured customer domain does NOT proxy to dead port; returns deterministic 404
+		sb.WriteString("    respond \"Application Not Found\" 404\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
+		sb.WriteString("        header_up Host {host}\n")
+		sb.WriteString("        header_up X-Real-IP {remote_host}\n")
 
-	for k, v := range route.Headers {
-		sb.WriteString(fmt.Sprintf("        header_up %s %q\n", k, v))
+		for k, v := range route.Headers {
+			sb.WriteString(fmt.Sprintf("        header_up %s %q\n", k, v))
+		}
+
+		if route.HealthCheckPath != "" {
+			sb.WriteString(fmt.Sprintf("        health_path %s\n", route.HealthCheckPath))
+			sb.WriteString("        health_interval 5s\n")
+			sb.WriteString("        health_timeout 2s\n")
+		}
+
+		sb.WriteString("    }\n")
 	}
-
-	if route.HealthCheckPath != "" {
-		sb.WriteString(fmt.Sprintf("        health_path %s\n", route.HealthCheckPath))
-		sb.WriteString("        health_interval 5s\n")
-		sb.WriteString("        health_timeout 2s\n")
-	}
-
-	sb.WriteString("    }\n")
 	sb.WriteString("}\n")
 
 	return sb.String(), nil
@@ -134,7 +141,8 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 	if cleanDomain == "" {
 		return fmt.Errorf("domain cannot be empty")
 	}
-	if !validDomainRegex.MatchString(cleanDomain) && cleanDomain != "localhost" && !strings.HasSuffix(cleanDomain, ".local") {
+	cleanCheck := strings.TrimPrefix(cleanDomain, "*.")
+	if !validDomainRegex.MatchString(cleanDomain) && !validDomainRegex.MatchString(cleanCheck) && cleanDomain != "localhost" && !strings.HasSuffix(cleanDomain, ".local") {
 		return fmt.Errorf("invalid domain format: %q", route.Domain)
 	}
 
@@ -151,7 +159,11 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 		return fmt.Errorf("invalid caddy snippet: %w", err)
 	}
 
-	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", cleanDomain))
+	fileName := cleanDomain
+	if strings.HasPrefix(fileName, "*.") {
+		fileName = "wildcard_" + strings.TrimPrefix(fileName, "*.")
+	}
+	targetFile := filepath.Join(m.configDir, fmt.Sprintf("%s.caddy", fileName))
 	cleanConfigDir := filepath.Clean(m.configDir)
 	cleanTargetFile := filepath.Clean(targetFile)
 	if !strings.HasPrefix(cleanTargetFile, cleanConfigDir) {
