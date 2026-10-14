@@ -16,6 +16,7 @@ type Config struct {
 	ConfigFile          string        `json:"config_file"`
 	NodeID              string        `json:"node_id"`
 	AgentID             string        `json:"agent_id"`
+	AgentKey            string        `json:"-"` // Shared cluster agent secret (never serialized in JSON)
 	ControlPlaneURL     string        `json:"control_plane_url"`
 	QueueURL            string        `json:"queue_url"`
 	VaultAddr           string        `json:"vault_addr"`
@@ -27,6 +28,7 @@ type Config struct {
 	HeartbeatInterval   time.Duration `json:"heartbeat_interval"`
 	LogLevel            slog.Level    `json:"log_level"`
 	DockerHost          string        `json:"docker_host"`
+	ShellListenAddr     string        `json:"shell_listen_addr"` // e.g. ":50052" for incoming gRPC shell streaming
 	ReconcileInterval   time.Duration `json:"reconcile_interval"`
 	RotationCheckPeriod time.Duration `json:"rotation_check_period"`
 }
@@ -72,8 +74,18 @@ func LoadConfig() (*Config, error) {
 	if v := os.Getenv("PRIMECLOUD_AGENT_ID"); v != "" {
 		cfg.AgentID = v
 	}
+	if v := os.Getenv("PRIMECLOUD_AGENT_SHARED_KEY"); v != "" {
+		cfg.AgentKey = strings.TrimSpace(v)
+	} else if v := os.Getenv("PRIMECLOUD_AGENT_KEY"); v != "" {
+		cfg.AgentKey = strings.TrimSpace(v)
+	} else if keyBytes, err := os.ReadFile("/etc/primecloud/credentials/agent_shared_key"); err == nil {
+		cfg.AgentKey = strings.TrimSpace(string(keyBytes))
+	}
 	if v := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL"); v != "" {
 		cfg.ControlPlaneURL = v
+	}
+	if v := os.Getenv("PRIMECLOUD_AGENT_SHELL_LISTEN_ADDR"); v != "" {
+		cfg.ShellListenAddr = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("PRIMECLOUD_QUEUE_URL"); v != "" {
 		cfg.QueueURL = v

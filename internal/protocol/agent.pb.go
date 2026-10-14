@@ -21,6 +21,58 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ShellSignalType int32
+
+const (
+	ShellSignalType_SIGNAL_UNSPECIFIED ShellSignalType = 0
+	ShellSignalType_SIGINT             ShellSignalType = 1
+	ShellSignalType_SIGTERM            ShellSignalType = 2
+	ShellSignalType_SIGWINCH           ShellSignalType = 3
+)
+
+// Enum value maps for ShellSignalType.
+var (
+	ShellSignalType_name = map[int32]string{
+		0: "SIGNAL_UNSPECIFIED",
+		1: "SIGINT",
+		2: "SIGTERM",
+		3: "SIGWINCH",
+	}
+	ShellSignalType_value = map[string]int32{
+		"SIGNAL_UNSPECIFIED": 0,
+		"SIGINT":             1,
+		"SIGTERM":            2,
+		"SIGWINCH":           3,
+	}
+)
+
+func (x ShellSignalType) Enum() *ShellSignalType {
+	p := new(ShellSignalType)
+	*p = x
+	return p
+}
+
+func (x ShellSignalType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ShellSignalType) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_agent_proto_enumTypes[0].Descriptor()
+}
+
+func (ShellSignalType) Type() protoreflect.EnumType {
+	return &file_proto_agent_proto_enumTypes[0]
+}
+
+func (x ShellSignalType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ShellSignalType.Descriptor instead.
+func (ShellSignalType) EnumDescriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{0}
+}
+
 // RegisterRequest contains hardware, kernel, and daemon metadata from the compute node.
 type RegisterRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1224,6 +1276,618 @@ func (x *ReconcileResponse) GetRepairInstructions() []string {
 	return nil
 }
 
+type ShellClientMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*ShellClientMessage_Init
+	//	*ShellClientMessage_Stdin
+	//	*ShellClientMessage_Resize
+	//	*ShellClientMessage_Signal
+	Payload       isShellClientMessage_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellClientMessage) Reset() {
+	*x = ShellClientMessage{}
+	mi := &file_proto_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellClientMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellClientMessage) ProtoMessage() {}
+
+func (x *ShellClientMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellClientMessage.ProtoReflect.Descriptor instead.
+func (*ShellClientMessage) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ShellClientMessage) GetPayload() isShellClientMessage_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *ShellClientMessage) GetInit() *ShellInitRequest {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellClientMessage_Init); ok {
+			return x.Init
+		}
+	}
+	return nil
+}
+
+func (x *ShellClientMessage) GetStdin() []byte {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellClientMessage_Stdin); ok {
+			return x.Stdin
+		}
+	}
+	return nil
+}
+
+func (x *ShellClientMessage) GetResize() *ShellResize {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellClientMessage_Resize); ok {
+			return x.Resize
+		}
+	}
+	return nil
+}
+
+func (x *ShellClientMessage) GetSignal() *ShellSignal {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellClientMessage_Signal); ok {
+			return x.Signal
+		}
+	}
+	return nil
+}
+
+type isShellClientMessage_Payload interface {
+	isShellClientMessage_Payload()
+}
+
+type ShellClientMessage_Init struct {
+	Init *ShellInitRequest `protobuf:"bytes,1,opt,name=init,proto3,oneof"`
+}
+
+type ShellClientMessage_Stdin struct {
+	Stdin []byte `protobuf:"bytes,2,opt,name=stdin,proto3,oneof"`
+}
+
+type ShellClientMessage_Resize struct {
+	Resize *ShellResize `protobuf:"bytes,3,opt,name=resize,proto3,oneof"`
+}
+
+type ShellClientMessage_Signal struct {
+	Signal *ShellSignal `protobuf:"bytes,4,opt,name=signal,proto3,oneof"`
+}
+
+func (*ShellClientMessage_Init) isShellClientMessage_Payload() {}
+
+func (*ShellClientMessage_Stdin) isShellClientMessage_Payload() {}
+
+func (*ShellClientMessage_Resize) isShellClientMessage_Payload() {}
+
+func (*ShellClientMessage_Signal) isShellClientMessage_Payload() {}
+
+type ShellInitRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Ticket        string                 `protobuf:"bytes,2,opt,name=ticket,proto3" json:"ticket,omitempty"`
+	ResourceId    string                 `protobuf:"bytes,3,opt,name=resource_id,json=resourceId,proto3" json:"resource_id,omitempty"`
+	ResourceType  string                 `protobuf:"bytes,4,opt,name=resource_type,json=resourceType,proto3" json:"resource_type,omitempty"` // "postgres" | "valkey"
+	TenantId      string                 `protobuf:"bytes,5,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	Command       string                 `protobuf:"bytes,6,opt,name=command,proto3" json:"command,omitempty"` // Whitelisted: "psql" | "valkey-cli"
+	InitialRows   uint32                 `protobuf:"varint,7,opt,name=initial_rows,json=initialRows,proto3" json:"initial_rows,omitempty"`
+	InitialCols   uint32                 `protobuf:"varint,8,opt,name=initial_cols,json=initialCols,proto3" json:"initial_cols,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellInitRequest) Reset() {
+	*x = ShellInitRequest{}
+	mi := &file_proto_agent_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellInitRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellInitRequest) ProtoMessage() {}
+
+func (x *ShellInitRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellInitRequest.ProtoReflect.Descriptor instead.
+func (*ShellInitRequest) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ShellInitRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetTicket() string {
+	if x != nil {
+		return x.Ticket
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetResourceId() string {
+	if x != nil {
+		return x.ResourceId
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetResourceType() string {
+	if x != nil {
+		return x.ResourceType
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetCommand() string {
+	if x != nil {
+		return x.Command
+	}
+	return ""
+}
+
+func (x *ShellInitRequest) GetInitialRows() uint32 {
+	if x != nil {
+		return x.InitialRows
+	}
+	return 0
+}
+
+func (x *ShellInitRequest) GetInitialCols() uint32 {
+	if x != nil {
+		return x.InitialCols
+	}
+	return 0
+}
+
+type ShellResize struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Rows          uint32                 `protobuf:"varint,1,opt,name=rows,proto3" json:"rows,omitempty"`
+	Cols          uint32                 `protobuf:"varint,2,opt,name=cols,proto3" json:"cols,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellResize) Reset() {
+	*x = ShellResize{}
+	mi := &file_proto_agent_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellResize) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellResize) ProtoMessage() {}
+
+func (x *ShellResize) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellResize.ProtoReflect.Descriptor instead.
+func (*ShellResize) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ShellResize) GetRows() uint32 {
+	if x != nil {
+		return x.Rows
+	}
+	return 0
+}
+
+func (x *ShellResize) GetCols() uint32 {
+	if x != nil {
+		return x.Cols
+	}
+	return 0
+}
+
+type ShellSignal struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Signal        ShellSignalType        `protobuf:"varint,1,opt,name=signal,proto3,enum=primecloud.agent.v1.ShellSignalType" json:"signal,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellSignal) Reset() {
+	*x = ShellSignal{}
+	mi := &file_proto_agent_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellSignal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellSignal) ProtoMessage() {}
+
+func (x *ShellSignal) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellSignal.ProtoReflect.Descriptor instead.
+func (*ShellSignal) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ShellSignal) GetSignal() ShellSignalType {
+	if x != nil {
+		return x.Signal
+	}
+	return ShellSignalType_SIGNAL_UNSPECIFIED
+}
+
+type ShellServerMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*ShellServerMessage_InitAck
+	//	*ShellServerMessage_Stdout
+	//	*ShellServerMessage_Stderr
+	//	*ShellServerMessage_Exit
+	//	*ShellServerMessage_Error
+	Payload       isShellServerMessage_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellServerMessage) Reset() {
+	*x = ShellServerMessage{}
+	mi := &file_proto_agent_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellServerMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellServerMessage) ProtoMessage() {}
+
+func (x *ShellServerMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellServerMessage.ProtoReflect.Descriptor instead.
+func (*ShellServerMessage) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ShellServerMessage) GetPayload() isShellServerMessage_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *ShellServerMessage) GetInitAck() *ShellInitAck {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellServerMessage_InitAck); ok {
+			return x.InitAck
+		}
+	}
+	return nil
+}
+
+func (x *ShellServerMessage) GetStdout() []byte {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellServerMessage_Stdout); ok {
+			return x.Stdout
+		}
+	}
+	return nil
+}
+
+func (x *ShellServerMessage) GetStderr() []byte {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellServerMessage_Stderr); ok {
+			return x.Stderr
+		}
+	}
+	return nil
+}
+
+func (x *ShellServerMessage) GetExit() *ShellExit {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellServerMessage_Exit); ok {
+			return x.Exit
+		}
+	}
+	return nil
+}
+
+func (x *ShellServerMessage) GetError() *ShellError {
+	if x != nil {
+		if x, ok := x.Payload.(*ShellServerMessage_Error); ok {
+			return x.Error
+		}
+	}
+	return nil
+}
+
+type isShellServerMessage_Payload interface {
+	isShellServerMessage_Payload()
+}
+
+type ShellServerMessage_InitAck struct {
+	InitAck *ShellInitAck `protobuf:"bytes,1,opt,name=init_ack,json=initAck,proto3,oneof"`
+}
+
+type ShellServerMessage_Stdout struct {
+	Stdout []byte `protobuf:"bytes,2,opt,name=stdout,proto3,oneof"`
+}
+
+type ShellServerMessage_Stderr struct {
+	Stderr []byte `protobuf:"bytes,3,opt,name=stderr,proto3,oneof"`
+}
+
+type ShellServerMessage_Exit struct {
+	Exit *ShellExit `protobuf:"bytes,4,opt,name=exit,proto3,oneof"`
+}
+
+type ShellServerMessage_Error struct {
+	Error *ShellError `protobuf:"bytes,5,opt,name=error,proto3,oneof"`
+}
+
+func (*ShellServerMessage_InitAck) isShellServerMessage_Payload() {}
+
+func (*ShellServerMessage_Stdout) isShellServerMessage_Payload() {}
+
+func (*ShellServerMessage_Stderr) isShellServerMessage_Payload() {}
+
+func (*ShellServerMessage_Exit) isShellServerMessage_Payload() {}
+
+func (*ShellServerMessage_Error) isShellServerMessage_Payload() {}
+
+type ShellInitAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Engine        string                 `protobuf:"bytes,2,opt,name=engine,proto3" json:"engine,omitempty"`
+	Banner        string                 `protobuf:"bytes,3,opt,name=banner,proto3" json:"banner,omitempty"`
+	Success       bool                   `protobuf:"varint,4,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellInitAck) Reset() {
+	*x = ShellInitAck{}
+	mi := &file_proto_agent_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellInitAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellInitAck) ProtoMessage() {}
+
+func (x *ShellInitAck) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellInitAck.ProtoReflect.Descriptor instead.
+func (*ShellInitAck) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ShellInitAck) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ShellInitAck) GetEngine() string {
+	if x != nil {
+		return x.Engine
+	}
+	return ""
+}
+
+func (x *ShellInitAck) GetBanner() string {
+	if x != nil {
+		return x.Banner
+	}
+	return ""
+}
+
+func (x *ShellInitAck) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+type ShellExit struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ExitCode      int32                  `protobuf:"varint,1,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellExit) Reset() {
+	*x = ShellExit{}
+	mi := &file_proto_agent_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellExit) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellExit) ProtoMessage() {}
+
+func (x *ShellExit) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellExit.ProtoReflect.Descriptor instead.
+func (*ShellExit) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ShellExit) GetExitCode() int32 {
+	if x != nil {
+		return x.ExitCode
+	}
+	return 0
+}
+
+func (x *ShellExit) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type ShellError struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShellError) Reset() {
+	*x = ShellError{}
+	mi := &file_proto_agent_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShellError) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShellError) ProtoMessage() {}
+
+func (x *ShellError) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShellError.ProtoReflect.Descriptor instead.
+func (*ShellError) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ShellError) GetCode() string {
+	if x != nil {
+		return x.Code
+	}
+	return ""
+}
+
+func (x *ShellError) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -1334,7 +1998,55 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x11ReconcileResponse\x12,\n" +
 	"\x12desired_state_json\x18\x01 \x01(\tR\x10desiredStateJson\x12\x1b\n" +
 	"\thas_drift\x18\x02 \x01(\bR\bhasDrift\x12/\n" +
-	"\x13repair_instructions\x18\x03 \x03(\tR\x12repairInstructions2\xf5\x05\n" +
+	"\x13repair_instructions\x18\x03 \x03(\tR\x12repairInstructions\"\xec\x01\n" +
+	"\x12ShellClientMessage\x12;\n" +
+	"\x04init\x18\x01 \x01(\v2%.primecloud.agent.v1.ShellInitRequestH\x00R\x04init\x12\x16\n" +
+	"\x05stdin\x18\x02 \x01(\fH\x00R\x05stdin\x12:\n" +
+	"\x06resize\x18\x03 \x01(\v2 .primecloud.agent.v1.ShellResizeH\x00R\x06resize\x12:\n" +
+	"\x06signal\x18\x04 \x01(\v2 .primecloud.agent.v1.ShellSignalH\x00R\x06signalB\t\n" +
+	"\apayload\"\x8c\x02\n" +
+	"\x10ShellInitRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x16\n" +
+	"\x06ticket\x18\x02 \x01(\tR\x06ticket\x12\x1f\n" +
+	"\vresource_id\x18\x03 \x01(\tR\n" +
+	"resourceId\x12#\n" +
+	"\rresource_type\x18\x04 \x01(\tR\fresourceType\x12\x1b\n" +
+	"\ttenant_id\x18\x05 \x01(\tR\btenantId\x12\x18\n" +
+	"\acommand\x18\x06 \x01(\tR\acommand\x12!\n" +
+	"\finitial_rows\x18\a \x01(\rR\vinitialRows\x12!\n" +
+	"\finitial_cols\x18\b \x01(\rR\vinitialCols\"5\n" +
+	"\vShellResize\x12\x12\n" +
+	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
+	"\x04cols\x18\x02 \x01(\rR\x04cols\"K\n" +
+	"\vShellSignal\x12<\n" +
+	"\x06signal\x18\x01 \x01(\x0e2$.primecloud.agent.v1.ShellSignalTypeR\x06signal\"\x82\x02\n" +
+	"\x12ShellServerMessage\x12>\n" +
+	"\binit_ack\x18\x01 \x01(\v2!.primecloud.agent.v1.ShellInitAckH\x00R\ainitAck\x12\x18\n" +
+	"\x06stdout\x18\x02 \x01(\fH\x00R\x06stdout\x12\x18\n" +
+	"\x06stderr\x18\x03 \x01(\fH\x00R\x06stderr\x124\n" +
+	"\x04exit\x18\x04 \x01(\v2\x1e.primecloud.agent.v1.ShellExitH\x00R\x04exit\x127\n" +
+	"\x05error\x18\x05 \x01(\v2\x1f.primecloud.agent.v1.ShellErrorH\x00R\x05errorB\t\n" +
+	"\apayload\"w\n" +
+	"\fShellInitAck\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x16\n" +
+	"\x06engine\x18\x02 \x01(\tR\x06engine\x12\x16\n" +
+	"\x06banner\x18\x03 \x01(\tR\x06banner\x12\x18\n" +
+	"\asuccess\x18\x04 \x01(\bR\asuccess\"@\n" +
+	"\tShellExit\x12\x1b\n" +
+	"\texit_code\x18\x01 \x01(\x05R\bexitCode\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\":\n" +
+	"\n" +
+	"ShellError\x12\x12\n" +
+	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage*P\n" +
+	"\x0fShellSignalType\x12\x16\n" +
+	"\x12SIGNAL_UNSPECIFIED\x10\x00\x12\n" +
+	"\n" +
+	"\x06SIGINT\x10\x01\x12\v\n" +
+	"\aSIGTERM\x10\x02\x12\f\n" +
+	"\bSIGWINCH\x10\x032\xf5\x05\n" +
 	"\fAgentService\x12W\n" +
 	"\bRegister\x12$.primecloud.agent.v1.RegisterRequest\x1a%.primecloud.agent.v1.RegisterResponse\x12f\n" +
 	"\x10StreamOperations\x12&.primecloud.agent.v1.OperationResponse\x1a&.primecloud.agent.v1.OperationEnvelope(\x010\x01\x12^\n" +
@@ -1343,7 +2055,9 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\vReportState\x12!.primecloud.agent.v1.StateRequest\x1a\".primecloud.agent.v1.StateResponse\x12T\n" +
 	"\vReportEvent\x12!.primecloud.agent.v1.EventRequest\x1a\".primecloud.agent.v1.EventResponse\x12Z\n" +
 	"\rReportMetrics\x12#.primecloud.agent.v1.MetricsRequest\x1a$.primecloud.agent.v1.MetricsResponse\x12Z\n" +
-	"\tReconcile\x12%.primecloud.agent.v1.ReconcileRequest\x1a&.primecloud.agent.v1.ReconcileResponseB:Z8github.com/primecloud/primecloud-agent/internal/protocolb\x06proto3"
+	"\tReconcile\x12%.primecloud.agent.v1.ReconcileRequest\x1a&.primecloud.agent.v1.ReconcileResponse2{\n" +
+	"\fShellService\x12k\n" +
+	"\x13StreamDatabaseShell\x12'.primecloud.agent.v1.ShellClientMessage\x1a'.primecloud.agent.v1.ShellServerMessage(\x010\x01B:Z8github.com/primecloud/primecloud-agent/internal/protocolb\x06proto3"
 
 var (
 	file_proto_agent_proto_rawDescOnce sync.Once
@@ -1357,49 +2071,68 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_proto_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_proto_agent_proto_goTypes = []any{
-	(*RegisterRequest)(nil),   // 0: primecloud.agent.v1.RegisterRequest
-	(*RegisterResponse)(nil),  // 1: primecloud.agent.v1.RegisterResponse
-	(*OperationEnvelope)(nil), // 2: primecloud.agent.v1.OperationEnvelope
-	(*OperationResponse)(nil), // 3: primecloud.agent.v1.OperationResponse
-	(*HeartbeatRequest)(nil),  // 4: primecloud.agent.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil), // 5: primecloud.agent.v1.HeartbeatResponse
-	(*InventoryRequest)(nil),  // 6: primecloud.agent.v1.InventoryRequest
-	(*InventoryResponse)(nil), // 7: primecloud.agent.v1.InventoryResponse
-	(*StateRequest)(nil),      // 8: primecloud.agent.v1.StateRequest
-	(*StateResponse)(nil),     // 9: primecloud.agent.v1.StateResponse
-	(*EventRequest)(nil),      // 10: primecloud.agent.v1.EventRequest
-	(*EventResponse)(nil),     // 11: primecloud.agent.v1.EventResponse
-	(*MetricsRequest)(nil),    // 12: primecloud.agent.v1.MetricsRequest
-	(*MetricsResponse)(nil),   // 13: primecloud.agent.v1.MetricsResponse
-	(*ReconcileRequest)(nil),  // 14: primecloud.agent.v1.ReconcileRequest
-	(*ReconcileResponse)(nil), // 15: primecloud.agent.v1.ReconcileResponse
-	nil,                       // 16: primecloud.agent.v1.RegisterRequest.LabelsEntry
+	(ShellSignalType)(0),       // 0: primecloud.agent.v1.ShellSignalType
+	(*RegisterRequest)(nil),    // 1: primecloud.agent.v1.RegisterRequest
+	(*RegisterResponse)(nil),   // 2: primecloud.agent.v1.RegisterResponse
+	(*OperationEnvelope)(nil),  // 3: primecloud.agent.v1.OperationEnvelope
+	(*OperationResponse)(nil),  // 4: primecloud.agent.v1.OperationResponse
+	(*HeartbeatRequest)(nil),   // 5: primecloud.agent.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),  // 6: primecloud.agent.v1.HeartbeatResponse
+	(*InventoryRequest)(nil),   // 7: primecloud.agent.v1.InventoryRequest
+	(*InventoryResponse)(nil),  // 8: primecloud.agent.v1.InventoryResponse
+	(*StateRequest)(nil),       // 9: primecloud.agent.v1.StateRequest
+	(*StateResponse)(nil),      // 10: primecloud.agent.v1.StateResponse
+	(*EventRequest)(nil),       // 11: primecloud.agent.v1.EventRequest
+	(*EventResponse)(nil),      // 12: primecloud.agent.v1.EventResponse
+	(*MetricsRequest)(nil),     // 13: primecloud.agent.v1.MetricsRequest
+	(*MetricsResponse)(nil),    // 14: primecloud.agent.v1.MetricsResponse
+	(*ReconcileRequest)(nil),   // 15: primecloud.agent.v1.ReconcileRequest
+	(*ReconcileResponse)(nil),  // 16: primecloud.agent.v1.ReconcileResponse
+	(*ShellClientMessage)(nil), // 17: primecloud.agent.v1.ShellClientMessage
+	(*ShellInitRequest)(nil),   // 18: primecloud.agent.v1.ShellInitRequest
+	(*ShellResize)(nil),        // 19: primecloud.agent.v1.ShellResize
+	(*ShellSignal)(nil),        // 20: primecloud.agent.v1.ShellSignal
+	(*ShellServerMessage)(nil), // 21: primecloud.agent.v1.ShellServerMessage
+	(*ShellInitAck)(nil),       // 22: primecloud.agent.v1.ShellInitAck
+	(*ShellExit)(nil),          // 23: primecloud.agent.v1.ShellExit
+	(*ShellError)(nil),         // 24: primecloud.agent.v1.ShellError
+	nil,                        // 25: primecloud.agent.v1.RegisterRequest.LabelsEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
-	16, // 0: primecloud.agent.v1.RegisterRequest.labels:type_name -> primecloud.agent.v1.RegisterRequest.LabelsEntry
-	0,  // 1: primecloud.agent.v1.AgentService.Register:input_type -> primecloud.agent.v1.RegisterRequest
-	3,  // 2: primecloud.agent.v1.AgentService.StreamOperations:input_type -> primecloud.agent.v1.OperationResponse
-	4,  // 3: primecloud.agent.v1.AgentService.SendHeartbeat:input_type -> primecloud.agent.v1.HeartbeatRequest
-	6,  // 4: primecloud.agent.v1.AgentService.ReportInventory:input_type -> primecloud.agent.v1.InventoryRequest
-	8,  // 5: primecloud.agent.v1.AgentService.ReportState:input_type -> primecloud.agent.v1.StateRequest
-	10, // 6: primecloud.agent.v1.AgentService.ReportEvent:input_type -> primecloud.agent.v1.EventRequest
-	12, // 7: primecloud.agent.v1.AgentService.ReportMetrics:input_type -> primecloud.agent.v1.MetricsRequest
-	14, // 8: primecloud.agent.v1.AgentService.Reconcile:input_type -> primecloud.agent.v1.ReconcileRequest
-	1,  // 9: primecloud.agent.v1.AgentService.Register:output_type -> primecloud.agent.v1.RegisterResponse
-	2,  // 10: primecloud.agent.v1.AgentService.StreamOperations:output_type -> primecloud.agent.v1.OperationEnvelope
-	5,  // 11: primecloud.agent.v1.AgentService.SendHeartbeat:output_type -> primecloud.agent.v1.HeartbeatResponse
-	7,  // 12: primecloud.agent.v1.AgentService.ReportInventory:output_type -> primecloud.agent.v1.InventoryResponse
-	9,  // 13: primecloud.agent.v1.AgentService.ReportState:output_type -> primecloud.agent.v1.StateResponse
-	11, // 14: primecloud.agent.v1.AgentService.ReportEvent:output_type -> primecloud.agent.v1.EventResponse
-	13, // 15: primecloud.agent.v1.AgentService.ReportMetrics:output_type -> primecloud.agent.v1.MetricsResponse
-	15, // 16: primecloud.agent.v1.AgentService.Reconcile:output_type -> primecloud.agent.v1.ReconcileResponse
-	9,  // [9:17] is the sub-list for method output_type
-	1,  // [1:9] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	25, // 0: primecloud.agent.v1.RegisterRequest.labels:type_name -> primecloud.agent.v1.RegisterRequest.LabelsEntry
+	18, // 1: primecloud.agent.v1.ShellClientMessage.init:type_name -> primecloud.agent.v1.ShellInitRequest
+	19, // 2: primecloud.agent.v1.ShellClientMessage.resize:type_name -> primecloud.agent.v1.ShellResize
+	20, // 3: primecloud.agent.v1.ShellClientMessage.signal:type_name -> primecloud.agent.v1.ShellSignal
+	0,  // 4: primecloud.agent.v1.ShellSignal.signal:type_name -> primecloud.agent.v1.ShellSignalType
+	22, // 5: primecloud.agent.v1.ShellServerMessage.init_ack:type_name -> primecloud.agent.v1.ShellInitAck
+	23, // 6: primecloud.agent.v1.ShellServerMessage.exit:type_name -> primecloud.agent.v1.ShellExit
+	24, // 7: primecloud.agent.v1.ShellServerMessage.error:type_name -> primecloud.agent.v1.ShellError
+	1,  // 8: primecloud.agent.v1.AgentService.Register:input_type -> primecloud.agent.v1.RegisterRequest
+	4,  // 9: primecloud.agent.v1.AgentService.StreamOperations:input_type -> primecloud.agent.v1.OperationResponse
+	5,  // 10: primecloud.agent.v1.AgentService.SendHeartbeat:input_type -> primecloud.agent.v1.HeartbeatRequest
+	7,  // 11: primecloud.agent.v1.AgentService.ReportInventory:input_type -> primecloud.agent.v1.InventoryRequest
+	9,  // 12: primecloud.agent.v1.AgentService.ReportState:input_type -> primecloud.agent.v1.StateRequest
+	11, // 13: primecloud.agent.v1.AgentService.ReportEvent:input_type -> primecloud.agent.v1.EventRequest
+	13, // 14: primecloud.agent.v1.AgentService.ReportMetrics:input_type -> primecloud.agent.v1.MetricsRequest
+	15, // 15: primecloud.agent.v1.AgentService.Reconcile:input_type -> primecloud.agent.v1.ReconcileRequest
+	17, // 16: primecloud.agent.v1.ShellService.StreamDatabaseShell:input_type -> primecloud.agent.v1.ShellClientMessage
+	2,  // 17: primecloud.agent.v1.AgentService.Register:output_type -> primecloud.agent.v1.RegisterResponse
+	3,  // 18: primecloud.agent.v1.AgentService.StreamOperations:output_type -> primecloud.agent.v1.OperationEnvelope
+	6,  // 19: primecloud.agent.v1.AgentService.SendHeartbeat:output_type -> primecloud.agent.v1.HeartbeatResponse
+	8,  // 20: primecloud.agent.v1.AgentService.ReportInventory:output_type -> primecloud.agent.v1.InventoryResponse
+	10, // 21: primecloud.agent.v1.AgentService.ReportState:output_type -> primecloud.agent.v1.StateResponse
+	12, // 22: primecloud.agent.v1.AgentService.ReportEvent:output_type -> primecloud.agent.v1.EventResponse
+	14, // 23: primecloud.agent.v1.AgentService.ReportMetrics:output_type -> primecloud.agent.v1.MetricsResponse
+	16, // 24: primecloud.agent.v1.AgentService.Reconcile:output_type -> primecloud.agent.v1.ReconcileResponse
+	21, // 25: primecloud.agent.v1.ShellService.StreamDatabaseShell:output_type -> primecloud.agent.v1.ShellServerMessage
+	17, // [17:26] is the sub-list for method output_type
+	8,  // [8:17] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -1407,18 +2140,32 @@ func file_proto_agent_proto_init() {
 	if File_proto_agent_proto != nil {
 		return
 	}
+	file_proto_agent_proto_msgTypes[16].OneofWrappers = []any{
+		(*ShellClientMessage_Init)(nil),
+		(*ShellClientMessage_Stdin)(nil),
+		(*ShellClientMessage_Resize)(nil),
+		(*ShellClientMessage_Signal)(nil),
+	}
+	file_proto_agent_proto_msgTypes[20].OneofWrappers = []any{
+		(*ShellServerMessage_InitAck)(nil),
+		(*ShellServerMessage_Stdout)(nil),
+		(*ShellServerMessage_Stderr)(nil),
+		(*ShellServerMessage_Exit)(nil),
+		(*ShellServerMessage_Error)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   17,
+			NumEnums:      1,
+			NumMessages:   25,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_proto_agent_proto_goTypes,
 		DependencyIndexes: file_proto_agent_proto_depIdxs,
+		EnumInfos:         file_proto_agent_proto_enumTypes,
 		MessageInfos:      file_proto_agent_proto_msgTypes,
 	}.Build()
 	File_proto_agent_proto = out.File

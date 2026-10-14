@@ -4,10 +4,9 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"io"
-	"strings"
 	"time"
 
+	"github.com/primecloud/primecloud-agent/internal/logs"
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
 )
 
@@ -19,7 +18,7 @@ type LogEntry struct {
 	Message     string    `json:"message"`
 }
 
-// FetchContainerLogs retrieves log lines from a managed container.
+// FetchContainerLogs retrieves log lines from a managed container using proper stream demultiplexing.
 func FetchContainerLogs(ctx context.Context, rt agentruntime.ContainerRuntime, containerID string, tailLines int) ([]LogEntry, error) {
 	if rt == nil {
 		return nil, fmt.Errorf("runtime is nil")
@@ -31,25 +30,22 @@ func FetchContainerLogs(ctx context.Context, rt agentruntime.ContainerRuntime, c
 	}
 	defer reader.Close()
 
-	buf, err := io.ReadAll(reader)
+	items, err := logs.DemuxDockerLogStream(reader, "stdout")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read container logs: %w", err)
+		return nil, fmt.Errorf("failed to demux container logs: %w", err)
 	}
 
-	lines := strings.Split(string(buf), "\n")
 	var entries []LogEntry
-	now := time.Now()
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
+	for _, item := range items {
+		ts := time.Now().UTC()
+		if item.Timestamp != nil {
+			ts = *item.Timestamp
 		}
 		entries = append(entries, LogEntry{
-			Timestamp:   now,
+			Timestamp:   ts,
 			ContainerID: containerID,
-			Stream:      "stdout",
-			Message:     trimmed,
+			Stream:      item.Stream,
+			Message:     item.Message,
 		})
 	}
 

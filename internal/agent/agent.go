@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/primecloud/primecloud-agent/internal/applications"
 	"github.com/primecloud/primecloud-agent/internal/backup"
@@ -59,6 +62,9 @@ type Agent struct {
 	dispatcher       *operations.Dispatcher
 	valkeyConsumer   *transport.ValkeyConsumer
 	runtime          runtime.ContainerRuntime
+	shellServer      *transport.DatabaseShellServer
+	shellGRPCServer  *grpc.Server
+	shellListener    net.Listener
 }
 
 // NewAgent constructs a new Agent daemon instance.
@@ -1800,13 +1806,29 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		nil,
 		a.logger,
 	)
-	a.logHarvester = logs.NewHarvester(
+	a.logHarvester = logs.NewHarvesterWithAuth(
 		rt,
 		cfg.ControlPlaneURL,
+		cfg.AgentKey,
+		cfg.NodeID,
 		100,
 		5*time.Second,
 		a.logger,
 	)
+
+	// Initialize real database PTY shell streaming service if configured
+	if cfg.ShellListenAddr != "" {
+		if dockerRT, ok := rt.(*runtime.DockerRuntime); ok && dockerRT != nil {
+			dockerAdapter := terminal.NewDockerRuntimeAdapter(dockerRT)
+			ptyRuntime := terminal.NewRealDatabaseShellRuntime(dockerAdapter, a.logger)
+			factory := transport.NewDefaultShellSessionFactory(ptyRuntime)
+			a.shellServer = transport.NewDatabaseShellServer(transport.ShellServerConfig{
+				Factory:        factory,
+				ExpectedNodeID: cfg.NodeID,
+				Logger:         a.logger,
+			})
+		}
+	}
 
 	return a, nil
 }
@@ -1848,6 +1870,27 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		}()
 	}
 
+	// Boot background gRPC ShellService server routine if configured
+	if a.shellServer != nil && a.cfg.ShellListenAddr != "" {
+		ln, err := net.Listen("tcp", a.cfg.ShellListenAddr)
+		if err != nil {
+			a.logger.Error("shell_grpc_listener_failed", "addr", a.cfg.ShellListenAddr, "error", err)
+		} else {
+			a.shellListener = ln
+			grpcSrv := grpc.NewServer()
+			pb.RegisterShellServiceServer(grpcSrv, a.shellServer)
+			a.shellGRPCServer = grpcSrv
+			a.wg.Add(1)
+			go func() {
+				defer a.wg.Done()
+				a.logger.Info("shell_grpc_server_listening", "addr", a.cfg.ShellListenAddr)
+				if err := grpcSrv.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+					a.logger.Error("shell_grpc_server_error", "error", err)
+				}
+			}()
+		}
+	}
+
 	a.state.Store(StateReady)
 	a.logger.Info("primecloud_agent_ready", "state", string(StateReady))
 
@@ -1865,6 +1908,11 @@ func (a *Agent) Stop() error {
 
 		if a.cancel != nil {
 			a.cancel()
+		}
+
+		if a.shellGRPCServer != nil {
+			a.logger.Info("shell_grpc_server_stopping")
+			a.shellGRPCServer.GracefulStop()
 		}
 
 		done := make(chan struct{})

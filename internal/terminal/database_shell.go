@@ -18,13 +18,18 @@ import (
 
 // Standard error definitions for shell security violations and lifecycle errors.
 var (
-	ErrForbiddenCommand  = errors.New("command forbidden: host shell, root shell, docker, and arbitrary binaries are strictly prohibited")
-	ErrInvalidPath       = errors.New("command path traversal forbidden: absolute or relative executable paths are not allowed")
-	ErrUnsupportedEngine = errors.New("unsupported resource engine: only postgres and valkey/keyvalue are supported")
-	ErrSessionNotFound   = errors.New("shell session not found")
-	ErrSessionExpired    = errors.New("shell session has expired")
-	ErrSessionClosed     = errors.New("shell session is closed")
-	ErrUnauthorized      = errors.New("cross-tenant shell access denied")
+	ErrForbiddenCommand   = errors.New("command forbidden: host shell, root shell, docker, and arbitrary binaries are strictly prohibited")
+	ErrInvalidPath        = errors.New("command path traversal forbidden: absolute or relative executable paths are not allowed")
+	ErrUnsupportedEngine  = errors.New("unsupported resource engine: only postgres and valkey/keyvalue are supported")
+	ErrSessionNotFound    = errors.New("shell session not found")
+	ErrSessionExpired     = errors.New("shell session has expired")
+	ErrSessionClosed      = errors.New("shell session is closed")
+	ErrUnauthorized       = errors.New("cross-tenant shell access denied")
+	ErrNilDockerClient    = errors.New("docker client cannot be nil")
+	ErrInvalidContainerID = errors.New("container ID is required and must not be empty")
+	ErrStreamTimeout      = errors.New("terminal stream timeout: reader stalled")
+	ErrContainerNotFound  = errors.New("database container not found or not running")
+	ErrBufferOverflow     = errors.New("terminal buffer limit exceeded")
 )
 
 // Allowed database client executables per resource engine.

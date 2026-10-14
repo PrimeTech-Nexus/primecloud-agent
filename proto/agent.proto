@@ -166,3 +166,73 @@ message ReconcileResponse {
   bool has_drift = 2;
   repeated string repair_instructions = 3;
 }
+
+// ShellService provides bidirectional streaming for interactive database shells.
+service ShellService {
+  // StreamDatabaseShell opens a bidirectional stream for interactive PTY shell execution.
+  rpc StreamDatabaseShell(stream ShellClientMessage) returns (stream ShellServerMessage);
+}
+
+message ShellClientMessage {
+  oneof payload {
+    ShellInitRequest init = 1;
+    bytes stdin = 2;
+    ShellResize resize = 3;
+    ShellSignal signal = 4;
+  }
+}
+
+message ShellInitRequest {
+  string session_id = 1;
+  string ticket = 2;
+  string resource_id = 3;
+  string resource_type = 4; // "postgres" | "valkey"
+  string tenant_id = 5;
+  string command = 6;       // Whitelisted: "psql" | "valkey-cli"
+  uint32 initial_rows = 7;
+  uint32 initial_cols = 8;
+}
+
+message ShellResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+enum ShellSignalType {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGINT = 1;
+  SIGTERM = 2;
+  SIGWINCH = 3;
+}
+
+message ShellSignal {
+  ShellSignalType signal = 1;
+}
+
+message ShellServerMessage {
+  oneof payload {
+    ShellInitAck init_ack = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    ShellExit exit = 4;
+    ShellError error = 5;
+  }
+}
+
+message ShellInitAck {
+  string session_id = 1;
+  string engine = 2;
+  string banner = 3;
+  bool success = 4;
+}
+
+message ShellExit {
+  int32 exit_code = 1;
+  string reason = 2;
+}
+
+message ShellError {
+  string code = 1;
+  string message = 2;
+}
+

@@ -400,3 +400,105 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "proto/agent.proto",
 }
+
+const (
+	ShellService_StreamDatabaseShell_FullMethodName = "/primecloud.agent.v1.ShellService/StreamDatabaseShell"
+)
+
+// ShellServiceClient is the client API for ShellService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ShellService provides bidirectional streaming for interactive database shells.
+type ShellServiceClient interface {
+	// StreamDatabaseShell opens a bidirectional stream for interactive PTY shell execution.
+	StreamDatabaseShell(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ShellClientMessage, ShellServerMessage], error)
+}
+
+type shellServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewShellServiceClient(cc grpc.ClientConnInterface) ShellServiceClient {
+	return &shellServiceClient{cc}
+}
+
+func (c *shellServiceClient) StreamDatabaseShell(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ShellClientMessage, ShellServerMessage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShellService_ServiceDesc.Streams[0], ShellService_StreamDatabaseShell_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ShellClientMessage, ShellServerMessage]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShellService_StreamDatabaseShellClient = grpc.BidiStreamingClient[ShellClientMessage, ShellServerMessage]
+
+// ShellServiceServer is the server API for ShellService service.
+// All implementations must embed UnimplementedShellServiceServer
+// for forward compatibility.
+//
+// ShellService provides bidirectional streaming for interactive database shells.
+type ShellServiceServer interface {
+	// StreamDatabaseShell opens a bidirectional stream for interactive PTY shell execution.
+	StreamDatabaseShell(grpc.BidiStreamingServer[ShellClientMessage, ShellServerMessage]) error
+	mustEmbedUnimplementedShellServiceServer()
+}
+
+// UnimplementedShellServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedShellServiceServer struct{}
+
+func (UnimplementedShellServiceServer) StreamDatabaseShell(grpc.BidiStreamingServer[ShellClientMessage, ShellServerMessage]) error {
+	return status.Error(codes.Unimplemented, "method StreamDatabaseShell not implemented")
+}
+func (UnimplementedShellServiceServer) mustEmbedUnimplementedShellServiceServer() {}
+func (UnimplementedShellServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeShellServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ShellServiceServer will
+// result in compilation errors.
+type UnsafeShellServiceServer interface {
+	mustEmbedUnimplementedShellServiceServer()
+}
+
+func RegisterShellServiceServer(s grpc.ServiceRegistrar, srv ShellServiceServer) {
+	// If the following call panics, it indicates UnimplementedShellServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ShellService_ServiceDesc, srv)
+}
+
+func _ShellService_StreamDatabaseShell_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ShellServiceServer).StreamDatabaseShell(&grpc.GenericServerStream[ShellClientMessage, ShellServerMessage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShellService_StreamDatabaseShellServer = grpc.BidiStreamingServer[ShellClientMessage, ShellServerMessage]
+
+// ShellService_ServiceDesc is the grpc.ServiceDesc for ShellService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ShellService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "primecloud.agent.v1.ShellService",
+	HandlerType: (*ShellServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamDatabaseShell",
+			Handler:       _ShellService_StreamDatabaseShell_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "proto/agent.proto",
+}
