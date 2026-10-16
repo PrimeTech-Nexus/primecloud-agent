@@ -52,9 +52,11 @@ jobs:
       - name: Cross-Compile Agent Binaries
         env:
           CGO_ENABLED: '0'
-          GO_LDFLAGS: '-s -w'
+          TAG: ${{ steps.vars.outputs.tag }}
+          COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist/amd64 dist/arm64 dist/release
+          GO_LDFLAGS="-s -w -X main.Version=${TAG} -X main.CommitSHA=${COMMIT}"
           GOOS=linux GOARCH=amd64 go build -ldflags="${GO_LDFLAGS}" -o dist/amd64/primecloud-agent ./cmd/agent
           GOOS=linux GOARCH=arm64 go build -ldflags="${GO_LDFLAGS}" -o dist/arm64/primecloud-agent ./cmd/agent
 

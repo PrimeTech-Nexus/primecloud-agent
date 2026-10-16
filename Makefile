@@ -3,10 +3,14 @@
 BINARY_NAME=primecloud-agent
 CMD_DIR=./cmd/agent
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
+LDFLAGS ?= -s -w -X main.Version=$(VERSION) -X main.CommitSHA=$(COMMIT)
+
 all: build
 
 build:
-	go build -v -o bin/$(BINARY_NAME) $(CMD_DIR)
+	go build -v -ldflags="$(LDFLAGS)" -o bin/$(BINARY_NAME) $(CMD_DIR)
 
 test:
 	go test -v -race ./...

@@ -1,0 +1,17 @@
+# ==============================================================================
+# PrimeCloud Production Least-Privilege Sudoers Drop-in for Agent Deployment
+# Host Target: pc-node-001 | Path: /etc/sudoers.d/99-primecloud-agent-deploy
+# Permissions: chmod 440 / chown root:root
+# Mode: Command-pinned, argument-restricted, zero wildcard execution
+# ==============================================================================
+
+# Disallow TTY requirement for automated non-interactive CI/CD deployment
+Defaults:deploy !requiretty
+
+# Reset environment and only allow essential variables
+Defaults:deploy env_reset
+
+# Grant the dedicated 'deploy' user execution rights ONLY to the hardened agent wrapper
+# with release tag matching v* and checksum matching 64 hex characters.
+deploy ALL=(root) NOPASSWD: /opt/primecloud-bootstrap/agent_deploy_wrapper.sh v* [0-9a-fA-F]*
+deploy ALL=(root) NOPASSWD: /opt/primecloud-bootstrap/agent_deploy_wrapper.sh --dry-run v* [0-9a-fA-F]*

@@ -1,0 +1,171 @@
+name: Deploy PrimeCloud Agent to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy (e.g. v0.4.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Execute in dry-run mode (validate without modifying host)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-production:
+    name: Deploy to Production (pc-node-001)
+    if: >-
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://pc-node-001.primecloud.internal
+    concurrency:
+      group: production-deployment-pc-node-001-agent
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and Validate Target Release Tag
+        id: resolve-tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+
+          TAG_CLEAN="$(printf '%s' "${TAG}" | tr -d '\r[:space:]')"
+
+          if [ -z "${TAG_CLEAN}" ]; then
+            echo "::error::Target release tag is empty! Aborting deployment."
+            exit 1
+          fi
+
+          if [[ ! "${TAG_CLEAN}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag format: '${TAG_CLEAN}'. Must follow SemVer (e.g. v0.4.0)."
+            exit 1
+          fi
+
+          echo "tag=${TAG_CLEAN}" >> "$GITHUB_OUTPUT"
+          echo "Target Release Tag: ${TAG_CLEAN}"
+
+      - name: Retrieve and Verify Release Checksum
+        id: resolve-checksum
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          echo "Fetching release metadata for tag ${TAG}..."
+          mkdir -p /tmp/release-manifest
+          cd /tmp/release-manifest
+
+          if ! gh release download "${TAG}" --pattern "SHA256SUMS" --repo "${{ github.repository }}"; then
+            echo "::error::Failed to download SHA256SUMS manifest for release ${TAG}!"
+            exit 1
+          fi
+
+          if [ ! -s "SHA256SUMS" ]; then
+            echo "::error::Downloaded SHA256SUMS manifest is empty or missing!"
+            exit 1
+          fi
+
+          # Locate target architecture asset checksum for pc-node-001 (linux-amd64)
+          ASSET_NAME="primecloud-agent-linux-amd64.tar.gz"
+          MATCHES=$(grep -E "${ASSET_NAME}\$" SHA256SUMS || true)
+
+          MATCH_COUNT=$(printf '%s\n' "${MATCHES}" | grep -c .) || true
+          if [ "${MATCH_COUNT}" -ne 1 ]; then
+            echo "::error::Expected exactly one checksum for ${ASSET_NAME} in SHA256SUMS, found ${MATCH_COUNT}!"
+            exit 1
+          fi
+
+          CHECKSUM=$(printf '%s' "${MATCHES}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r[:space:]')
+
+          if [[ ! "${CHECKSUM}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Parsed checksum '${CHECKSUM}' is not a valid 64-character SHA-256 hex string!"
+            exit 1
+          fi
+
+          echo "checksum=${CHECKSUM}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Verified Release Checksum: ${CHECKSUM} (${ASSET_NAME})"
+
+      - name: Execute Remote Deployment via Hardened Wrapper
+        env:
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
+          CHECKSUM: ${{ steps.resolve-checksum.outputs.checksum }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+          DEPLOY_USER: ${{ secrets.PROD_SSH_USER }}
+          DEPLOY_KEY: ${{ secrets.PROD_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          if [ -z "${DEPLOY_HOST}" ] || [ -z "${DEPLOY_USER}" ] || [ -z "${DEPLOY_KEY}" ] || [ -z "${KNOWN_HOSTS}" ]; then
+            echo "::error::Required deployment secrets (PROD_HOST, PROD_SSH_USER, PROD_SSH_KEY, PROD_KNOWN_HOSTS) are missing!"
+            exit 1
+          fi
+
+          DEPLOY_HOST_CLEAN="$(printf '%s' "${DEPLOY_HOST}" | tr -d '\r[:space:]')"
+          DEPLOY_USER_CLEAN="$(printf '%s' "${DEPLOY_USER}" | tr -d '\r[:space:]')"
+          TAG_CLEAN="$(printf '%s' "${TAG}" | tr -d '\r[:space:]')"
+          CHECKSUM_CLEAN="$(printf '%s' "${CHECKSUM}" | tr -d '\r[:space:]')"
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${KNOWN_HOSTS}" | tr -d '\r' > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          if ! ssh-keygen -F "${DEPLOY_HOST_CLEAN}" -f ~/.ssh/known_hosts >/dev/null 2>&1; then
+            echo "::error::Verified host key entry for target host '${DEPLOY_HOST_CLEAN}' not found in known_hosts!"
+            exit 1
+          fi
+
+          printf '%s\n' "${DEPLOY_KEY}" | tr -d '\r' > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          trap 'rm -f ~/.ssh/id_deploy ~/.ssh/known_hosts' EXIT
+
+          EXTRA_ARGS=""
+          if [ "${DRY_RUN}" = "true" ]; then
+            EXTRA_ARGS="--dry-run"
+            echo "==> Executing in DRY-RUN mode..."
+          fi
+
+          echo "==> Connecting to ${DEPLOY_HOST_CLEAN} via SSH..."
+          ssh -i ~/.ssh/id_deploy \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}" \
+            "sudo -n /opt/primecloud-bootstrap/agent_deploy_wrapper.sh ${EXTRA_ARGS} \"${TAG_CLEAN}\" \"${CHECKSUM_CLEAN}\""
+
+      - name: Record Production Deployment Audit Summary
+        if: always()
+        run: |
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### PrimeCloud Agent Production Deployment Summary"
+              echo "- **Status:** ${{ job.status }}"
+              echo "- **Target Release Tag:** \`${{ steps.resolve-tag.outputs.tag || 'none' }}\`"
+              echo "- **Target Architecture:** \`linux-amd64\`"
+              echo "- **Target Asset:** \`${{ steps.resolve-checksum.outputs.asset_name || 'primecloud-agent-linux-amd64.tar.gz' }}\`"
+              echo "- **Verified Checksum:** \`${{ steps.resolve-checksum.outputs.checksum || 'none' }}\`"
+              echo "- **Dry-Run Mode:** \`${{ github.event.inputs.dry_run || 'false' }}\`"
+              echo "- **Target Host:** \`pc-node-001\`"
+              echo "- **Target Service:** \`primecloud-agent.service\`"
+              echo "- **Service Health Note:** Service liveness was verified via systemd. Remote Control Plane registration and Valkey queue consumption require valid configuration in \`/etc/primecloud/agent.env\` and external connectivity."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
