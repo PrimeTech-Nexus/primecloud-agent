@@ -182,7 +182,7 @@ case "\$action" in
                 echo "failed"
             fi
         elif [[ "\$prop" == "MainPID" ]]; then
-            echo "\$PPID"
+            echo "1"
         fi
         exit 0
         ;;
