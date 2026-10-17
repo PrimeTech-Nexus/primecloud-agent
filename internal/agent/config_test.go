@@ -106,3 +106,45 @@ func TestLoadConfig_AppRole_FromJSONFile(t *testing.T) {
 		t.Error("expected default VaultAddr")
 	}
 }
+
+func TestLoadConfig_ControlPlaneHTTPURL_DerivedFromControlPlaneURL(t *testing.T) {
+	origCP := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL")
+	origHTTP := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL")
+	defer func() {
+		os.Setenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL", origCP)
+		os.Setenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL", origHTTP)
+	}()
+
+	os.Unsetenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL")
+	os.Unsetenv("PRIMECLOUD_CONTROL_PLANE_HTTP_URL")
+	os.Setenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL", "10.50.0.20:50051")
+
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	expected := "http://10.50.0.20:8000"
+	if cfg.ControlPlaneHTTPURL != expected {
+		t.Errorf("expected derived ControlPlaneHTTPURL '%s', got '%s'", expected, cfg.ControlPlaneHTTPURL)
+	}
+}
+
+func TestLoadConfig_ControlPlaneHTTPURL_ExplicitEnv(t *testing.T) {
+	origHTTP := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL")
+	defer func() {
+		os.Setenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL", origHTTP)
+	}()
+
+	os.Setenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL", "https://api.internal.primecloud:8443")
+
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	expected := "https://api.internal.primecloud:8443"
+	if cfg.ControlPlaneHTTPURL != expected {
+		t.Errorf("expected explicit ControlPlaneHTTPURL '%s', got '%s'", expected, cfg.ControlPlaneHTTPURL)
+	}
+}

@@ -18,6 +18,7 @@ type Config struct {
 	AgentID             string        `json:"agent_id"`
 	AgentKey            string        `json:"-"` // Shared cluster agent secret (never serialized in JSON)
 	ControlPlaneURL     string        `json:"control_plane_url"`
+	ControlPlaneHTTPURL string        `json:"control_plane_http_url"`
 	QueueURL            string        `json:"queue_url"`
 	VaultAddr           string        `json:"vault_addr"`
 	VaultRoleID         string        `json:"-"` // Never serialized in JSON
@@ -35,8 +36,8 @@ type Config struct {
 
 // String implements fmt.Stringer to ensure secrets are never leaked in string formatting.
 func (c *Config) String() string {
-	return fmt.Sprintf("Config{NodeID:%s, AgentID:%s, ControlPlaneURL:%s, QueueURL:%s, VaultAddr:%s, CertDir:%s, ResourceDir:%s, HeartbeatInterval:%v, LogLevel:%v, DockerHost:%s}",
-		c.NodeID, c.AgentID, c.ControlPlaneURL, c.QueueURL, c.VaultAddr, c.CertDir, c.ResourceDir, c.HeartbeatInterval, c.LogLevel, c.DockerHost)
+	return fmt.Sprintf("Config{NodeID:%s, AgentID:%s, ControlPlaneURL:%s, ControlPlaneHTTPURL:%s, QueueURL:%s, VaultAddr:%s, CertDir:%s, ResourceDir:%s, HeartbeatInterval:%v, LogLevel:%v, DockerHost:%s}",
+		c.NodeID, c.AgentID, c.ControlPlaneURL, c.ControlPlaneHTTPURL, c.QueueURL, c.VaultAddr, c.CertDir, c.ResourceDir, c.HeartbeatInterval, c.LogLevel, c.DockerHost)
 }
 
 // DefaultConfig returns baseline configuration defaults.
@@ -46,6 +47,7 @@ func DefaultConfig() *Config {
 		NodeID:              "0191c001-0000-7000-8000-000000000001",
 		AgentID:             "agent-node-0191c001-0000-7000-8000-000000000001",
 		ControlPlaneURL:     "127.0.0.1:50051",
+		ControlPlaneHTTPURL: "http://127.0.0.1:8000",
 		QueueURL:            "127.0.0.1:6379",
 		VaultAddr:           "http://127.0.0.1:8200",
 		CertDir:             "/etc/primecloud/agent",
@@ -83,6 +85,31 @@ func LoadConfig() (*Config, error) {
 	}
 	if v := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL"); v != "" {
 		cfg.ControlPlaneURL = v
+	}
+	var explicitHTTPURL string
+	if v := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_HTTP_URL"); v != "" {
+		explicitHTTPURL = strings.TrimSpace(v)
+	} else if v := os.Getenv("PRIMECLOUD_CONTROL_PLANE_HTTP_URL"); v != "" {
+		explicitHTTPURL = strings.TrimSpace(v)
+	} else if v := os.Getenv("PRIMECLOUD_CONTROL_PLANE_URL"); v != "" && (strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")) {
+		explicitHTTPURL = strings.TrimSpace(v)
+	}
+
+	if explicitHTTPURL != "" {
+		if !strings.HasPrefix(explicitHTTPURL, "http://") && !strings.HasPrefix(explicitHTTPURL, "https://") {
+			explicitHTTPURL = "http://" + explicitHTTPURL
+		}
+		cfg.ControlPlaneHTTPURL = explicitHTTPURL
+	} else if v := os.Getenv("PRIMECLOUD_AGENT_CONTROL_PLANE_URL"); v != "" {
+		// ControlPlaneURL was overridden via env, derive ControlPlaneHTTPURL from it
+		derived := cfg.ControlPlaneURL
+		if strings.Contains(derived, ":50051") {
+			derived = strings.Replace(derived, ":50051", ":8000", 1)
+		}
+		if !strings.HasPrefix(derived, "http://") && !strings.HasPrefix(derived, "https://") {
+			derived = "http://" + derived
+		}
+		cfg.ControlPlaneHTTPURL = derived
 	}
 	if v := os.Getenv("PRIMECLOUD_AGENT_SHELL_LISTEN_ADDR"); v != "" {
 		cfg.ShellListenAddr = strings.TrimSpace(v)

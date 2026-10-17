@@ -378,4 +378,85 @@ func TestDiscoverAndHarvestOnce(t *testing.T) {
 	if h.buffer[1].ResourceID != "database-uuid-2" {
 		t.Errorf("expected fallback ResourceID database-uuid-2, got %s", h.buffer[1].ResourceID)
 	}
+	if h.buffer[1].ResourceType != ResourceTypeDatabase {
+		t.Errorf("expected ResourceType database, got %s", h.buffer[1].ResourceType)
+	}
+}
+
+func TestHarvester_URLRewrite_Port50051(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"10.50.0.20:50051", "http://10.50.0.20:8000"},
+		{"http://10.50.0.20:50051", "http://10.50.0.20:8000"},
+		{"127.0.0.1:50051/", "http://127.0.0.1:8000"},
+		{"http://10.50.0.20:8000", "http://10.50.0.20:8000"},
+		{"https://api.primecloud.internal", "https://api.primecloud.internal"},
+	}
+
+	for _, tc := range cases {
+		h := NewHarvesterWithAuth(nil, tc.input, "test-key", "test-node", 100, 5*time.Second, nil)
+		if h.controlPlaneURL != tc.expected {
+			t.Errorf("input %s: expected %s, got %s", tc.input, tc.expected, h.controlPlaneURL)
+		}
+	}
+}
+
+func TestDiscoverAndHarvestOnce_DeploymentAndTypeMetadata(t *testing.T) {
+	mockRT := &mockRuntime{
+		containers: []agentruntime.ContainerSummary{
+			{
+				ID:    "cnt-app-123",
+				Names: []string{"/pc-app-prod"},
+				Labels: map[string]string{
+					"primecloud.resource_id":   "app-uuid-1",
+					"primecloud.deployment_id": "dep-uuid-999",
+				},
+			},
+			{
+				ID:    "cnt-db-456",
+				Names: []string{"/pc-pg-database-uuid-2"},
+				Labels: map[string]string{
+					"primecloud.managed": "true",
+				},
+			},
+		},
+		logOutput: map[string][]byte{
+			"cnt-app-123": makeDockerFrame(1, "2026-10-13T20:00:00Z App log line\n"),
+			"cnt-db-456":  makeDockerFrame(2, "2026-10-13T20:00:01Z Postgres log error\n"),
+		},
+	}
+
+	h := NewHarvester(mockRT, "http://localhost:59999", 50, 1*time.Second, nil)
+	err := h.DiscoverAndHarvestOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected discover error: %v", err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if len(h.buffer) != 2 {
+		t.Fatalf("expected 2 harvested logs, got %d", len(h.buffer))
+	}
+
+	appLog := h.buffer[0]
+	if appLog.ResourceID != "app-uuid-1" {
+		t.Errorf("expected ResourceID app-uuid-1, got %s", appLog.ResourceID)
+	}
+	if appLog.DeploymentID != "dep-uuid-999" {
+		t.Errorf("expected DeploymentID dep-uuid-999, got %s", appLog.DeploymentID)
+	}
+	if appLog.ResourceType != ResourceTypeApplication {
+		t.Errorf("expected ResourceType application, got %s", appLog.ResourceType)
+	}
+
+	dbLog := h.buffer[1]
+	if dbLog.ResourceID != "database-uuid-2" {
+		t.Errorf("expected ResourceID database-uuid-2, got %s", dbLog.ResourceID)
+	}
+	if dbLog.ResourceType != ResourceTypeDatabase {
+		t.Errorf("expected ResourceType database, got %s", dbLog.ResourceType)
+	}
 }

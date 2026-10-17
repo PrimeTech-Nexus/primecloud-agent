@@ -2,9 +2,13 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime"
 	"strconv"
 	"strings"
@@ -55,15 +59,18 @@ type MetricPayload struct {
 
 // Collector continuously samples metrics and transmits them to the Control Plane.
 type Collector struct {
-	mu          sync.Mutex
-	interval    time.Duration
-	nodeID      string
-	agentID     string
-	rt          agentruntime.ContainerRuntime
-	grpcClient  protocol.AgentServiceClient
-	logger      *slog.Logger
-	draining    bool
-	failedCount int
+	mu              sync.Mutex
+	interval        time.Duration
+	nodeID          string
+	agentID         string
+	rt              agentruntime.ContainerRuntime
+	grpcClient      protocol.AgentServiceClient
+	controlPlaneURL string
+	agentKey        string
+	httpClient      *http.Client
+	logger          *slog.Logger
+	draining        bool
+	failedCount     int
 }
 
 // NewCollector constructs a Collector instance.
@@ -86,7 +93,44 @@ func NewCollector(
 		agentID:    agentID,
 		rt:         rt,
 		grpcClient: grpcClient,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 		logger:     logger.With("component", "metrics_collector"),
+	}
+}
+
+// NewCollectorWithAuth constructs a Collector instance with direct authenticated HTTP transport to Control Plane.
+func NewCollectorWithAuth(
+	interval time.Duration,
+	nodeID, agentID string,
+	rt agentruntime.ContainerRuntime,
+	controlPlaneURL string,
+	agentKey string,
+	logger *slog.Logger,
+) *Collector {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	cleanURL := strings.TrimRight(controlPlaneURL, "/")
+	if cleanURL != "" {
+		if strings.HasSuffix(cleanURL, ":50051") {
+			cleanURL = strings.TrimSuffix(cleanURL, ":50051") + ":8000"
+		}
+		if !strings.HasPrefix(cleanURL, "http://") && !strings.HasPrefix(cleanURL, "https://") {
+			cleanURL = "http://" + cleanURL
+		}
+	}
+	return &Collector{
+		interval:        interval,
+		nodeID:          nodeID,
+		agentID:         agentID,
+		rt:              rt,
+		controlPlaneURL: cleanURL,
+		agentKey:        agentKey,
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		logger:          logger.With("component", "metrics_collector"),
 	}
 }
 
@@ -310,8 +354,196 @@ func (c *Collector) Start(ctx context.Context) {
 					c.mu.Unlock()
 					c.logger.Debug("metrics_report_successful")
 				}
+			} else if c.controlPlaneURL != "" {
+				reportCtx, rCancel := context.WithTimeout(ctx, 10*time.Second)
+				c.transmitHTTP(reportCtx, metrics)
+				rCancel()
 			}
 		}
+	}
+}
+
+type IngestMetricPoint struct {
+	ResourceID   string  `json:"resource_id"`
+	ResourceType string  `json:"resource_type"`
+	MetricName   string  `json:"metric_name"`
+	Value        float64 `json:"value"`
+	Unit         string  `json:"unit"`
+	Timestamp    string  `json:"timestamp,omitempty"`
+}
+
+type IngestMetricBatch struct {
+	NodeID  string              `json:"node_id,omitempty"`
+	Metrics []IngestMetricPoint `json:"metrics"`
+}
+
+func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
+	if c.controlPlaneURL == "" {
+		return
+	}
+
+	sampledIso := metrics.SampledAt.UTC().Format(time.RFC3339)
+	var points []IngestMetricPoint
+
+	// 1. Host Node Level Metrics
+	points = append(points,
+		IngestMetricPoint{
+			ResourceID:   c.nodeID,
+			ResourceType: "node",
+			MetricName:   "cpu_usage_percent",
+			Value:        metrics.CPUUsagePercent,
+			Unit:         "percent",
+			Timestamp:    sampledIso,
+		},
+		IngestMetricPoint{
+			ResourceID:   c.nodeID,
+			ResourceType: "node",
+			MetricName:   "memory_usage_percent",
+			Value:        metrics.MemoryUsagePercent,
+			Unit:         "percent",
+			Timestamp:    sampledIso,
+		},
+		IngestMetricPoint{
+			ResourceID:   c.nodeID,
+			ResourceType: "node",
+			MetricName:   "disk_usage_percent",
+			Value:        metrics.DiskUsagePercent,
+			Unit:         "percent",
+			Timestamp:    sampledIso,
+		},
+	)
+
+	// 2. Container / Workload Level Metrics
+	for shortID, stat := range metrics.ContainerStats {
+		resID := stat.ResourceID
+		if resID == "" {
+			resID = shortID
+		}
+		resType := "application"
+		if stat.Engine != "" {
+			resType = stat.Engine
+		}
+
+		points = append(points,
+			IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "cpu_usage_percent",
+				Value:        stat.CPUUsagePercent,
+				Unit:         "percent",
+				Timestamp:    sampledIso,
+			},
+			IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "memory_usage_bytes",
+				Value:        float64(stat.MemoryUsageBytes),
+				Unit:         "bytes",
+				Timestamp:    sampledIso,
+			},
+		)
+
+		if stat.UptimeSeconds > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "uptime_seconds",
+				Value:        float64(stat.UptimeSeconds),
+				Unit:         "s",
+				Timestamp:    sampledIso,
+			})
+		}
+		if stat.ActiveConnections > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "active_connections",
+				Value:        float64(stat.ActiveConnections),
+				Unit:         "count",
+				Timestamp:    sampledIso,
+			})
+		}
+		if stat.DatabaseSizeBytes > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "database_size_bytes",
+				Value:        float64(stat.DatabaseSizeBytes),
+				Unit:         "bytes",
+				Timestamp:    sampledIso,
+			})
+		}
+		if stat.ConnectedClients > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "connected_clients",
+				Value:        float64(stat.ConnectedClients),
+				Unit:         "count",
+				Timestamp:    sampledIso,
+			})
+		}
+		if stat.CommandsProcessed > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "commands_processed",
+				Value:        float64(stat.CommandsProcessed),
+				Unit:         "count",
+				Timestamp:    sampledIso,
+			})
+		}
+	}
+
+	batch := IngestMetricBatch{
+		NodeID:  c.nodeID,
+		Metrics: points,
+	}
+
+	bodyBytes, err := json.Marshal(batch)
+	if err != nil {
+		c.logger.Warn("metrics_marshal_failed", "error", err)
+		return
+	}
+
+	ingestURL := fmt.Sprintf("%s/v1/monitoring/ingest/metrics", c.controlPlaneURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingestURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.logger.Warn("metrics_request_creation_failed", "error", err)
+		return
+	}
+
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	idempKey := fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+
+	req.Header.Set("Content-Type", "application/json")
+	if c.agentKey != "" {
+		req.Header.Set("X-Agent-Key", c.agentKey)
+	}
+	req.Header.Set("X-Sender-Identity", "agent:"+c.nodeID)
+	req.Header.Set("Idempotency-Key", idempKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.mu.Lock()
+		c.failedCount++
+		c.mu.Unlock()
+		c.logger.Warn("metrics_http_ingest_failed", "error", err, "failed_count", c.failedCount)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		c.mu.Lock()
+		c.failedCount = 0
+		c.mu.Unlock()
+		c.logger.Debug("metrics_http_ingest_successful", "accepted_points", len(points))
+	} else {
+		c.mu.Lock()
+		c.failedCount++
+		c.mu.Unlock()
+		c.logger.Warn("metrics_http_ingest_rejected", "status_code", resp.StatusCode, "failed_count", c.failedCount)
 	}
 }
 

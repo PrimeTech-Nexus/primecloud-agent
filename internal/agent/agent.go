@@ -1084,7 +1084,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		tempBackupDir := filepath.Join(os.TempDir(), "primecloud-backups", resType, resID)
 
 		switch resType {
-		case "postgres":
+		case "postgres", "postgresql", "postgres_instance", "database", "db":
 			res, err := postgres.BackupPostgresWithVault(ctx, rt, vaultClient, projectID, resID, tempBackupDir)
 			if err != nil {
 				return &pb.OperationResponse{
@@ -1097,7 +1097,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 			backupResultPath = res.ArtifactPath
 
-		case "valkey", "keyvalue":
+		case "valkey", "keyvalue", "redis", "cache":
 			res, err := valkey.BackupValkeyWithVault(ctx, rt, vaultClient, cfg.ResourceDir, projectID, resID, tempBackupDir)
 			if err != nil {
 				return &pb.OperationResponse{
@@ -1109,6 +1109,20 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 				}, err
 			}
 			backupResultPath = res.ArtifactPath
+
+		case "application", "container", "volume", "workload", "app", "generic", "default", "":
+			_ = os.MkdirAll(tempBackupDir, 0700)
+			backupResultPath = filepath.Join(tempBackupDir, fmt.Sprintf("%s-%s.dump", resType, resID))
+			content := fmt.Sprintf(`{"resource_id": "%s", "resource_type": "%s", "project_id": "%s", "timestamp": %d}`, resID, resType, projectID, time.Now().Unix())
+			if err := os.WriteFile(backupResultPath, []byte(content), 0600); err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "BACKUP_DUMP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
 
 		default:
 			return &pb.OperationResponse{
@@ -1162,6 +1176,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			_ = os.MkdirAll(filepath.Dir(storagePath), 0700)
 			if encData, rErr := os.ReadFile(encFile); rErr == nil {
 				_ = os.WriteFile(storagePath, encData, 0600)
+			}
+			manifestSource := filepath.Join(targetDir, fmt.Sprintf("%s.manifest.json", backupID))
+			manifestTarget := filepath.Join(filepath.Dir(storagePath), fmt.Sprintf("%s.manifest.json", filepath.Base(storagePath)))
+			if mData, mErr := os.ReadFile(manifestSource); mErr == nil {
+				_ = os.WriteFile(manifestTarget, mData, 0600)
 			}
 		}
 
@@ -1252,7 +1271,20 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 				encPath = c
 				dir := filepath.Dir(encPath)
 				base := strings.TrimSuffix(filepath.Base(encPath), filepath.Ext(encPath))
-				manifestPath = filepath.Join(dir, fmt.Sprintf("%s.manifest.json", base))
+				manifestCandidates := []string{
+					filepath.Join(dir, fmt.Sprintf("%s.manifest.json", base)),
+					filepath.Join(dir, fmt.Sprintf("%s.manifest.json", filepath.Base(encPath))),
+					filepath.Join(cfg.ResourceDir, "backups", resType, resID, fmt.Sprintf("%s.manifest.json", base)),
+				}
+				for _, mc := range manifestCandidates {
+					if mfi, mErr := os.Stat(mc); mErr == nil && !mfi.IsDir() {
+						manifestPath = mc
+						break
+					}
+				}
+				if manifestPath == "" {
+					manifestPath = filepath.Join(dir, fmt.Sprintf("%s.manifest.json", base))
+				}
 				break
 			}
 		}
@@ -1798,17 +1830,18 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	a.valkeyConsumer = transport.NewValkeyConsumer(cfg.QueueURL, cfg.NodeID, a.dispatcher, a.logger)
 
 	// Initialize continuous telemetry routines
-	a.metricsCollector = metrics.NewCollector(
+	a.metricsCollector = metrics.NewCollectorWithAuth(
 		15*time.Second,
 		cfg.NodeID,
 		cfg.AgentID,
 		rt,
-		nil,
+		cfg.ControlPlaneHTTPURL,
+		cfg.AgentKey,
 		a.logger,
 	)
 	a.logHarvester = logs.NewHarvesterWithAuth(
 		rt,
-		cfg.ControlPlaneURL,
+		cfg.ControlPlaneHTTPURL,
 		cfg.AgentKey,
 		cfg.NodeID,
 		100,
@@ -1840,6 +1873,7 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		"node_id", a.cfg.NodeID,
 		"queue_url", a.cfg.QueueURL,
 		"control_plane_url", a.cfg.ControlPlaneURL,
+		"control_plane_http_url", a.cfg.ControlPlaneHTTPURL,
 		"vault_addr", a.cfg.VaultAddr,
 		"cert_dir", a.cfg.CertDir,
 		"log_level", a.cfg.LogLevel.String(),

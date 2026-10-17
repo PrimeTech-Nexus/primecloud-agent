@@ -144,8 +144,13 @@ func NewHarvesterWithAuth(
 	}
 
 	cleanURL := strings.TrimRight(controlPlaneURL, "/")
-	if !strings.HasPrefix(cleanURL, "http://") && !strings.HasPrefix(cleanURL, "https://") {
-		cleanURL = "http://" + cleanURL
+	if cleanURL != "" {
+		if strings.HasSuffix(cleanURL, ":50051") {
+			cleanURL = strings.TrimSuffix(cleanURL, ":50051") + ":8000"
+		}
+		if !strings.HasPrefix(cleanURL, "http://") && !strings.HasPrefix(cleanURL, "https://") {
+			cleanURL = "http://" + cleanURL
+		}
 	}
 
 	return &Harvester{
@@ -430,6 +435,11 @@ func (h *Harvester) transmitBatch(ctx context.Context, batch *BatchWithKey) erro
 
 // HarvestContainer pulls and demultiplexes logs for a container and enqueues them.
 func (h *Harvester) HarvestContainer(ctx context.Context, containerID, resourceID string) error {
+	return h.HarvestContainerWithMetadata(ctx, containerID, resourceID, "", ResourceTypeApplication)
+}
+
+// HarvestContainerWithMetadata pulls and demultiplexes logs for a container with explicit deployment and resource type context.
+func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerID, resourceID, deploymentID, resourceType string) error {
 	if h.rt == nil {
 		return nil
 	}
@@ -448,6 +458,12 @@ func (h *Harvester) HarvestContainer(ctx context.Context, containerID, resourceI
 	for _, item := range items {
 		item.ResourceID = resourceID
 		item.ContainerID = containerID
+		if deploymentID != "" {
+			item.DeploymentID = deploymentID
+		}
+		if resourceType != "" {
+			item.ResourceType = resourceType
+		}
 		h.EnqueueLog(item)
 	}
 
@@ -467,11 +483,20 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 
 	for _, cnt := range containers {
 		resourceID := ""
+		deploymentID := ""
+		resourceType := ResourceTypeApplication
+
 		if cnt.Labels != nil {
 			if rid, ok := cnt.Labels["primecloud.resource_id"]; ok && rid != "" {
 				resourceID = rid
 			} else if rid, ok := cnt.Labels["primecloud.application_id"]; ok && rid != "" {
 				resourceID = rid
+			}
+
+			if did, ok := cnt.Labels["primecloud.deployment_id"]; ok && did != "" {
+				deploymentID = did
+			} else if did, ok := cnt.Labels["primecloud.instance_id"]; ok && did != "" {
+				deploymentID = did
 			}
 		}
 
@@ -479,8 +504,10 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 			cleanName := strings.TrimPrefix(cnt.Names[0], "/")
 			if strings.HasPrefix(cleanName, "pc-pg-") {
 				resourceID = strings.TrimPrefix(cleanName, "pc-pg-")
+				resourceType = ResourceTypeDatabase
 			} else if strings.HasPrefix(cleanName, "pc-vk-") {
 				resourceID = strings.TrimPrefix(cleanName, "pc-vk-")
+				resourceType = ResourceTypeDatabase
 			}
 		}
 
@@ -489,7 +516,7 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 		}
 
 		harvestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := h.HarvestContainer(harvestCtx, cnt.ID, resourceID); err != nil {
+		if err := h.HarvestContainerWithMetadata(harvestCtx, cnt.ID, resourceID, deploymentID, resourceType); err != nil {
 			h.logger.Debug("container_log_harvest_skipped", "container_id", cnt.ID, "error", err)
 		}
 		cancel()
