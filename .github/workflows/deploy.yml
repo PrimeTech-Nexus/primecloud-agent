@@ -199,7 +199,7 @@ jobs:
           DEPLOY_HOST_CLEAN="$(printf '%s' "${DEPLOY_HOST}" | tr -d '\r[:space:]')"
           DEPLOY_USER_CLEAN="$(printf '%s' "${DEPLOY_USER}" | tr -d '\r[:space:]')"
           TAG_CLEAN="$(printf '%s' "${TAG}" | tr -d '\r[:space:]')"
-          CHECKSUM_CLEAN="$(printf '%s' "${CHECKSUM}" | tr -d '\r[:space:]')"
+          CHECKSUM_CLEAN="$(printf '%s' "${CHECKSUM}" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')"
 
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "${KNOWN_HOSTS}" | tr -d '\r' > ~/.ssh/known_hosts
@@ -224,6 +224,16 @@ jobs:
             -o ConnectTimeout=15 \
             dist/release/primecloud-agent-linux-amd64.tar.gz \
             "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}:${STAGED_REMOTE}"
+
+          echo "==> Verifying remote asset permissions and integrity..."
+          ssh -i ~/.ssh/id_deploy \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}" \
+            "chmod 0644 '${STAGED_REMOTE}' && test -s '${STAGED_REMOTE}'"
 
           EXTRA_ARGS=""
           if [ "${DRY_RUN}" = "true" ]; then

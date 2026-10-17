@@ -624,6 +624,186 @@ else
     FAILED_COUNT=$((FAILED_COUNT + 1))
 fi
 
+# Test 18: Successful installation from an explicitly staged CI artifact (no release download)
+echo "Test 18: Successful installation from an explicitly staged CI artifact"
+T18_DIR="${TEST_TMP}/t18"
+mkdir -p "$T18_DIR"
+BIN_T18="${T18_DIR}/primecloud-agent"
+create_mock_agent_binary "$BIN_T18" "v0.3.0" "oldcommit1111"
+
+TARBALL_T18="${T18_DIR}/staged-asset.tar.gz"
+create_release_tarball "$TARBALL_T18" "v0.4.4-main.1111111" "commit1111111"
+T18_SHA=$(sha256sum "$TARBALL_T18" | awk '{print $1}')
+
+# Failing mock curl to guarantee curl is never invoked
+MOCK_CURL_FAIL="${T18_DIR}/mock_curl_fail"
+cat << 'EOF' > "$MOCK_CURL_FAIL"
+#!/usr/bin/env bash
+echo "ERROR: Curl was unexpectedly invoked for a staged artifact deployment!" >&2
+exit 99
+EOF
+chmod 0755 "$MOCK_CURL_FAIL"
+
+MOCK_SYSTEMCTL_T18="${T18_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T18" "success" "active" "${T18_DIR}/sys_state"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="$MOCK_SYSTEMCTL_T18" \
+    PRIMECLOUD_AGENT_BIN="$BIN_T18" \
+    PRIMECLOUD_UPDATE_LOCK="${T18_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    PRIMECLOUD_HEALTH_TIMEOUT=3 \
+    PRIMECLOUD_HEALTH_INTERVAL=1 \
+    bash "$UPDATER" --staged-archive "$TARBALL_T18" v0.4.4-main.1111111 "$T18_SHA" 2>&1)
+code=$?
+set -e
+assert_eq 0 "$code" "Staged artifact update returns exit code 0"
+assert_contains "$output" "Using explicitly staged candidate archive" "Logs explicit staged archive usage"
+assert_contains "$output" "PrimeCloud Agent successfully updated to v0.4.4-main.1111111" "Success logged"
+INSTALLED_VER_T18=$("$BIN_T18" --version)
+assert_contains "$INSTALLED_VER_T18" "v0.4.4-main.1111111" "Installed binary reports correct staged version"
+
+# Test 19: Correct handling of checksum-derived archive filename with case insensitivity
+echo "Test 19: Correct handling of checksum-derived archive filename with case insensitivity"
+T19_DIR="${TEST_TMP}/t19"
+mkdir -p "$T19_DIR"
+BIN_T19="${T19_DIR}/primecloud-agent"
+create_mock_agent_binary "$BIN_T19" "v0.3.0" "oldcommit1111"
+
+TARBALL_T19_RAW="${T19_DIR}/raw-asset.tar.gz"
+create_release_tarball "$TARBALL_T19_RAW" "v0.4.4-main.2222222" "commit2222222"
+T19_SHA_LOWER=$(sha256sum "$TARBALL_T19_RAW" | awk '{print $1}')
+T19_SHA_UPPER=$(echo "$T19_SHA_LOWER" | tr '[:lower:]' '[:upper:]')
+
+# Place in default /tmp/ location with lowercase name
+STAGED_T19="/tmp/primecloud-agent-${T19_SHA_LOWER}.tar.gz"
+cp -f "$TARBALL_T19_RAW" "$STAGED_T19"
+
+MOCK_SYSTEMCTL_T19="${T19_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T19" "success" "active" "${T19_DIR}/sys_state"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="$MOCK_SYSTEMCTL_T19" \
+    PRIMECLOUD_AGENT_BIN="$BIN_T19" \
+    PRIMECLOUD_UPDATE_LOCK="${T19_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    PRIMECLOUD_HEALTH_TIMEOUT=3 \
+    PRIMECLOUD_HEALTH_INTERVAL=1 \
+    bash "$UPDATER" v0.4.4-main.2222222 "$T19_SHA_UPPER" 2>&1)
+code=$?
+set -e
+rm -f "$STAGED_T19"
+assert_eq 0 "$code" "Auto-detected checksum-derived archive returns exit code 0"
+assert_contains "$output" "Found locally staged candidate asset" "Locates checksum-derived file"
+assert_contains "$output" "PrimeCloud Agent successfully updated to v0.4.4-main.2222222" "Updated successfully"
+
+# Test 20: Rejection of missing explicit staged artifact (fail-closed, no release download)
+echo "Test 20: Rejection of missing explicit staged artifact"
+T20_DIR="${TEST_TMP}/t20"
+mkdir -p "$T20_DIR"
+NONEXISTENT_STAGED="${T20_DIR}/nonexistent.tar.gz"
+MOCK_SYSTEMCTL_T20="${T20_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T20" "success" "active" "${T20_DIR}/sys_state"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="$MOCK_SYSTEMCTL_T20" \
+    PRIMECLOUD_AGENT_BIN="${T20_DIR}/primecloud-agent" \
+    PRIMECLOUD_UPDATE_LOCK="${T20_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    bash "$UPDATER" --staged-archive "$NONEXISTENT_STAGED" v0.4.0 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 2>&1)
+code=$?
+set -e
+assert_eq 4 "$code" "Missing explicit staged archive returns exit code 4"
+assert_contains "$output" "Explicitly specified staged archive not found or unreadable" "Reports missing explicit archive"
+
+# Test 21: Rejection of corrupted staged artifact (checksum mismatch fail-closed)
+echo "Test 21: Rejection of corrupted staged artifact"
+T21_DIR="${TEST_TMP}/t21"
+mkdir -p "$T21_DIR"
+CORRUPTED_TARBALL="${T21_DIR}/corrupted.tar.gz"
+echo "corrupted data payload" > "$CORRUPTED_TARBALL"
+EXPECTED_SHA="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+MOCK_SYSTEMCTL_T21="${T21_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T21" "success" "active" "${T21_DIR}/sys_state"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="$MOCK_SYSTEMCTL_T21" \
+    PRIMECLOUD_AGENT_BIN="${T21_DIR}/primecloud-agent" \
+    PRIMECLOUD_UPDATE_LOCK="${T21_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    bash "$UPDATER" --staged-archive "$CORRUPTED_TARBALL" v0.4.0 "$EXPECTED_SHA" 2>&1)
+code=$?
+set -e
+assert_eq 5 "$code" "Corrupted staged artifact returns exit code 5"
+assert_contains "$output" "Cryptographic SHA-256 checksum mismatch" "Reports checksum mismatch on staged artifact"
+
+# Test 22: Rejection of branch-push build when pre-staged artifact is missing (never attempts GitHub Release download)
+echo "Test 22: Rejection of branch-push build without staged artifact"
+T22_DIR="${TEST_TMP}/t22"
+mkdir -p "$T22_DIR"
+MOCK_SYSTEMCTL_T22="${T22_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T22" "success" "active" "${T22_DIR}/sys_state"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="$MOCK_SYSTEMCTL_T22" \
+    PRIMECLOUD_AGENT_BIN="${T22_DIR}/primecloud-agent" \
+    PRIMECLOUD_UPDATE_LOCK="${T22_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    bash "$UPDATER" v0.4.4-main.9999999 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 2>&1)
+code=$?
+set -e
+assert_eq 4 "$code" "Branch build without staged archive returns exit code 4"
+assert_contains "$output" "is a branch-push build which has no GitHub Release asset" "Explains branch build has no release asset"
+
+# Test 23: Rollback if Agent fails health checks during staged artifact installation
+echo "Test 23: Rollback on health check failure during staged artifact installation"
+T23_DIR="${TEST_TMP}/t23"
+mkdir -p "$T23_DIR"
+BIN_T23="${T23_DIR}/primecloud-agent"
+create_mock_agent_binary "$BIN_T23" "v0.3.0" "oldcommit1111"
+
+TARBALL_T23="${T23_DIR}/staged-bad.tar.gz"
+create_release_tarball "$TARBALL_T23" "v0.4.4-main.failcheck" "badcommit1111"
+T23_SHA=$(sha256sum "$TARBALL_T23" | awk '{print $1}')
+
+STATE_T23="${T23_DIR}/sys_state"
+MOCK_SYSTEMCTL_T23="${T23_DIR}/mock_systemctl"
+create_mock_systemctl "$MOCK_SYSTEMCTL_T23" "success" "failed" "$STATE_T23"
+
+cat << EOF > "${T23_DIR}/mock_systemctl_wrapper"
+#!/usr/bin/env bash
+state_dir="${STATE_T23}"
+if [[ "\$1" == "restart" ]]; then
+    count=\$(cat "\${state_dir}/restarts" 2>/dev/null || echo "0")
+    if [[ \$count -ge 1 ]]; then
+        echo "true" > "\${state_dir}/rollback_healthy"
+    fi
+fi
+exec "${MOCK_SYSTEMCTL_T23}" "\$@"
+EOF
+chmod 0755 "${T23_DIR}/mock_systemctl_wrapper"
+
+set +e
+output=$(CURL_CMD="$MOCK_CURL_FAIL" \
+    SYSTEMCTL_CMD="${T23_DIR}/mock_systemctl_wrapper" \
+    PRIMECLOUD_AGENT_BIN="$BIN_T23" \
+    PRIMECLOUD_UPDATE_LOCK="${T23_DIR}/lock" \
+    PRIMECLOUD_TARGET_ARCH="amd64" \
+    PRIMECLOUD_HEALTH_TIMEOUT=3 \
+    PRIMECLOUD_HEALTH_INTERVAL=1 \
+    bash "$UPDATER" --staged-archive "$TARBALL_T23" v0.4.4-main.failcheck "$T23_SHA" 2>&1)
+code=$?
+set -e
+assert_eq 1 "$code" "Health check failure with staged artifact triggers rollback and returns 1"
+assert_contains "$output" "Service successfully rolled back to previous version and is active" "Reports rollback success"
+RESTORED_VER_T23=$("$BIN_T23" --version)
+assert_contains "$RESTORED_VER_T23" "v0.3.0" "Binary restored to old version after rollback"
+
 echo "=============================================================================="
 echo "TEST RESULTS SUMMARY: ${PASSED_COUNT} passed, ${FAILED_COUNT} failed"
 echo "=============================================================================="

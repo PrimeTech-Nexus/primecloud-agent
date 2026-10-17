@@ -40,9 +40,6 @@ cleanup() {
     if [[ -n "${STAGE_BIN:-}" && -f "${STAGE_BIN:-}" ]]; then
         rm -f "${STAGE_BIN}" 2>/dev/null || true
     fi
-    if [[ -n "${STAGED_ARCHIVE:-}" && -f "${STAGED_ARCHIVE:-}" ]]; then
-        rm -f "${STAGED_ARCHIVE}" 2>/dev/null || true
-    fi
     if [[ "${LOCK_HELD}" == "true" ]]; then
         if command -v flock >/dev/null 2>&1; then
             flock -u ${LOCK_FD} 2>/dev/null || true
@@ -78,6 +75,7 @@ Options:
   --lock-file <path>        Lockfile path (default: /run/lock/primecloud-agent-update.lock)
   --arch <amd64|arm64>      Target architecture override (default: auto-detected)
   --timeout <seconds>       Health check timeout in seconds (default: 30)
+  --staged-archive <path>   Use local pre-staged candidate archive instead of downloading
   -n, --dry-run             Validate and download without mutating host binary or restarting service
   -h, --help                Show this help message
 EOF
@@ -85,10 +83,16 @@ EOF
 
 TAG=""
 CHECKSUM=""
+EXPLICIT_STAGED_ARCHIVE=""
 
 # Parse options
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -a|--archive|--staged-archive)
+            [[ $# -lt 2 ]] && { echo "ERROR: --staged-archive requires an argument." >&2; exit 2; }
+            EXPLICIT_STAGED_ARCHIVE="$2"
+            shift 2
+            ;;
         -t|--tag)
             [[ $# -lt 2 ]] && { echo "ERROR: --tag requires an argument." >&2; exit 2; }
             TAG="$2"
@@ -282,12 +286,46 @@ TMP_DIR="$(mktemp -d -t primecloud-agent-update.XXXXXX)"
 chmod 0700 "$TMP_DIR"
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
 
-# Acquire candidate archive: check pre-staged asset first, fallback to HTTPS release download
-STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM}.tar.gz"
-if [[ -f "$STAGED_ARCHIVE" ]]; then
+# Normalize checksum to lower-case for filesystem and comparison
+CHECKSUM_LOWER="$(echo "$CHECKSUM" | tr '[:upper:]' '[:lower:]')"
+
+# Determine candidate archive source
+STAGED_ARCHIVE="${EXPLICIT_STAGED_ARCHIVE:-${PRIMECLOUD_STAGED_ARCHIVE:-}}"
+
+if [[ -z "$STAGED_ARCHIVE" ]]; then
+    # Auto-detect default staged archive location
+    if [[ -f "/tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz" ]]; then
+        STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz"
+    elif [[ -f "/tmp/primecloud-agent-${CHECKSUM}.tar.gz" ]]; then
+        STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM}.tar.gz"
+    fi
+fi
+
+# Detect whether this is a non-release branch build (e.g. v0.4.4-main.<commit>)
+IS_BRANCH_BUILD=false
+if [[ "$TAG" =~ -main\. || "$TAG" =~ -ci\. || "$TAG" =~ -dev\. ]]; then
+    IS_BRANCH_BUILD=true
+fi
+
+if [[ -n "$EXPLICIT_STAGED_ARCHIVE" ]]; then
+    # Caller explicitly requested a staged archive: fail-closed if missing or unreadable
+    if [[ ! -f "$STAGED_ARCHIVE" || ! -r "$STAGED_ARCHIVE" ]]; then
+        echo "ERROR: Explicitly specified staged archive not found or unreadable: ${STAGED_ARCHIVE}" >&2
+        exit 4
+    fi
+    echo "==> Using explicitly staged candidate archive at ${STAGED_ARCHIVE}"
+    cp -f "$STAGED_ARCHIVE" "$ARCHIVE_PATH"
+elif [[ -n "$STAGED_ARCHIVE" ]]; then
+    # Auto-detected staged archive found
     echo "==> Found locally staged candidate asset at ${STAGED_ARCHIVE}"
     cp -f "$STAGED_ARCHIVE" "$ARCHIVE_PATH"
+elif [[ "$IS_BRANCH_BUILD" == "true" ]]; then
+    # Branch build without staged archive: never attempt release download
+    echo "ERROR: Release tag '${TAG}' is a branch-push build which has no GitHub Release asset." >&2
+    echo "       A verified pre-staged archive (/tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz or --staged-archive) is required." >&2
+    exit 4
 else
+    # Genuine release tag without staged artifact: download release asset from GitHub Releases
     echo "==> Downloading release asset from ${DOWNLOAD_URL}..."
     if ! "$CURL_CMD" -fsSL --proto '=https' --tlsv1.2 --max-time 120 --retry 3 --retry-delay 2 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"; then
         echo "ERROR: Failed to download release asset from ${DOWNLOAD_URL}" >&2
@@ -298,7 +336,7 @@ fi
 # Verify SHA-256 checksum
 echo "==> Verifying SHA-256 checksum..."
 ACTUAL_SHA="$("$SHA256SUM_CMD" "$ARCHIVE_PATH" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-EXPECTED_SHA="$(echo "$CHECKSUM" | tr '[:upper:]' '[:lower:]')"
+EXPECTED_SHA="${CHECKSUM_LOWER}"
 
 if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
     echo "ERROR: Cryptographic SHA-256 checksum mismatch!" >&2

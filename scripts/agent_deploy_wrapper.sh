@@ -12,17 +12,23 @@ IFS=$'\n\t'
 DRY_RUN=false
 TAG=""
 CHECKSUM=""
+STAGED_ARCHIVE=""
 
-# 1. Parse and validate arguments (strictly accepts [--dry-run] <TAG> <CHECKSUM>)
+# 1. Parse and validate arguments (accepts [--dry-run] [--staged-archive <PATH>] <TAG> <CHECKSUM>)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run|-n)
             DRY_RUN=true
             shift
             ;;
+        -a|--archive|--staged-archive)
+            [[ $# -lt 2 ]] && { echo "==> [SECURITY REJECTION] --staged-archive requires an argument." >&2; exit 1; }
+            STAGED_ARCHIVE="$2"
+            shift 2
+            ;;
         -*)
             echo "==> [SECURITY REJECTION] Unknown flag or option: '$1'" >&2
-            echo "    Usage: $0 [--dry-run] <TAG> <SHA256_CHECKSUM>" >&2
+            echo "    Usage: $0 [--dry-run] [--staged-archive <PATH>] <TAG> <SHA256_CHECKSUM>" >&2
             exit 1
             ;;
         *)
@@ -32,7 +38,7 @@ while [[ $# -gt 0 ]]; do
                 CHECKSUM="$1"
             else
                 echo "==> [SECURITY REJECTION] Too many arguments provided." >&2
-                echo "    Usage: $0 [--dry-run] <TAG> <SHA256_CHECKSUM>" >&2
+                echo "    Usage: $0 [--dry-run] [--staged-archive <PATH>] <TAG> <SHA256_CHECKSUM>" >&2
                 exit 1
             fi
             shift
@@ -42,7 +48,7 @@ done
 
 if [[ -z "$TAG" || -z "$CHECKSUM" ]]; then
     echo "==> [SECURITY REJECTION] Both release tag and SHA-256 checksum are required." >&2
-    echo "    Usage: $0 [--dry-run] <TAG> <SHA256_CHECKSUM>" >&2
+    echo "    Usage: $0 [--dry-run] [--staged-archive <PATH>] <TAG> <SHA256_CHECKSUM>" >&2
     exit 1
 fi
 
@@ -93,14 +99,46 @@ if [[ "${PRIMECLOUD_ENV:-}" != "test" ]]; then
     fi
 fi
 
-# 6. Delegate execution to update-agent.sh with locked arguments
+# 6. Candidate archive resolution and integrity pre-check
+CHECKSUM_LOWER="$(printf '%s' "$CHECKSUM" | tr '[:upper:]' '[:lower:]')"
+SHA256SUM_BIN="${SHA256SUM_CMD:-sha256sum}"
+
+if [[ -z "$STAGED_ARCHIVE" ]]; then
+    if [[ -f "/tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz" ]]; then
+        STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz"
+    elif [[ -f "/tmp/primecloud-agent-${CHECKSUM}.tar.gz" ]]; then
+        STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM}.tar.gz"
+    fi
+fi
+
 EXTRA_ARGS=()
 if [[ "$DRY_RUN" == "true" ]]; then
     EXTRA_ARGS+=("--dry-run")
 fi
 
+if [[ -n "$STAGED_ARCHIVE" ]]; then
+    if [[ ! -f "$STAGED_ARCHIVE" || ! -s "$STAGED_ARCHIVE" ]]; then
+        echo "==> [SECURITY REJECTION] Candidate archive is missing, empty, or not a regular file: ${STAGED_ARCHIVE}" >&2
+        exit 1
+    fi
+    if command -v "$SHA256SUM_BIN" >/dev/null 2>&1; then
+        ACTUAL_SHA="$("$SHA256SUM_BIN" "$STAGED_ARCHIVE" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        if [[ "$ACTUAL_SHA" != "$CHECKSUM_LOWER" ]]; then
+            echo "==> [SECURITY REJECTION] Candidate archive SHA-256 does not match expected checksum!" >&2
+            echo "    Expected: ${CHECKSUM_LOWER}" >&2
+            echo "    Actual:   ${ACTUAL_SHA}" >&2
+            exit 1
+        fi
+    fi
+    EXTRA_ARGS+=("--staged-archive" "$STAGED_ARCHIVE")
+    echo "==> [ENTRYPOINT] Validated candidate staged archive: ${STAGED_ARCHIVE}"
+elif [[ "$TAG" =~ -main\. || "$TAG" =~ -ci\. || "$TAG" =~ -dev\. ]]; then
+    echo "==> [SECURITY REJECTION] Branch deployment '${TAG}' requires a pre-staged candidate archive at /tmp/primecloud-agent-${CHECKSUM_LOWER}.tar.gz, but none was found!" >&2
+    exit 1
+fi
+
 echo "==> [ENTRYPOINT] Validated release tag: ${TAG}"
-echo "==> [ENTRYPOINT] Validated SHA-256 checksum: ${CHECKSUM}"
+echo "==> [ENTRYPOINT] Validated SHA-256 checksum: ${CHECKSUM_LOWER}"
 echo "==> [ENTRYPOINT] Executing ${UPDATER_SCRIPT}..."
 
 exec "${UPDATER_SCRIPT}" "${EXTRA_ARGS[@]}" "${TAG}" "${CHECKSUM}"
