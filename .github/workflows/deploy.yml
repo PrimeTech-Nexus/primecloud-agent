@@ -1,14 +1,20 @@
 name: Deploy PrimeCloud Agent to Production
 
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to deploy (e.g. v0.4.0)'
-        required: true
+        description: 'Release tag or version override (e.g. v0.4.4)'
+        required: false
         type: string
+        default: ''
       dry_run:
         description: 'Execute in dry-run mode (validate without modifying host)'
         required: false
@@ -18,12 +24,130 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: production-deployment-pc-node-001-agent
+  cancel-in-progress: false
+
 jobs:
+  build-and-verify:
+    name: Build & Verify Agent Binary
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve-metadata.outputs.tag }}
+      commit_sha: ${{ steps.resolve-metadata.outputs.commit_sha }}
+      checksum: ${{ steps.package-asset.outputs.checksum }}
+      asset_name: ${{ steps.package-asset.outputs.asset_name }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Verify Formatting (gofmt)
+        run: |
+          UNFORMATTED=$(gofmt -l . || true)
+          if [ -n "${UNFORMATTED}" ]; then
+            echo "::error::The following Go files are not properly formatted:"
+            echo "${UNFORMATTED}"
+            exit 1
+          fi
+          echo "gofmt verification passed."
+
+      - name: Run Go Vet
+        run: |
+          go vet ./...
+
+      - name: Run Go Tests
+        run: |
+          go test -v ./...
+
+      - name: Resolve Build Version and Metadata
+        id: resolve-metadata
+        run: |
+          COMMIT="${GITHUB_SHA}"
+          COMMIT_SHORT="${COMMIT:0:7}"
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RAW_TAG="${{ github.event.release.tag_name }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            RAW_TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            RAW_TAG="v0.4.4-main.${COMMIT_SHORT}"
+          fi
+
+          TAG_CLEAN="$(printf '%s' "${RAW_TAG}" | tr -d '\r[:space:]')"
+
+          if [[ ! "${TAG_CLEAN}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag format: '${TAG_CLEAN}'. Must follow SemVer (e.g. v0.4.4)."
+            exit 1
+          fi
+
+          echo "tag=${TAG_CLEAN}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "commit_short=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Tag: ${TAG_CLEAN}"
+          echo "Resolved Commit: ${COMMIT}"
+
+      - name: Cross-Compile Linux AMD64 Binary
+        env:
+          TAG: ${{ steps.resolve-metadata.outputs.tag }}
+          COMMIT: ${{ steps.resolve-metadata.outputs.commit_sha }}
+        run: |
+          mkdir -p dist/amd64 dist/release
+          GO_LDFLAGS="-s -w -X main.Version=${TAG} -X main.CommitSHA=${COMMIT}"
+          echo "Compiling Linux AMD64 binary with ldflags: ${GO_LDFLAGS}"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${GO_LDFLAGS}" -o dist/amd64/primecloud-agent ./cmd/agent
+          chmod 0755 dist/amd64/primecloud-agent
+
+      - name: Package Release Tarball and Generate SHA256SUMS Manifest
+        id: package-asset
+        run: |
+          ASSET_NAME="primecloud-agent-linux-amd64.tar.gz"
+          tar -czf "dist/release/${ASSET_NAME}" -C dist/amd64 primecloud-agent
+
+          cd dist/release
+          sha256sum "${ASSET_NAME}" > SHA256SUMS
+
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+          CHECKSUM=$(awk '{print $1}' SHA256SUMS | tr -d '\r[:space:]')
+          if [[ ! "${CHECKSUM}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Generated checksum '${CHECKSUM}' is not a valid 64-character SHA-256 hex string!"
+            exit 1
+          fi
+
+          echo "checksum=${CHECKSUM}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Verified Package SHA-256: ${CHECKSUM} (${ASSET_NAME})"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: primecloud-agent-linux-amd64
+          path: |
+            dist/release/primecloud-agent-linux-amd64.tar.gz
+            dist/release/SHA256SUMS
+          retention-days: 14
+
   deploy-production:
     name: Deploy to Production (pc-node-001)
+    needs: [build-and-verify]
     if: >-
-      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) ||
-      (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
+      github.event_name != 'pull_request' && (
+        (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+        (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) ||
+        (github.event_name == 'workflow_dispatch')
+      )
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -33,80 +157,34 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
+          name: primecloud-agent-linux-amd64
+          path: dist/release
 
-      - name: Resolve and Validate Target Release Tag
-        id: resolve-tag
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          else
-            TAG="${{ github.event.inputs.tag }}"
-          fi
-
-          TAG_CLEAN="$(printf '%s' "${TAG}" | tr -d '\r[:space:]')"
-
-          if [ -z "${TAG_CLEAN}" ]; then
-            echo "::error::Target release tag is empty! Aborting deployment."
-            exit 1
-          fi
-
-          if [[ ! "${TAG_CLEAN}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Invalid release tag format: '${TAG_CLEAN}'. Must follow SemVer (e.g. v0.4.0)."
-            exit 1
-          fi
-
-          echo "tag=${TAG_CLEAN}" >> "$GITHUB_OUTPUT"
-          echo "Target Release Tag: ${TAG_CLEAN}"
-
-      - name: Retrieve and Verify Release Checksum
-        id: resolve-checksum
+      - name: Verify Local Artifact Integrity
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.resolve-tag.outputs.tag }}
+          EXPECTED_CHECKSUM: ${{ needs.build-and-verify.outputs.checksum }}
         run: |
-          echo "Fetching release metadata for tag ${TAG}..."
-          mkdir -p /tmp/release-manifest
-          cd /tmp/release-manifest
-
-          if ! gh release download "${TAG}" --pattern "SHA256SUMS" --repo "${{ github.repository }}"; then
-            echo "::error::Failed to download SHA256SUMS manifest for release ${TAG}!"
+          cd dist/release
+          if [ ! -s SHA256SUMS ] || [ ! -s primecloud-agent-linux-amd64.tar.gz ]; then
+            echo "::error::Required deployment artifact or SHA256SUMS missing!"
             exit 1
           fi
-
-          if [ ! -s "SHA256SUMS" ]; then
-            echo "::error::Downloaded SHA256SUMS manifest is empty or missing!"
+          sha256sum -c SHA256SUMS
+          ACTUAL_SHA=$(sha256sum primecloud-agent-linux-amd64.tar.gz | awk '{print $1}')
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_CHECKSUM}" ]; then
+            echo "::error::Checksum mismatch between build output (${EXPECTED_CHECKSUM}) and downloaded artifact (${ACTUAL_SHA})!"
             exit 1
           fi
-
-          # Locate target architecture asset checksum for pc-node-001 (linux-amd64)
-          ASSET_NAME="primecloud-agent-linux-amd64.tar.gz"
-          MATCHES=$(grep -E "${ASSET_NAME}\$" SHA256SUMS || true)
-
-          MATCH_COUNT=$(printf '%s\n' "${MATCHES}" | grep -c .) || true
-          if [ "${MATCH_COUNT}" -ne 1 ]; then
-            echo "::error::Expected exactly one checksum for ${ASSET_NAME} in SHA256SUMS, found ${MATCH_COUNT}!"
-            exit 1
-          fi
-
-          CHECKSUM=$(printf '%s' "${MATCHES}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r[:space:]')
-
-          if [[ ! "${CHECKSUM}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Parsed checksum '${CHECKSUM}' is not a valid 64-character SHA-256 hex string!"
-            exit 1
-          fi
-
-          echo "checksum=${CHECKSUM}" >> "$GITHUB_OUTPUT"
-          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Verified Release Checksum: ${CHECKSUM} (${ASSET_NAME})"
+          echo "Verified candidate artifact integrity: ${ACTUAL_SHA}"
 
       - name: Execute Remote Deployment via Hardened Wrapper
         env:
-          TAG: ${{ steps.resolve-tag.outputs.tag }}
-          CHECKSUM: ${{ steps.resolve-checksum.outputs.checksum }}
+          TAG: ${{ needs.build-and-verify.outputs.tag }}
+          CHECKSUM: ${{ needs.build-and-verify.outputs.checksum }}
+          COMMIT_SHA: ${{ needs.build-and-verify.outputs.commit_sha }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           DEPLOY_HOST: ${{ secrets.PROD_HOST }}
           DEPLOY_USER: ${{ secrets.PROD_SSH_USER }}
@@ -136,6 +214,17 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           trap 'rm -f ~/.ssh/id_deploy ~/.ssh/known_hosts' EXIT
 
+          STAGED_REMOTE="/tmp/primecloud-agent-${CHECKSUM_CLEAN}.tar.gz"
+          echo "==> Transferring candidate asset to ${DEPLOY_HOST_CLEAN}:${STAGED_REMOTE}..."
+          scp -i ~/.ssh/id_deploy \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            dist/release/primecloud-agent-linux-amd64.tar.gz \
+            "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}:${STAGED_REMOTE}"
+
           EXTRA_ARGS=""
           if [ "${DRY_RUN}" = "true" ]; then
             EXTRA_ARGS="--dry-run"
@@ -159,13 +248,16 @@ jobs:
             {
               echo "### PrimeCloud Agent Production Deployment Summary"
               echo "- **Status:** ${{ job.status }}"
-              echo "- **Target Release Tag:** \`${{ steps.resolve-tag.outputs.tag || 'none' }}\`"
+              echo "- **Target Release Tag / Version:** \`${{ needs.build-and-verify.outputs.tag || 'none' }}\`"
+              echo "- **Commit SHA:** \`${{ needs.build-and-verify.outputs.commit_sha || github.sha }}\`"
               echo "- **Target Architecture:** \`linux-amd64\`"
-              echo "- **Target Asset:** \`${{ steps.resolve-checksum.outputs.asset_name || 'primecloud-agent-linux-amd64.tar.gz' }}\`"
-              echo "- **Verified Checksum:** \`${{ steps.resolve-checksum.outputs.checksum || 'none' }}\`"
+              echo "- **Target Asset:** \`${{ needs.build-and-verify.outputs.asset_name || 'primecloud-agent-linux-amd64.tar.gz' }}\`"
+              echo "- **Verified Checksum:** \`${{ needs.build-and-verify.outputs.checksum || 'none' }}\`"
+              echo "- **Trigger Event:** \`${{ github.event_name }}\`"
+              echo "- **Ref:** \`${{ github.ref }}\`"
               echo "- **Dry-Run Mode:** \`${{ github.event.inputs.dry_run || 'false' }}\`"
               echo "- **Target Host:** \`pc-node-001\`"
               echo "- **Target Service:** \`primecloud-agent.service\`"
-              echo "- **Service Health Note:** Service liveness was verified via systemd. Remote Control Plane registration and Valkey queue consumption require valid configuration in \`/etc/primecloud/agent.env\` and external connectivity."
+              echo "- **Rollback Invariant:** Automated rollback restores \`/usr/local/bin/primecloud-agent.bak\` and restarts the service if health checks fail."
             } >> "$GITHUB_STEP_SUMMARY"
           fi

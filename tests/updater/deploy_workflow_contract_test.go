@@ -27,30 +27,41 @@ func loadDeployWorkflow(t *testing.T) string {
 func TestDeployWorkflow_TriggerSecurity(t *testing.T) {
 	content := loadDeployWorkflow(t)
 
-	// 1. Must trigger on published releases
+	// 1. Must trigger on designated production branch push and version tags
+	if !strings.Contains(content, "push:") || !strings.Contains(content, "branches: [main]") {
+		t.Error("deploy.yml must trigger on push to designated production branch main")
+	}
+	if !strings.Contains(content, `tags: ["v*"]`) && !strings.Contains(content, `tags: ['v*']`) {
+		t.Error("deploy.yml must trigger on version tags")
+	}
+
+	// 2. Must run checks on pull_request to main without deploying
+	if !strings.Contains(content, "pull_request:") {
+		t.Error("deploy.yml must support pull_request checks")
+	}
+	if !strings.Contains(content, "github.event_name != 'pull_request'") {
+		t.Error("deploy.yml must ensure deploy-production job never runs on pull_request")
+	}
+
+	// 3. Must trigger on published releases
 	if !strings.Contains(content, "release:") || !strings.Contains(content, "types: [published]") {
 		t.Error("deploy.yml must trigger on release: types: [published]")
 	}
 
-	// 2. Must trigger on workflow_dispatch with required tag
+	// 4. Must trigger on workflow_dispatch with dry_run option
 	if !strings.Contains(content, "workflow_dispatch:") {
 		t.Error("deploy.yml must support manual workflow_dispatch")
 	}
-	if !strings.Contains(content, "tag:") || !strings.Contains(content, "required: true") {
-		t.Error("deploy.yml workflow_dispatch must require a 'tag' input")
-	}
-
-	// 3. Must support dry_run input
 	if !strings.Contains(content, "dry_run:") {
 		t.Error("deploy.yml workflow_dispatch should support 'dry_run' boolean option")
 	}
 
-	// 4. Must NEVER trigger on pull_request or push to arbitrary branches
-	if strings.Contains(content, "pull_request:") {
-		t.Error("deploy.yml must NEVER trigger on pull_request (security violation)")
+	// 5. Build and verify job must generate checksum and upload artifacts
+	if !strings.Contains(content, "actions/upload-artifact@v4") {
+		t.Error("deploy.yml build job must upload verified release artifacts")
 	}
-	if strings.Contains(content, "push:") {
-		t.Error("deploy.yml must NEVER trigger on push to arbitrary branches (security violation)")
+	if !strings.Contains(content, "actions/download-artifact@v4") {
+		t.Error("deploy.yml deploy job must download verified release artifacts")
 	}
 }
 

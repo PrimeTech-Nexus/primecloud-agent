@@ -28,6 +28,8 @@ JOURNALCTL_CMD="${JOURNALCTL_CMD:-journalctl}"
 
 # Global tracking variables for cleanup and rollback
 TMP_DIR=""
+STAGE_BIN=""
+STAGED_ARCHIVE=""
 LOCK_HELD=false
 LOCK_FD=200
 cleanup() {
@@ -37,6 +39,9 @@ cleanup() {
     fi
     if [[ -n "${STAGE_BIN:-}" && -f "${STAGE_BIN:-}" ]]; then
         rm -f "${STAGE_BIN}" 2>/dev/null || true
+    fi
+    if [[ -n "${STAGED_ARCHIVE:-}" && -f "${STAGED_ARCHIVE:-}" ]]; then
+        rm -f "${STAGED_ARCHIVE}" 2>/dev/null || true
     fi
     if [[ "${LOCK_HELD}" == "true" ]]; then
         if command -v flock >/dev/null 2>&1; then
@@ -277,11 +282,17 @@ TMP_DIR="$(mktemp -d -t primecloud-agent-update.XXXXXX)"
 chmod 0700 "$TMP_DIR"
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
 
-# Download release archive over HTTPS
-echo "==> Downloading release asset from ${DOWNLOAD_URL}..."
-if ! "$CURL_CMD" -fsSL --proto '=https' --tlsv1.2 --max-time 120 --retry 3 --retry-delay 2 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"; then
-    echo "ERROR: Failed to download release asset from ${DOWNLOAD_URL}" >&2
-    exit 4
+# Acquire candidate archive: check pre-staged asset first, fallback to HTTPS release download
+STAGED_ARCHIVE="/tmp/primecloud-agent-${CHECKSUM}.tar.gz"
+if [[ -f "$STAGED_ARCHIVE" ]]; then
+    echo "==> Found locally staged candidate asset at ${STAGED_ARCHIVE}"
+    cp -f "$STAGED_ARCHIVE" "$ARCHIVE_PATH"
+else
+    echo "==> Downloading release asset from ${DOWNLOAD_URL}..."
+    if ! "$CURL_CMD" -fsSL --proto '=https' --tlsv1.2 --max-time 120 --retry 3 --retry-delay 2 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"; then
+        echo "ERROR: Failed to download release asset from ${DOWNLOAD_URL}" >&2
+        exit 4
+    fi
 fi
 
 # Verify SHA-256 checksum
