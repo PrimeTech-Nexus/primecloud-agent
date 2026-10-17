@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: production-deployment-pc-node-001-agent
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -76,8 +76,8 @@ jobs:
 
           if [ "${{ github.event_name }}" = "release" ]; then
             RAW_TAG="${{ github.event.release.tag_name }}"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
-            RAW_TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            RAW_TAG="${{ inputs.tag }}"
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           else
@@ -185,7 +185,7 @@ jobs:
           TAG: ${{ needs.build-and-verify.outputs.tag }}
           CHECKSUM: ${{ needs.build-and-verify.outputs.checksum }}
           COMMIT_SHA: ${{ needs.build-and-verify.outputs.commit_sha }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
           DEPLOY_HOST: ${{ secrets.PROD_HOST }}
           DEPLOY_USER: ${{ secrets.PROD_SSH_USER }}
           DEPLOY_KEY: ${{ secrets.PROD_SSH_KEY }}
@@ -255,7 +255,7 @@ jobs:
               echo "- **Verified Checksum:** \`${{ needs.build-and-verify.outputs.checksum || 'none' }}\`"
               echo "- **Trigger Event:** \`${{ github.event_name }}\`"
               echo "- **Ref:** \`${{ github.ref }}\`"
-              echo "- **Dry-Run Mode:** \`${{ github.event.inputs.dry_run || 'false' }}\`"
+              echo "- **Dry-Run Mode:** \`${{ inputs.dry_run || false }}\`"
               echo "- **Target Host:** \`pc-node-001\`"
               echo "- **Target Service:** \`primecloud-agent.service\`"
               echo "- **Rollback Invariant:** Automated rollback restores \`/usr/local/bin/primecloud-agent.bak\` and restarts the service if health checks fail."
