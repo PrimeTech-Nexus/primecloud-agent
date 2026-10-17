@@ -214,6 +214,22 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           trap 'rm -f ~/.ssh/id_deploy ~/.ssh/known_hosts' EXIT
 
+          echo "==> Verifying target host filesystem capacity on /tmp..."
+          AVAIL_KB=$(ssh -i ~/.ssh/id_deploy \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}" \
+            "df -k /tmp | awk 'NR>1 {print \$4}'" | tr -d '\r[:space:]')
+
+          if [ -z "${AVAIL_KB}" ] || [ "${AVAIL_KB}" -lt 51200 ]; then
+            echo "::error::Target host filesystem (/tmp) has insufficient free space (Available: ${AVAIL_KB:-0} KB, minimum required: 51200 KB). Aborting deployment to prevent partial transfer failure."
+            exit 1
+          fi
+          echo "Target host capacity verified: ${AVAIL_KB} KB available on /tmp."
+
           STAGED_REMOTE="/tmp/primecloud-agent-${CHECKSUM_CLEAN}.tar.gz"
           echo "==> Transferring candidate asset to ${DEPLOY_HOST_CLEAN}:${STAGED_REMOTE}..."
           scp -i ~/.ssh/id_deploy \
@@ -225,15 +241,29 @@ jobs:
             dist/release/primecloud-agent-linux-amd64.tar.gz \
             "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}:${STAGED_REMOTE}"
 
-          echo "==> Verifying remote asset permissions and integrity..."
-          ssh -i ~/.ssh/id_deploy \
+          echo "==> Verifying remote asset permissions and cryptographic checksum..."
+          REMOTE_SHA=$(ssh -i ~/.ssh/id_deploy \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}" \
-            "chmod 0644 '${STAGED_REMOTE}' && test -s '${STAGED_REMOTE}'"
+            "chmod 0644 '${STAGED_REMOTE}' && test -s '${STAGED_REMOTE}' && sha256sum '${STAGED_REMOTE}' | awk '{print \$1}'" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')
+
+          if [ "${REMOTE_SHA}" != "${CHECKSUM_CLEAN}" ]; then
+            echo "::error::Remote candidate asset checksum mismatch! Expected: ${CHECKSUM_CLEAN}, got: ${REMOTE_SHA}"
+            ssh -i ~/.ssh/id_deploy \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              "${DEPLOY_USER_CLEAN}@${DEPLOY_HOST_CLEAN}" \
+              "rm -f '${STAGED_REMOTE}'" || true
+            exit 1
+          fi
+          echo "Verified remote asset SHA-256 matches build checksum: ${REMOTE_SHA}"
 
           EXTRA_ARGS=""
           if [ "${DRY_RUN}" = "true" ]; then

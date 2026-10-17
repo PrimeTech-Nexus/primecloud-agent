@@ -187,3 +187,31 @@ func TestDeployWorkflow_AuditSummary(t *testing.T) {
 		}
 	}
 }
+
+func TestDeployWorkflow_ArtifactTransferSafety(t *testing.T) {
+	content := loadDeployWorkflow(t)
+
+	// 1. Must perform pre-flight filesystem capacity check before transferring
+	if !strings.Contains(content, "df -k /tmp") {
+		t.Error("deploy.yml must verify remote filesystem capacity on /tmp before transferring")
+	}
+	if !strings.Contains(content, "insufficient free space") {
+		t.Error("deploy.yml must fail closed if remote filesystem capacity is insufficient")
+	}
+
+	// 2. Must transfer candidate asset via scp with strict host key checking
+	if !strings.Contains(content, "scp -i ~/.ssh/id_deploy") {
+		t.Error("deploy.yml must transfer asset using scp with deployment identity")
+	}
+	if !strings.Contains(content, "dist/release/primecloud-agent-linux-amd64.tar.gz") {
+		t.Error("deploy.yml must transfer dist/release/primecloud-agent-linux-amd64.tar.gz")
+	}
+
+	// 3. Must verify remote candidate asset checksum post-transfer
+	if !strings.Contains(content, "sha256sum '${STAGED_REMOTE}'") {
+		t.Error("deploy.yml must verify remote candidate asset SHA-256 after transfer")
+	}
+	if !strings.Contains(content, "Remote candidate asset checksum mismatch!") {
+		t.Error("deploy.yml must fail closed on remote checksum mismatch")
+	}
+}
