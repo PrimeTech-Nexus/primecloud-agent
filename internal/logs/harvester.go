@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,13 @@ func GenerateUUIDv4() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// containerCursor tracks harvesting progress and deduplication state for a specific container.
+type containerCursor struct {
+	lastTimestamp time.Time
+	seenCounts    map[string]int // Disambiguates identical timestamps at boundary
+	lastSeenAt    time.Time      // Pruning timestamp for stopped/removed containers
+}
+
 // Harvester tails application containers and streams redacted logs.
 type Harvester struct {
 	mu              sync.Mutex
@@ -110,6 +118,10 @@ type Harvester struct {
 	buffer          []LogItem
 	inflight        *BatchWithKey // Pending batch awaiting acknowledgment or retry
 	maxBuffer       int
+
+	cursors      map[string]*containerCursor
+	droppedCount int64 // Dropped in current flush cycle
+	totalDropped int64 // Cumulative lifetime dropped entries
 }
 
 // NewHarvester constructs a Harvester instance.
@@ -164,7 +176,36 @@ func NewHarvesterWithAuth(
 		buffer:          make([]LogItem, 0, batchSize),
 		maxBuffer:       MaxBufferLimit,
 		logger:          logger.With("component", "log_harvester"),
+		cursors:         make(map[string]*containerCursor),
 	}
+}
+
+// DroppedCount returns the count of dropped log items in the current flush cycle.
+func (h *Harvester) DroppedCount() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.droppedCount
+}
+
+// TotalDropped returns the cumulative lifetime count of log items dropped due to backpressure.
+func (h *Harvester) TotalDropped() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.totalDropped
+}
+
+// GetCursor returns the recorded cursor timestamp and whether a cursor exists for the container.
+func (h *Harvester) GetCursor(containerID string) (time.Time, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cursors == nil {
+		return time.Time{}, false
+	}
+	cur, ok := h.cursors[containerID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return cur.lastTimestamp, true
 }
 
 // RedactSecrets applies regex masking to sensitive log content.
@@ -227,7 +268,10 @@ func NormalizeStream(stream string) string {
 func (h *Harvester) EnqueueLog(item LogItem) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.enqueueLogLocked(item)
+}
 
+func (h *Harvester) enqueueLogLocked(item LogItem) {
 	// Redact message secrets
 	item.Message = RedactSecrets(item.Message)
 	if len(item.Message) > MaxMessageLength {
@@ -241,10 +285,12 @@ func (h *Harvester) EnqueueLog(item LogItem) {
 	item.Stream = NormalizeStream(item.Stream)
 	item.Severity = NormalizeSeverity(item.Severity)
 
-	// Backpressure: drop oldest logs if buffer exceeds max limit
+	// Backpressure: drop oldest logs if buffer exceeds max limit.
+	// Warning is aggregated and logged once per Flush() cycle to prevent log flood.
 	if len(h.buffer) >= h.maxBuffer {
 		h.buffer = h.buffer[1:]
-		h.logger.Warn("log_buffer_backpressure_drop_oldest")
+		h.droppedCount++
+		h.totalDropped++
 	}
 
 	h.buffer = append(h.buffer, item)
@@ -321,11 +367,33 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 		if trimmed == "" {
 			continue
 		}
+
+		ts := now
+		msg := trimmed
+		parts := strings.SplitN(trimmed, " ", 2)
+		if len(parts) == 2 {
+			if parsedTS, parseErr := time.Parse(time.RFC3339Nano, parts[0]); parseErr == nil {
+				ts = parsedTS
+				msg = parts[1]
+			} else if parsedTS, parseErr := time.Parse(time.RFC3339, parts[0]); parseErr == nil {
+				ts = parsedTS
+				msg = parts[1]
+			}
+		}
+
+		sev := SeverityInfo
+		lowerMsg := strings.ToLower(msg)
+		if strings.Contains(lowerMsg, "error") || strings.Contains(lowerMsg, "fatal") || strings.Contains(lowerMsg, "panic") {
+			sev = SeverityError
+		} else if strings.Contains(lowerMsg, "warn") {
+			sev = SeverityWarn
+		}
+
 		fallbackItems = append(fallbackItems, LogItem{
 			Stream:    NormalizeStream(fallbackStream),
-			Severity:  SeverityInfo,
-			Message:   trimmed,
-			Timestamp: &now,
+			Severity:  sev,
+			Message:   msg,
+			Timestamp: &ts,
 		})
 	}
 
@@ -336,6 +404,9 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 // Retries of the same batch NEVER generate a new Idempotency-Key.
 func (h *Harvester) Flush(ctx context.Context) error {
 	h.mu.Lock()
+	droppedInCycle := h.droppedCount
+	h.droppedCount = 0
+	totalDropped := h.totalDropped
 
 	// If there is an existing inflight batch that previously failed, prioritize sending it with its original key
 	var currentBatch BatchWithKey
@@ -344,6 +415,13 @@ func (h *Harvester) Flush(ctx context.Context) error {
 	} else {
 		if len(h.buffer) == 0 {
 			h.mu.Unlock()
+			if droppedInCycle > 0 {
+				h.logger.Warn("log_buffer_backpressure_drop_summary",
+					"dropped_count", droppedInCycle,
+					"total_dropped", totalDropped,
+					"buffer_capacity", h.maxBuffer,
+				)
+			}
 			return nil
 		}
 
@@ -362,6 +440,14 @@ func (h *Harvester) Flush(ctx context.Context) error {
 		h.inflight = &currentBatch
 	}
 	h.mu.Unlock()
+
+	if droppedInCycle > 0 {
+		h.logger.Warn("log_buffer_backpressure_drop_summary",
+			"dropped_count", droppedInCycle,
+			"total_dropped", totalDropped,
+			"buffer_capacity", h.maxBuffer,
+		)
+	}
 
 	// Transmit batch with stable key
 	err := h.transmitBatch(ctx, &currentBatch)
@@ -444,7 +530,32 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		return nil
 	}
 
-	reader, err := h.rt.GetContainerLogs(ctx, containerID)
+	h.mu.Lock()
+	if h.cursors == nil {
+		h.cursors = make(map[string]*containerCursor)
+	}
+	cursor, exists := h.cursors[containerID]
+	if !exists {
+		cursor = &containerCursor{
+			seenCounts: make(map[string]int),
+			lastSeenAt: time.Now(),
+		}
+		h.cursors[containerID] = cursor
+	} else {
+		cursor.lastSeenAt = time.Now()
+	}
+	since := cursor.lastTimestamp
+	h.mu.Unlock()
+
+	var reader io.ReadCloser
+	var err error
+
+	// If runtime supports incremental log reading, query since cursor timestamp
+	if incReader, ok := h.rt.(agentruntime.IncrementalLogReader); ok && !since.IsZero() {
+		reader, err = incReader.GetContainerLogsSince(ctx, containerID, since)
+	} else {
+		reader, err = h.rt.GetContainerLogs(ctx, containerID)
+	}
 	if err != nil {
 		return err
 	}
@@ -455,7 +566,59 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		return err
 	}
 
+	// Sort items by timestamp to ensure chronological processing across demultiplexed streams
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Timestamp == nil || items[j].Timestamp == nil {
+			return false
+		}
+		return items[i].Timestamp.Before(*items[j].Timestamp)
+	})
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Track occurrences seen in this harvest cycle for boundary timestamp
+	cycleCounts := make(map[string]int)
+
 	for _, item := range items {
+		ts := item.Timestamp
+		if ts == nil {
+			now := time.Now().UTC()
+			ts = &now
+			item.Timestamp = ts
+		}
+
+		key := item.Stream + ":" + item.Message
+
+		if !cursor.lastTimestamp.IsZero() {
+			if ts.Before(cursor.lastTimestamp) {
+				// Historical entry already processed
+				continue
+			}
+			if ts.Equal(cursor.lastTimestamp) {
+				cycleCounts[key]++
+				if cycleCounts[key] <= cursor.seenCounts[key] {
+					// Duplicate occurrence already processed in previous cycle
+					continue
+				}
+				cursor.seenCounts[key] = cycleCounts[key]
+			} else { // ts.After(cursor.lastTimestamp)
+				cursor.lastTimestamp = *ts
+				cursor.seenCounts = map[string]int{key: 1}
+				cycleCounts = map[string]int{key: 1}
+			}
+		} else {
+			// First harvest of this container
+			if cursor.lastTimestamp.IsZero() || ts.After(cursor.lastTimestamp) {
+				cursor.lastTimestamp = *ts
+				cursor.seenCounts = map[string]int{key: 1}
+				cycleCounts = map[string]int{key: 1}
+			} else if ts.Equal(cursor.lastTimestamp) {
+				cycleCounts[key]++
+				cursor.seenCounts[key] = cycleCounts[key]
+			}
+		}
+
 		item.ResourceID = resourceID
 		item.ContainerID = containerID
 		if deploymentID != "" {
@@ -464,7 +627,7 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		if resourceType != "" {
 			item.ResourceType = resourceType
 		}
-		h.EnqueueLog(item)
+		h.enqueueLogLocked(item)
 	}
 
 	return nil
@@ -481,7 +644,10 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
+	activeIDs := make(map[string]struct{}, len(containers))
 	for _, cnt := range containers {
+		activeIDs[cnt.ID] = struct{}{}
+
 		resourceID := ""
 		deploymentID := ""
 		resourceType := ResourceTypeApplication
@@ -522,7 +688,46 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 		cancel()
 	}
 
+	// Purge stale cursors for containers not observed running for > 10 minutes
+	h.mu.Lock()
+	now := time.Now()
+	for id, cur := range h.cursors {
+		if _, active := activeIDs[id]; !active {
+			if now.Sub(cur.lastSeenAt) > 10*time.Minute {
+				delete(h.cursors, id)
+			}
+		}
+	}
+	h.mu.Unlock()
+
 	return nil
+}
+
+// ResetCursor clears cursor tracking for a given container (e.g. on manual container recreation).
+func (h *Harvester) ResetCursor(containerID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cursors != nil {
+		delete(h.cursors, containerID)
+	}
+}
+
+// PurgeStaleCursors removes cursors for containers that have not been observed running for longer than maxAge.
+func (h *Harvester) PurgeStaleCursors(maxAge time.Duration) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cursors == nil {
+		return 0
+	}
+	now := time.Now()
+	purged := 0
+	for id, cur := range h.cursors {
+		if now.Sub(cur.lastSeenAt) >= maxAge {
+			delete(h.cursors, id)
+			purged++
+		}
+	}
+	return purged
 }
 
 // Start boots background harvesting and flush loop.

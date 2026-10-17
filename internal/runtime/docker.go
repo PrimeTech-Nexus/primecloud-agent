@@ -38,6 +38,11 @@ type ContainerRuntime interface {
 	Close() error
 }
 
+// IncrementalLogReader specifies an optional extension for runtimes supporting time-filtered log retrieval.
+type IncrementalLogReader interface {
+	GetContainerLogsSince(ctx context.Context, containerID string, since time.Time) (io.ReadCloser, error)
+}
+
 // DockerRuntime implements ContainerRuntime backed by the official Docker Engine API.
 type DockerRuntime struct {
 	cli *client.Client
@@ -520,12 +525,21 @@ func (d *DockerRuntime) ListContainers(ctx context.Context, all bool) ([]Contain
 
 // GetContainerLogs returns a stream of stdout/stderr logs from the container.
 func (d *DockerRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
-	return d.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+	return d.GetContainerLogsSince(ctx, containerID, time.Time{})
+}
+
+// GetContainerLogsSince returns a stream of stdout/stderr logs from the container filtered since the given timestamp.
+func (d *DockerRuntime) GetContainerLogsSince(ctx context.Context, containerID string, since time.Time) (io.ReadCloser, error) {
+	opts := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     false,
 		Timestamps: true,
-	})
+	}
+	if !since.IsZero() {
+		opts.Since = since.UTC().Format(time.RFC3339Nano)
+	}
+	return d.cli.ContainerLogs(ctx, containerID, opts)
 }
 
 // GetContainerStats returns a stream of container resource usage statistics.
