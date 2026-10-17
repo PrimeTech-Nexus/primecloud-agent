@@ -207,10 +207,12 @@ func BuildEnvSlice(env map[string]string) []string {
 // taking into account the WorkloadType.
 // For APPLICATION workloads (or empty workload type):
 //   - Guarantees container port 8000/tcp (and any specified application ports) have dynamic host port bindings.
+//
 // For MANAGED_POSTGRES workloads:
 //   - Container port 5432/tcp is exposed internally in Docker.
 //   - Dynamic host port bindings are NOT created unless an explicit host port is requested.
 //   - Port 8000/tcp is NEVER exposed or bound.
+//
 // For MANAGED_VALKEY workloads:
 //   - Container port 6379/tcp is exposed internally in Docker.
 //   - Dynamic host port bindings are NOT created unless an explicit host port is requested.

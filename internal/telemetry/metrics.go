@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"runtime"
-	"time"
 	"os"
 	"os/exec"
-	"strings"
+	"runtime"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/protocol"
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
@@ -114,7 +114,7 @@ func (c *Collector) CollectNodeMetrics(ctx context.Context) (*NodeMetrics, error
 		cpuUsage, memPercent, diskUsage = getMetricsWin()
 	} else if runtime.GOOS == "linux" {
 		// Real linux metrics
-		
+
 		// CPU using /proc/loadavg as simple proxy, or top
 		out, err := os.ReadFile("/proc/loadavg")
 		if err == nil {

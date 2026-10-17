@@ -123,4 +123,3 @@ func (r *Reconstructor) RestoreToWorkloadWithVault(ctx context.Context, manifest
 		return nil
 	}
 }
-

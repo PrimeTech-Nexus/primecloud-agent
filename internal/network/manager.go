@@ -17,14 +17,14 @@ import (
 
 // Standard error codes for Managed Data Networking.
 const (
-	ErrCodeNetworkCreateFailed         = "NETWORK_CREATE_FAILED"
-	ErrCodeNetworkSubnetConflict       = "NETWORK_SUBNET_CONFLICT"
-	ErrCodeNetworkOwnershipConflict    = "NETWORK_OWNERSHIP_CONFLICT"
-	ErrCodeNetworkAttachFailed         = "NETWORK_ATTACH_FAILED"
-	ErrCodeNetworkDetachFailed         = "NETWORK_DETACH_FAILED"
-	ErrCodeNetworkNotFound             = "NETWORK_NOT_FOUND"
+	ErrCodeNetworkCreateFailed          = "NETWORK_CREATE_FAILED"
+	ErrCodeNetworkSubnetConflict        = "NETWORK_SUBNET_CONFLICT"
+	ErrCodeNetworkOwnershipConflict     = "NETWORK_OWNERSHIP_CONFLICT"
+	ErrCodeNetworkAttachFailed          = "NETWORK_ATTACH_FAILED"
+	ErrCodeNetworkDetachFailed          = "NETWORK_DETACH_FAILED"
+	ErrCodeNetworkNotFound              = "NETWORK_NOT_FOUND"
 	ErrCodeNetworkDNSVerificationFailed = "NETWORK_DNS_VERIFICATION_FAILED"
-	ErrCodeNetworkReconcileFailed      = "NETWORK_RECONCILIATION_FAILED"
+	ErrCodeNetworkReconcileFailed       = "NETWORK_RECONCILIATION_FAILED"
 )
 
 // Label constants establishing authoritative ownership and resource metadata.
@@ -38,7 +38,7 @@ const (
 	ResourceTypeManagedDataNetwork = "managed_data_network"
 	NetworkVersionV1               = "1"
 
-	SubnetPoolBase   = "10.240"
+	SubnetPoolBase    = "10.240"
 	DefaultSubnetMask = "/24"
 )
 
@@ -545,4 +545,3 @@ func sanitizeAliases(aliases []string) []string {
 	}
 	return res
 }
-

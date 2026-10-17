@@ -91,7 +91,7 @@ func TestTelemetry_FullPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CollectNodeMetrics failed: %v", err)
 	}
-	
+
 	// Ensure metrics are derived properly and bounded safely
 	if metrics.MemoryUsagePercent < 0 || metrics.MemoryUsagePercent > 100 {
 		t.Errorf("Expected valid real memory usage between 0-100, got %v", metrics.MemoryUsagePercent)

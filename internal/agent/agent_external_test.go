@@ -447,4 +447,3 @@ func TestPostgresExternalAccess_NestedPayloadJsonDecodesPort30001(t *testing.T) 
 		t.Fatalf("expected HAProxy cfg file to contain 'bind *:30001', got:\n%s", string(data))
 	}
 }
-

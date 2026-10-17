@@ -101,4 +101,3 @@ func TestEnsurePostgresDataDir(t *testing.T) {
 		t.Fatalf("pgdata path is not a directory")
 	}
 }
-

@@ -20,13 +20,13 @@ type MockRuntime struct {
 	removedForce  bool
 }
 
-func (m *MockRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *MockRuntime) PullImage(ctx context.Context, ref string) error               { return nil }
 func (m *MockRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error { return nil }
 func (m *MockRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
 	m.createdConfig = cfg
 	return "mock-container-12345", nil
 }
-func (m *MockRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *MockRuntime) StartContainer(ctx context.Context, id string) error              { return nil }
 func (m *MockRuntime) StopContainer(ctx context.Context, id string, timeout *int) error { return nil }
 func (m *MockRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
 	m.removedID = id
@@ -55,7 +55,7 @@ func (m *MockRuntime) GetContainerStats(ctx context.Context, containerID string)
 	return nil, nil
 }
 func (m *MockRuntime) Ping(ctx context.Context) error { return nil }
-func (m *MockRuntime) Close() error { return nil }
+func (m *MockRuntime) Close() error                   { return nil }
 
 func TestDynamicPortAllocation_BuildPortConfig_Port8000(t *testing.T) {
 	// 1. Verify that when container port 8000 is requested, BuildPortConfig creates exposed port 8000/tcp

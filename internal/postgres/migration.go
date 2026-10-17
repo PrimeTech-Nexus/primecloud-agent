@@ -22,19 +22,19 @@ import (
 
 // Standard error codes matching migration-contract-v1
 const (
-	ErrCodeTargetNotReady       = "TARGET_NOT_READY"
-	ErrCodeContainerUnhealthy   = "CONTAINER_UNHEALTHY"
-	ErrCodePostgresUnreachable  = "POSTGRES_UNREACHABLE"
-	ErrCodeInsufficientDisk     = "INSUFFICIENT_DISK"
-	ErrCodeSnapshotFailed       = "SNAPSHOT_FAILED"
-	ErrCodeArtifactNotFound     = "ARTIFACT_NOT_FOUND"
-	ErrCodeArtifactCorrupt      = "CORRUPT_ARTIFACT"
-	ErrCodeRestoreFailed        = "RESTORE_FAILED"
-	ErrCodeBinaryMissing        = "BINARY_MISSING"
-	ErrCodeInspectionFailed     = "INSPECTION_FAILED"
-	ErrCodeRollbackFailed       = "ROLLBACK_FAILED"
-	ErrCodeCleanupFailed        = "CLEANUP_FAILED"
-	ErrCodeInvalidPayload       = "INVALID_PAYLOAD_SCHEMA"
+	ErrCodeTargetNotReady      = "TARGET_NOT_READY"
+	ErrCodeContainerUnhealthy  = "CONTAINER_UNHEALTHY"
+	ErrCodePostgresUnreachable = "POSTGRES_UNREACHABLE"
+	ErrCodeInsufficientDisk    = "INSUFFICIENT_DISK"
+	ErrCodeSnapshotFailed      = "SNAPSHOT_FAILED"
+	ErrCodeArtifactNotFound    = "ARTIFACT_NOT_FOUND"
+	ErrCodeArtifactCorrupt     = "CORRUPT_ARTIFACT"
+	ErrCodeRestoreFailed       = "RESTORE_FAILED"
+	ErrCodeBinaryMissing       = "BINARY_MISSING"
+	ErrCodeInspectionFailed    = "INSPECTION_FAILED"
+	ErrCodeRollbackFailed      = "ROLLBACK_FAILED"
+	ErrCodeCleanupFailed       = "CLEANUP_FAILED"
+	ErrCodeInvalidPayload      = "INVALID_PAYLOAD_SCHEMA"
 )
 
 // PrepareTargetRequest defines request payload for prepare_migration_target.
@@ -678,4 +678,3 @@ func splitLines(s string) []string {
 	}
 	return lines
 }
-

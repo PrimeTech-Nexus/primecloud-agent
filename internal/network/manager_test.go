@@ -15,7 +15,7 @@ import (
 // mockDockerNetworkClient implements DockerNetworkClient in-memory for testing.
 type mockDockerNetworkClient struct {
 	mu          sync.Mutex
-	networks    map[string]types.NetworkResource // id/name -> resource
+	networks    map[string]types.NetworkResource                      // id/name -> resource
 	attachedMap map[string]map[string]*dockerNetwork.EndpointSettings // netID -> containerID -> endpoint
 	createErr   error
 	inspectErr  error

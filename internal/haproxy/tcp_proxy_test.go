@@ -162,7 +162,7 @@ func TestPostgresRawTCPForwarding(t *testing.T) {
 
 	// Send PG Startup Packet (Proto 3.0)
 	var startupBuf bytes.Buffer
-	binary.Write(&startupBuf, binary.BigEndian, int32(0)) // placeholder for len
+	binary.Write(&startupBuf, binary.BigEndian, int32(0))      // placeholder for len
 	binary.Write(&startupBuf, binary.BigEndian, int32(196608)) // 3.0 protocol
 	startupBuf.WriteString("user\x00primecloud\x00database\x00app\x00\x00")
 	startupBytes := startupBuf.Bytes()

@@ -2119,4 +2119,3 @@ func extractExternalPort(payload map[string]interface{}) int {
 	}
 	return 0
 }
-

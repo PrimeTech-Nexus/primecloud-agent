@@ -83,7 +83,7 @@ func TestValkey_ProvisioningAndVaultCredentials(t *testing.T) {
 	rdbPath := filepath.Join(baseResDir, "valkey", resID, "dump.rdb")
 	os.MkdirAll(filepath.Dir(rdbPath), 0700)
 	os.WriteFile(rdbPath, []byte("REDIS0009fake"), 0600)
-	
+
 	backupRes, err := valkey.BackupValkeyWithVault(ctx, nil, nil, baseResDir, projectID, resID, filepath.Join(tempDir, "backups"))
 	if err != nil {
 		t.Fatalf("BackupValkey failed: %v", err)

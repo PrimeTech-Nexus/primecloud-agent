@@ -689,5 +689,3 @@ func TestValkeyConsumer_RealQueueEnvelopePreservesExternalPort(t *testing.T) {
 		t.Fatal("timed out waiting for real queue envelope test")
 	}
 }
-
-
