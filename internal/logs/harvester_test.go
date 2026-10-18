@@ -460,3 +460,53 @@ func TestDiscoverAndHarvestOnce_DeploymentAndTypeMetadata(t *testing.T) {
 		t.Errorf("expected ResourceType database, got %s", dbLog.ResourceType)
 	}
 }
+
+func TestDiscoverAndHarvestOnce_ApplicationNameFallback(t *testing.T) {
+	mockRT := &mockRuntime{
+		containers: []agentruntime.ContainerSummary{
+			{
+				ID:     "cnt-sam-999",
+				Names:  []string{"/pc-sambackend-0-3e2849fb"},
+				Labels: map[string]string{}, // No labels attached
+			},
+			{
+				ID:     "cnt-sys-111",
+				Names:  []string{"/primecloud-control-plane"},
+				Labels: map[string]string{}, // Infrastructure container without labels
+			},
+		},
+		logOutput: map[string][]byte{
+			"cnt-sam-999": makeDockerFrame(1, "2026-10-18T17:00:00Z Mini-Mart POS API running\n"),
+			"cnt-sys-111": makeDockerFrame(1, "2026-10-18T17:00:00Z Internal CP log\n"),
+		},
+	}
+
+	h := NewHarvester(mockRT, "http://localhost:59999", 50, 1*time.Second, nil)
+	err := h.DiscoverAndHarvestOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected discover error: %v", err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Should harvest cnt-sam-999 and skip cnt-sys-111
+	if len(h.buffer) != 1 {
+		t.Fatalf("expected 1 harvested log, got %d", len(h.buffer))
+	}
+
+	item := h.buffer[0]
+	if item.ResourceID != "sambackend" {
+		t.Errorf("expected ResourceID sambackend, got %s", item.ResourceID)
+	}
+	if item.DeploymentID != "3e2849fb" {
+		t.Errorf("expected DeploymentID 3e2849fb, got %s", item.DeploymentID)
+	}
+	if item.ResourceType != ResourceTypeApplication {
+		t.Errorf("expected ResourceType application, got %s", item.ResourceType)
+	}
+	if item.Message != "Mini-Mart POS API running" {
+		t.Errorf("expected message 'Mini-Mart POS API running', got '%s'", item.Message)
+	}
+}
+

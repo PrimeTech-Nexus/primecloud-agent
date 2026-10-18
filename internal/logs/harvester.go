@@ -508,6 +508,22 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 			} else if strings.HasPrefix(cleanName, "pc-vk-") {
 				resourceID = strings.TrimPrefix(cleanName, "pc-vk-")
 				resourceType = ResourceTypeDatabase
+			} else if strings.HasPrefix(cleanName, "pc-app-") {
+				resourceID = strings.TrimPrefix(cleanName, "pc-app-")
+				resourceType = ResourceTypeApplication
+			} else if strings.HasPrefix(cleanName, "pc-") && !strings.HasPrefix(cleanName, "primecloud-") {
+				// Canonical application container naming: pc-{slug}-{replica_index}-{dep_short}
+				// E.g. pc-sambackend-0-3e2849fb
+				parts := strings.Split(cleanName, "-")
+				if len(parts) >= 4 {
+					resourceID = strings.Join(parts[1:len(parts)-2], "-")
+					if deploymentID == "" {
+						deploymentID = parts[len(parts)-1]
+					}
+				} else if len(parts) >= 2 {
+					resourceID = strings.TrimPrefix(cleanName, "pc-")
+				}
+				resourceType = ResourceTypeApplication
 			}
 		}
 
