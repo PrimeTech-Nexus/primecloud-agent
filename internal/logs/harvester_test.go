@@ -509,4 +509,3 @@ func TestDiscoverAndHarvestOnce_ApplicationNameFallback(t *testing.T) {
 		t.Errorf("expected message 'Mini-Mart POS API running', got '%s'", item.Message)
 	}
 }
-
