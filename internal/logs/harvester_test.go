@@ -509,3 +509,117 @@ func TestDiscoverAndHarvestOnce_ApplicationNameFallback(t *testing.T) {
 		t.Errorf("expected message 'Mini-Mart POS API running', got '%s'", item.Message)
 	}
 }
+
+func TestAggregateMultilineItems_PythonTraceback(t *testing.T) {
+	ts := time.Now().UTC()
+	rawItems := []LogItem{
+		{Stream: StreamStderr, Severity: SeverityError, Message: "Traceback (most recent call last):", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "  File \"/app/main.py\", line 42, in handle_request", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    res = db.execute(query)", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "psycopg2.OperationalError: server closed the connection unexpectedly", Timestamp: &ts},
+		{Stream: StreamStdout, Severity: SeverityInfo, Message: "INFO: Normal log continues", Timestamp: &ts},
+	}
+
+	aggregated := AggregateMultilineItems(rawItems)
+	if len(aggregated) != 2 {
+		t.Fatalf("expected 2 items after multiline aggregation, got %d", len(aggregated))
+	}
+
+	first := aggregated[0]
+	if first.Severity != SeverityError {
+		t.Errorf("expected Severity ERROR, got %s", first.Severity)
+	}
+	if first.Message != "psycopg2.OperationalError: server closed the connection unexpectedly" {
+		t.Errorf("expected summary error line, got: %s", first.Message)
+	}
+	if first.StructuredData == nil || first.StructuredData["is_multiline"] != true {
+		t.Errorf("expected is_multiline structured data to be true")
+	}
+	if rawTb, ok := first.StructuredData["raw_traceback"].(string); !ok || !strings.Contains(rawTb, "Traceback (most recent call last):") {
+		t.Errorf("expected raw_traceback to contain full traceback, got: %v", rawTb)
+	}
+
+	second := aggregated[1]
+	if second.Message != "INFO: Normal log continues" {
+		t.Errorf("expected second item to be unaffected, got: %s", second.Message)
+	}
+}
+
+func TestHarvestContainer_CursorDeduplication(t *testing.T) {
+	t1 := "2026-10-18T17:00:00.000000000Z"
+	t2 := "2026-10-18T17:00:05.000000000Z"
+	t3 := "2026-10-18T17:00:10.000000000Z"
+
+	mockRT := &mockRuntime{
+		logOutput: map[string][]byte{
+			"cnt-sam-1": makeDockerFrame(1, t1+" First log\n"+t2+" Second log\n"),
+		},
+	}
+
+	h := NewHarvester(mockRT, "http://localhost:59999", 50, 1*time.Second, nil)
+
+	// Harvest pass 1
+	err := h.HarvestContainerWithMetadata(context.Background(), "cnt-sam-1", "app-1", "dep-1", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("unexpected harvest error: %v", err)
+	}
+	if len(h.buffer) != 2 {
+		t.Fatalf("expected 2 logs buffered on pass 1, got %d", len(h.buffer))
+	}
+
+	// Clear buffer (simulating flush)
+	h.buffer = h.buffer[:0]
+
+	// Harvest pass 2 with same logs -> should enqueue 0 logs
+	err = h.HarvestContainerWithMetadata(context.Background(), "cnt-sam-1", "app-1", "dep-1", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("unexpected harvest error: %v", err)
+	}
+	if len(h.buffer) != 0 {
+		t.Fatalf("expected 0 logs buffered on duplicate pass, got %d", len(h.buffer))
+	}
+
+	// Update container stream with a new 3rd log
+	mockRT.logOutput["cnt-sam-1"] = makeDockerFrame(1, t1+" First log\n"+t2+" Second log\n"+t3+" Third log\n")
+
+	// Harvest pass 3 -> should only enqueue the 3rd log
+	err = h.HarvestContainerWithMetadata(context.Background(), "cnt-sam-1", "app-1", "dep-1", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("unexpected harvest error: %v", err)
+	}
+	if len(h.buffer) != 1 {
+		t.Fatalf("expected 1 log buffered on pass 3, got %d", len(h.buffer))
+	}
+	if h.buffer[0].Message != "Third log" {
+		t.Errorf("expected 'Third log', got '%s'", h.buffer[0].Message)
+	}
+}
+
+func TestPermanentFailure404(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"detail":"Resource not found"}`))
+	}))
+	defer server.Close()
+
+	h := NewHarvester(nil, server.URL, 50, 1*time.Second, nil)
+	now := time.Now().UTC()
+	h.EnqueueLog(LogItem{
+		ResourceID: "non-existent-resource",
+		Message:    "Dead log",
+		Timestamp:  &now,
+	})
+
+	err := h.Flush(context.Background())
+	if err == nil {
+		t.Fatalf("expected 404 error from flush, got nil")
+	}
+
+	// Verify that inflight batch was dropped to prevent wedging
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.inflight != nil {
+		t.Errorf("expected inflight to be nil after permanent 404 rejection, got %v", h.inflight)
+	}
+}
+

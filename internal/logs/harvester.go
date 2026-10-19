@@ -110,6 +110,7 @@ type Harvester struct {
 	buffer          []LogItem
 	inflight        *BatchWithKey // Pending batch awaiting acknowledgment or retry
 	maxBuffer       int
+	containerCursors map[string]time.Time
 }
 
 // NewHarvester constructs a Harvester instance.
@@ -163,6 +164,7 @@ func NewHarvesterWithAuth(
 		batchInterval:   batchInterval,
 		buffer:          make([]LogItem, 0, batchSize),
 		maxBuffer:       MaxBufferLimit,
+		containerCursors: make(map[string]time.Time),
 		logger:          logger.With("component", "log_harvester"),
 	}
 }
@@ -250,6 +252,96 @@ func (h *Harvester) EnqueueLog(item LogItem) {
 	h.buffer = append(h.buffer, item)
 }
 
+// AggregateMultilineItems groups consecutive traceback or panic frames into a single LogItem.
+func AggregateMultilineItems(items []LogItem) []LogItem {
+	if len(items) <= 1 {
+		return items
+	}
+
+	isTracebackStart := func(msg string) bool {
+		lower := strings.ToLower(msg)
+		return strings.HasPrefix(lower, "traceback (most recent call last):") ||
+			strings.HasPrefix(msg, "panic:")
+	}
+
+	isTracebackContinuation := func(msg string) bool {
+		return strings.HasPrefix(msg, " ") ||
+			strings.HasPrefix(msg, "\t") ||
+			strings.HasPrefix(msg, "goroutine ") ||
+			strings.HasPrefix(msg, "[signal ")
+	}
+
+	var result []LogItem
+	var currentGroup []LogItem
+
+	flushGroup := func() {
+		if len(currentGroup) == 0 {
+			return
+		}
+		if len(currentGroup) == 1 {
+			result = append(result, currentGroup[0])
+			currentGroup = nil
+			return
+		}
+
+		base := currentGroup[0]
+		var sb strings.Builder
+		for i, itm := range currentGroup {
+			if i > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(itm.Message)
+		}
+		fullText := sb.String()
+
+		summary := base.Message
+		lastLine := currentGroup[len(currentGroup)-1].Message
+		if strings.Contains(lastLine, ": ") && !strings.HasPrefix(lastLine, " ") && !strings.HasPrefix(lastLine, "\t") {
+			summary = lastLine
+		}
+
+		if base.StructuredData == nil {
+			base.StructuredData = make(map[string]interface{})
+		}
+		base.StructuredData["is_multiline"] = true
+		base.StructuredData["line_count"] = len(currentGroup)
+		base.StructuredData["raw_traceback"] = fullText
+		base.Severity = SeverityError
+		base.Message = summary
+		result = append(result, base)
+		currentGroup = nil
+	}
+
+	for _, item := range items {
+		if len(currentGroup) == 0 {
+			if isTracebackStart(item.Message) {
+				currentGroup = append(currentGroup, item)
+			} else {
+				result = append(result, item)
+			}
+		} else {
+			if isTracebackContinuation(item.Message) {
+				currentGroup = append(currentGroup, item)
+			} else {
+				lastMsg := currentGroup[len(currentGroup)-1].Message
+				if isTracebackContinuation(lastMsg) && (strings.Contains(item.Message, "Error") || strings.Contains(item.Message, "Exception") || strings.Contains(item.Message, ":")) {
+					currentGroup = append(currentGroup, item)
+					flushGroup()
+				} else {
+					flushGroup()
+					if isTracebackStart(item.Message) {
+						currentGroup = append(currentGroup, item)
+					} else {
+						result = append(result, item)
+					}
+				}
+			}
+		}
+	}
+	flushGroup()
+	return result
+}
+
 // DemuxDockerLogStream separates multiplexed Docker stdout and stderr streams via stdcopy.StdCopy.
 // If the stream contains raw text rather than Docker multiplex headers, it gracefully falls back
 // to parsing line-by-line into the fallbackStream.
@@ -308,7 +400,7 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 
 		parseLines(&stdoutBuf, StreamStdout, SeverityInfo)
 		parseLines(&stderrBuf, StreamStderr, SeverityError)
-		return items, nil
+		return AggregateMultilineItems(items), nil
 	}
 
 	// Fallback for non-multiplexed raw text streams (e.g. mock reader or TTY output)
@@ -329,7 +421,7 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 		})
 	}
 
-	return fallbackItems, nil
+	return AggregateMultilineItems(fallbackItems), nil
 }
 
 // Flush transmits buffered logs to the Control Plane using sender-scoped idempotency.
@@ -413,14 +505,14 @@ func (h *Harvester) transmitBatch(ctx context.Context, batch *BatchWithKey) erro
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusMultiStatus {
 		return nil
 	}
 
-	// Permanent failures (401/403 auth errors, 400 validation, 409 conflict):
+	// Permanent failures (401/403 auth errors, 400 validation, 404 unmapped resource, 409 conflict):
 	// Drop the rejected batch to avoid permanently stalling the ingestion queue.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
-		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusConflict {
+		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusConflict {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		h.mu.Lock()
 		h.inflight = nil
@@ -455,7 +547,23 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		return err
 	}
 
+	h.mu.Lock()
+	lastSeen, hasCursor := h.containerCursors[containerID]
+	var maxSeen time.Time
+	if hasCursor {
+		maxSeen = lastSeen
+	}
+	h.mu.Unlock()
+
 	for _, item := range items {
+		if item.Timestamp != nil {
+			if hasCursor && !item.Timestamp.After(lastSeen) {
+				continue
+			}
+			if item.Timestamp.After(maxSeen) {
+				maxSeen = *item.Timestamp
+			}
+		}
 		item.ResourceID = resourceID
 		item.ContainerID = containerID
 		if deploymentID != "" {
@@ -467,16 +575,22 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		h.EnqueueLog(item)
 	}
 
+	if !maxSeen.IsZero() {
+		h.mu.Lock()
+		h.containerCursors[containerID] = maxSeen
+		h.mu.Unlock()
+	}
+
 	return nil
 }
 
-// DiscoverAndHarvestOnce inspects all running containers and harvests their logs.
+// DiscoverAndHarvestOnce inspects all running and exited containers and harvests their logs.
 func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 	if h.rt == nil {
 		return nil
 	}
 
-	containers, err := h.rt.ListContainers(ctx, false) // Running containers only
+	containers, err := h.rt.ListContainers(ctx, true) // Include exited/crashed containers to capture crash logs
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
