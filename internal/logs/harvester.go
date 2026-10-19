@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -83,8 +84,9 @@ type LogIngestResponse struct {
 
 // BatchWithKey pairs a batch of log items with a stable idempotency key for reliable retries.
 type BatchWithKey struct {
-	Key  string
-	Logs []LogItem
+	Key           string               `json:"key"`
+	Logs          []LogItem            `json:"logs"`
+	MaxTimestamps map[string]time.Time `json:"max_timestamps,omitempty"`
 }
 
 // GenerateUUIDv4 generates a compliant RFC 4122 v4 UUID string.
@@ -98,19 +100,21 @@ func GenerateUUIDv4() string {
 
 // Harvester tails application containers and streams redacted logs.
 type Harvester struct {
-	mu              sync.Mutex
-	rt              agentruntime.ContainerRuntime
-	controlPlaneURL string
-	agentKey        string
-	nodeID          string
-	httpClient      *http.Client
-	logger          *slog.Logger
-	batchSize       int
-	batchInterval   time.Duration
-	buffer          []LogItem
-	inflight        *BatchWithKey // Pending batch awaiting acknowledgment or retry
-	maxBuffer       int
-	containerCursors map[string]time.Time
+	mu                sync.Mutex
+	rt                agentruntime.ContainerRuntime
+	controlPlaneURL   string
+	agentKey          string
+	nodeID            string
+	httpClient        *http.Client
+	logger            *slog.Logger
+	batchSize         int
+	batchInterval     time.Duration
+	buffer            []LogItem
+	inflight          *BatchWithKey // Pending batch awaiting acknowledgment or retry
+	maxBuffer         int
+	containerCursors  map[string]time.Time
+	pendingWatermarks map[string]time.Time
+	cursorStore       CursorStore
 }
 
 // NewHarvester constructs a Harvester instance.
@@ -154,19 +158,35 @@ func NewHarvesterWithAuth(
 		}
 	}
 
-	return &Harvester{
-		rt:              rt,
-		controlPlaneURL: cleanURL,
-		agentKey:        agentKey,
-		nodeID:          nodeID,
-		httpClient:      &http.Client{Timeout: 10 * time.Second},
-		batchSize:       batchSize,
-		batchInterval:   batchInterval,
-		buffer:          make([]LogItem, 0, batchSize),
-		maxBuffer:       MaxBufferLimit,
-		containerCursors: make(map[string]time.Time),
-		logger:          logger.With("component", "log_harvester"),
+	cursorPath := os.Getenv("PRIMECLOUD_LOG_CURSOR_FILE")
+	if cursorPath == "" {
+		cursorPath = "/var/lib/primecloud/log_cursors.json"
 	}
+	store := NewFileCursorStore(cursorPath, DefaultMaxCursorEntries, logger)
+	_ = store.Load()
+
+	return &Harvester{
+		rt:                rt,
+		controlPlaneURL:   cleanURL,
+		agentKey:          agentKey,
+		nodeID:            nodeID,
+		httpClient:        &http.Client{Timeout: 10 * time.Second},
+		batchSize:         batchSize,
+		batchInterval:     batchInterval,
+		buffer:            make([]LogItem, 0, batchSize),
+		maxBuffer:         MaxBufferLimit,
+		containerCursors:  make(map[string]time.Time),
+		pendingWatermarks: make(map[string]time.Time),
+		cursorStore:       store,
+		logger:            logger.With("component", "log_harvester"),
+	}
+}
+
+// SetCursorStore configures an explicit cursor checkpoint store (e.g. for testing).
+func (h *Harvester) SetCursorStore(store CursorStore) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cursorStore = store
 }
 
 // RedactSecrets applies regex masking to sensitive log content.
@@ -447,9 +467,19 @@ func (h *Harvester) Flush(ctx context.Context) error {
 		toSend := h.buffer[:count]
 		h.buffer = h.buffer[count:]
 
+		maxTimestamps := make(map[string]time.Time)
+		for _, item := range toSend {
+			if item.ContainerID != "" && item.Timestamp != nil {
+				if cur, ok := maxTimestamps[item.ContainerID]; !ok || item.Timestamp.After(cur) {
+					maxTimestamps[item.ContainerID] = *item.Timestamp
+				}
+			}
+		}
+
 		currentBatch = BatchWithKey{
-			Key:  GenerateUUIDv4(),
-			Logs: toSend,
+			Key:           GenerateUUIDv4(),
+			Logs:          toSend,
+			MaxTimestamps: maxTimestamps,
 		}
 		h.inflight = &currentBatch
 	}
@@ -461,8 +491,16 @@ func (h *Harvester) Flush(ctx context.Context) error {
 		return err
 	}
 
-	// On success, clear inflight batch
+	// On success, advance and commit durable checkpoints ONLY upon verified Control Plane acceptance (Requirement B3)
+	if h.cursorStore != nil && len(currentBatch.MaxTimestamps) > 0 {
+		_ = h.cursorStore.Commit(currentBatch.MaxTimestamps)
+	}
+
+	// On success, clear inflight batch and update in-memory high-water marks
 	h.mu.Lock()
+	for cid, ts := range currentBatch.MaxTimestamps {
+		h.containerCursors[cid] = ts
+	}
 	h.inflight = nil
 	h.mu.Unlock()
 
@@ -548,20 +586,35 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 	}
 
 	h.mu.Lock()
-	lastSeen, hasCursor := h.containerCursors[containerID]
-	var maxSeen time.Time
-	if hasCursor {
-		maxSeen = lastSeen
+	var lastAcked time.Time
+	var hasAcked bool
+	if h.cursorStore != nil {
+		lastAcked, hasAcked = h.cursorStore.Get(containerID)
 	}
+	if !hasAcked {
+		lastAcked, hasAcked = h.containerCursors[containerID]
+	}
+	pendingMax := h.pendingWatermarks[containerID]
 	h.mu.Unlock()
+
+	var newMaxSeen time.Time
+	if hasAcked {
+		newMaxSeen = lastAcked
+	}
+	if pendingMax.After(newMaxSeen) {
+		newMaxSeen = pendingMax
+	}
 
 	for _, item := range items {
 		if item.Timestamp != nil {
-			if hasCursor && !item.Timestamp.After(lastSeen) {
+			if hasAcked && !item.Timestamp.After(lastAcked) {
 				continue
 			}
-			if item.Timestamp.After(maxSeen) {
-				maxSeen = *item.Timestamp
+			if !pendingMax.IsZero() && !item.Timestamp.After(pendingMax) {
+				continue
+			}
+			if item.Timestamp.After(newMaxSeen) {
+				newMaxSeen = *item.Timestamp
 			}
 		}
 		item.ResourceID = resourceID
@@ -575,12 +628,25 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		h.EnqueueLog(item)
 	}
 
-	if !maxSeen.IsZero() {
+	if !newMaxSeen.IsZero() {
 		h.mu.Lock()
-		h.containerCursors[containerID] = maxSeen
+		h.pendingWatermarks[containerID] = newMaxSeen
+		h.containerCursors[containerID] = newMaxSeen
 		h.mu.Unlock()
 	}
 
+	return nil
+}
+
+// HarvestIngressStream parses Caddy access logs from a reader and enqueues them into the harvester buffer.
+func (h *Harvester) HarvestIngressStream(ctx context.Context, reader io.Reader, domainMap map[string]string) error {
+	items, err := ParseCaddyAccessStream(reader, domainMap)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		h.EnqueueLog(item)
+	}
 	return nil
 }
 

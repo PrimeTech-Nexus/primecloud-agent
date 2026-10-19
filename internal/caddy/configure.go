@@ -21,6 +21,8 @@ type RouteConfig struct {
 	TLS             bool              `json:"tls"`
 	Headers         map[string]string `json:"headers,omitempty"`
 	HealthCheckPath string            `json:"health_check_path,omitempty"`
+	ResourceID      string            `json:"resource_id,omitempty"`
+	AccessLogPath   string            `json:"access_log_path,omitempty"`
 }
 
 // Manager orchestrates Caddy reverse proxy configuration.
@@ -101,6 +103,16 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 		sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
 	}
 
+	// Request Correlation: Return X-Prime-Request-Id downstream to client (ADR-0004)
+	sb.WriteString("    header X-Prime-Request-Id {http.request.uuid}\n")
+
+	// Structured Ingress Access Logging (ADR-0003)
+	logPath := route.AccessLogPath
+	if logPath == "" {
+		logPath = "/var/log/primecloud/caddy-access.log"
+	}
+	sb.WriteString(fmt.Sprintf("    log {\n        output file %s {\n            roll_size 20mb\n            roll_keep 3\n        }\n        format json {\n            time_format \"iso8601\"\n        }\n    }\n", logPath))
+
 	if isWildcard {
 		// Wildcard fallback: unconfigured customer domain does NOT proxy to dead port; returns deterministic 404
 		sb.WriteString("    respond \"Application Not Found\" 404\n")
@@ -108,6 +120,7 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 		sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
 		sb.WriteString("        header_up Host {host}\n")
 		sb.WriteString("        header_up X-Real-IP {remote_host}\n")
+		sb.WriteString("        header_up X-Prime-Request-Id {http.request.uuid}\n")
 
 		for k, v := range route.Headers {
 			sb.WriteString(fmt.Sprintf("        header_up %s %q\n", k, v))

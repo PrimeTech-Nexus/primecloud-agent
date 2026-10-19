@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -622,4 +624,79 @@ func TestPermanentFailure404(t *testing.T) {
 		t.Errorf("expected inflight to be nil after permanent 404 rejection, got %v", h.inflight)
 	}
 }
+
+func TestHarvester_EndToEndDurableCheckpointCommitOnAck(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "harvester_cursor_e2e_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cursorPath := filepath.Join(tmpDir, "cursors.json")
+	store := NewFileCursorStore(cursorPath, 100, nil)
+
+	var serverHits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&serverHits, 1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"persisted","accepted_count":2}`))
+	}))
+	defer server.Close()
+
+	t1 := "2026-10-19T05:00:00.000000000Z"
+	t2 := "2026-10-19T05:00:05.000000000Z"
+
+	mockRT := &mockRuntime{
+		logOutput: map[string][]byte{
+			"cnt-sam-e2e": makeDockerFrame(1, t1+" Application boot\n"+t2+" Server listening on :8000\n"),
+		},
+	}
+
+	h := NewHarvester(mockRT, server.URL, 50, 1*time.Second, nil)
+	h.SetCursorStore(store)
+
+	// Step 1: Harvest logs
+	err = h.HarvestContainerWithMetadata(context.Background(), "cnt-sam-e2e", "app-sam", "dep-sam", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("unexpected harvest error: %v", err)
+	}
+
+	// Step 2: Before flush, store checkpoint must NOT have advanced yet!
+	if _, ok := store.Get("cnt-sam-e2e"); ok {
+		t.Fatalf("checkpoint must NOT advance before batch is acknowledged by Control Plane!")
+	}
+
+	// Step 3: Flush to Control Plane
+	err = h.Flush(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected flush error: %v", err)
+	}
+
+	// Step 4: After successful flush, checkpoint must be committed in store and persisted on disk!
+	expectedT2, _ := time.Parse(time.RFC3339Nano, t2)
+	savedT, ok := store.Get("cnt-sam-e2e")
+	if !ok || !savedT.Equal(expectedT2) {
+		t.Fatalf("expected committed checkpoint %v, got %v (ok=%v)", expectedT2, savedT, ok)
+	}
+
+	// Step 5: Simulate Agent Restart - create new harvester with new store reloading from disk
+	storeReloaded := NewFileCursorStore(cursorPath, 100, nil)
+	if err := storeReloaded.Load(); err != nil {
+		t.Fatalf("failed to reload store from disk: %v", err)
+	}
+
+	hRestarted := NewHarvester(mockRT, server.URL, 50, 1*time.Second, nil)
+	hRestarted.SetCursorStore(storeReloaded)
+
+	// Harvest same container on restarted agent -> must NOT re-read historical logs!
+	err = hRestarted.HarvestContainerWithMetadata(context.Background(), "cnt-sam-e2e", "app-sam", "dep-sam", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("unexpected harvest error on restart: %v", err)
+	}
+
+	if len(hRestarted.buffer) != 0 {
+		t.Fatalf("expected 0 logs buffered after restart (historical logs skipped), got %d", len(hRestarted.buffer))
+	}
+}
+
 
