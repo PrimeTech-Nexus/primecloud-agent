@@ -257,3 +257,64 @@ func TestCaddyLogTailer_LifecycleRotationAndPartialWrites(t *testing.T) {
 	}
 }
 
+func TestCaddyLogTailer_RenameReplacementNewFileLargerThanOffset(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "caddy-access.log")
+	rotatedPath := filepath.Join(tmpDir, "caddy-access.log.1")
+
+	tailer := NewCaddyLogTailer(logPath, nil, nil)
+
+	// Step 1: Write an initial small log file (1 line, ~90 bytes)
+	initialLine := `{"level":"info","request":{"method":"GET","host":"app.test","uri":"/initial"},"status":200}` + "\n"
+	if err := os.WriteFile(logPath, []byte(initialLine), 0644); err != nil {
+		t.Fatalf("failed to write initial log: %v", err)
+	}
+
+	items, err := tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected drain error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 initial item, got %d", len(items))
+	}
+	initialOffset := tailer.lastOffset
+	if initialOffset == 0 {
+		t.Fatalf("expected lastOffset > 0, got %d", initialOffset)
+	}
+
+	// Step 2: Simulate logrotate rename / replacement rotation:
+	// Move active file to .1
+	if err := os.Rename(logPath, rotatedPath); err != nil {
+		t.Fatalf("failed to rename file for rotation: %v", err)
+	}
+
+	// Create a brand new active file with content that is LARGER than initialOffset
+	newLine1 := `{"level":"warn","request":{"method":"GET","host":"app.test","uri":"/new-first-line-larger"},"status":404}` + "\n"
+	newLine2 := `{"level":"error","request":{"method":"POST","host":"app.test","uri":"/new-second-line-larger"},"status":500}` + "\n"
+	newContent := newLine1 + newLine2
+	if int64(len(newContent)) <= initialOffset {
+		t.Fatalf("test precondition failed: newContent size %d must be greater than initialOffset %d", len(newContent), initialOffset)
+	}
+
+	if err := os.WriteFile(logPath, []byte(newContent), 0644); err != nil {
+		t.Fatalf("failed to write new rotated log file: %v", err)
+	}
+
+	// Step 3: Drain. Because the file identity (inode / FileInfo) changed via os.SameFile,
+	// the tailer MUST detect rotation, reset offset to 0, and read BOTH new lines from byte 0.
+	items, err = tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected drain error after replacement rotation: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items from new rotated file, got %d (file identity check failed)", len(items))
+	}
+	if items[0].Severity != SeverityWarn {
+		t.Errorf("expected 1st item WARN, got %s", items[0].Severity)
+	}
+	if items[1].Severity != SeverityError {
+		t.Errorf("expected 2nd item ERROR, got %s", items[1].Severity)
+	}
+}
+
+

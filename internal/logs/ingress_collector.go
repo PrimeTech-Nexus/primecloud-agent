@@ -219,12 +219,13 @@ func RedactAuthHeaders(headers map[string][]string) map[string][]string {
 // CaddyLogTailer tracks file offsets, detects log rotation, handles partial line writes,
 // and streams new parsed LogItems to the agent harvester.
 type CaddyLogTailer struct {
-	mu         sync.Mutex
-	filePath   string
-	lastOffset int64
-	partial    string
-	domainMap  map[string]string
-	logger     *slog.Logger
+	mu           sync.Mutex
+	filePath     string
+	lastOffset   int64
+	lastFileInfo os.FileInfo
+	partial      string
+	domainMap    map[string]string
+	logger       *slog.Logger
 }
 
 // NewCaddyLogTailer constructs an offset-tracking tailer for Caddy's access log file.
@@ -246,39 +247,49 @@ func NewCaddyLogTailer(filePath string, domainMap map[string]string, logger *slo
 }
 
 // DrainNewLogs reads all complete lines appended to the log file since last offset.
-// Detects rotation (truncation), buffers incomplete trailing lines, and parses valid lines.
+// Detects rotation (truncation or file identity change), buffers incomplete trailing lines, and parses valid lines.
 func (t *CaddyLogTailer) DrainNewLogs() ([]LogItem, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	stat, err := os.Stat(t.filePath)
+	f, err := os.Open(t.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// File not created yet by Caddy; normal during initial startup
 			return nil, nil
 		}
+		return nil, fmt.Errorf("failed to open caddy access log: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("failed to stat caddy access log: %w", err)
 	}
 
 	curSize := stat.Size()
 
-	// Detect log rotation or truncation: if current size is smaller than lastOffset, reset to 0
-	if curSize < t.lastOffset {
+	// Detect log rotation via file identity (e.g. rename-and-recreate rotation where the new file
+	// is already larger than lastOffset, or inode/file-index has changed) or in-place truncation.
+	isRotated := false
+	if t.lastFileInfo != nil && !os.SameFile(t.lastFileInfo, stat) {
+		isRotated = true
+	} else if curSize < t.lastOffset {
+		isRotated = true
+	}
+
+	if isRotated {
 		t.logger.Info("caddy_access_log_rotated", "old_offset", t.lastOffset, "new_size", curSize)
 		t.lastOffset = 0
 		t.partial = ""
 	}
 
+	t.lastFileInfo = stat
+
 	// No new data written
 	if curSize == t.lastOffset {
 		return nil, nil
 	}
-
-	f, err := os.Open(t.filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open caddy access log: %w", err)
-	}
-	defer f.Close()
 
 	if _, err := f.Seek(t.lastOffset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek caddy access log: %w", err)
