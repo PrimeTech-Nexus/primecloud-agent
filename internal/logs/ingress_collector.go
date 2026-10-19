@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -212,3 +215,118 @@ func RedactAuthHeaders(headers map[string][]string) map[string][]string {
 	}
 	return cleaned
 }
+
+// CaddyLogTailer tracks file offsets, detects log rotation, handles partial line writes,
+// and streams new parsed LogItems to the agent harvester.
+type CaddyLogTailer struct {
+	mu         sync.Mutex
+	filePath   string
+	lastOffset int64
+	partial    string
+	domainMap  map[string]string
+	logger     *slog.Logger
+}
+
+// NewCaddyLogTailer constructs an offset-tracking tailer for Caddy's access log file.
+func NewCaddyLogTailer(filePath string, domainMap map[string]string, logger *slog.Logger) *CaddyLogTailer {
+	if filePath == "" {
+		filePath = os.Getenv("PRIMECLOUD_CADDY_ACCESS_LOG")
+		if filePath == "" {
+			filePath = "/var/log/primecloud/caddy-access.log"
+		}
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &CaddyLogTailer{
+		filePath:  filePath,
+		domainMap: domainMap,
+		logger:    logger.With("component", "caddy_log_tailer"),
+	}
+}
+
+// DrainNewLogs reads all complete lines appended to the log file since last offset.
+// Detects rotation (truncation), buffers incomplete trailing lines, and parses valid lines.
+func (t *CaddyLogTailer) DrainNewLogs() ([]LogItem, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	stat, err := os.Stat(t.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File not created yet by Caddy; normal during initial startup
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to stat caddy access log: %w", err)
+	}
+
+	curSize := stat.Size()
+
+	// Detect log rotation or truncation: if current size is smaller than lastOffset, reset to 0
+	if curSize < t.lastOffset {
+		t.logger.Info("caddy_access_log_rotated", "old_offset", t.lastOffset, "new_size", curSize)
+		t.lastOffset = 0
+		t.partial = ""
+	}
+
+	// No new data written
+	if curSize == t.lastOffset {
+		return nil, nil
+	}
+
+	f, err := os.Open(t.filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open caddy access log: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(t.lastOffset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek caddy access log: %w", err)
+	}
+
+	readBytes, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read caddy access log: %w", err)
+	}
+
+	if len(readBytes) == 0 {
+		return nil, nil
+	}
+
+	// Advance offset by bytes read
+	t.lastOffset += int64(len(readBytes))
+
+	// Prepend leftover partial chunk from previous cycle if any
+	chunk := t.partial + string(readBytes)
+	t.partial = ""
+
+	// If the chunk doesn't end with newline, preserve the trailing partial fragment
+	if !strings.HasSuffix(chunk, "\n") {
+		lastNewline := strings.LastIndex(chunk, "\n")
+		if lastNewline == -1 {
+			// Entire chunk is partial; wait for next read
+			t.partial = chunk
+			return nil, nil
+		}
+		t.partial = chunk[lastNewline+1:]
+		chunk = chunk[:lastNewline+1]
+	}
+
+	var items []LogItem
+	lines := strings.Split(chunk, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		item, err := ParseCaddyAccessLogLine(trimmed, t.domainMap)
+		if err != nil {
+			t.logger.Debug("caddy_access_line_parse_skipped", "line", trimmed, "error", err)
+			continue
+		}
+		items = append(items, *item)
+	}
+
+	return items, nil
+}
+

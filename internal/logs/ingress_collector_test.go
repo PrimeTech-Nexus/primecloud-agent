@@ -1,6 +1,8 @@
 package logs
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -160,3 +162,98 @@ func TestParseCaddyAccessStream(t *testing.T) {
 		t.Errorf("expected 3rd item to be ERROR, got %s", items[2].Severity)
 	}
 }
+
+func TestCaddyLogTailer_LifecycleRotationAndPartialWrites(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "caddy-access.log")
+
+	tailer := NewCaddyLogTailer(logPath, nil, nil)
+
+	// 1. Initial drain when file doesn't exist yet -> returns nil, nil without error
+	items, err := tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected error when file missing: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %d", len(items))
+	}
+
+	// 2. Write 2 complete log lines
+	line1 := `{"level":"info","request":{"method":"GET","host":"app.test","uri":"/one"},"status":200}` + "\n"
+	line2 := `{"level":"warn","request":{"method":"GET","host":"app.test","uri":"/two"},"status":404}` + "\n"
+	if err := os.WriteFile(logPath, []byte(line1+line2), 0644); err != nil {
+		t.Fatalf("failed to write log file: %v", err)
+	}
+
+	items, err = tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected drain error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	// 3. Second drain with no new data -> returns 0 items
+	items, err = tailer.DrainNewLogs()
+	if err != nil || len(items) != 0 {
+		t.Fatalf("expected 0 items on empty poll, got %d (err=%v)", len(items), err)
+	}
+
+	// 4. Test Partial Write: write half a JSON line without newline
+	partialChunk := `{"level":"info","request":{"method":"GET","host":"app.test","uri":"/three"`
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("failed to open file for append: %v", err)
+	}
+	_, _ = f.WriteString(partialChunk)
+	_ = f.Close()
+
+	// Drain must NOT return or crash on partial line; it buffers it
+	items, err = tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected error on partial write: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items on partial write, got %d", len(items))
+	}
+
+	// Now append the rest of the line with newline
+	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("failed to open file for append: %v", err)
+	}
+	restChunk := `},"status":200}` + "\n"
+	_, _ = f.WriteString(restChunk)
+	_ = f.Close()
+
+	// Drain now reconstitutes the complete line and parses it
+	items, err = tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected error after partial line completed: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 completed item, got %d", len(items))
+	}
+	if items[0].StructuredData["status_code"] != 200 {
+		t.Errorf("expected status 200, got %v", items[0].StructuredData["status_code"])
+	}
+
+	// 5. Test Log Rotation / Truncation: overwrite file with new shorter content
+	rotatedLine := `{"level":"error","request":{"method":"POST","host":"app.test","uri":"/login"},"status":500}` + "\n"
+	if err := os.WriteFile(logPath, []byte(rotatedLine), 0644); err != nil {
+		t.Fatalf("failed to simulate rotation: %v", err)
+	}
+
+	// Drain must detect size decrease, reset offset, and read the rotated line
+	items, err = tailer.DrainNewLogs()
+	if err != nil {
+		t.Fatalf("unexpected error on rotated log drain: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item after rotation, got %d", len(items))
+	}
+	if items[0].Severity != SeverityError {
+		t.Errorf("expected ERROR severity after rotation, got %s", items[0].Severity)
+	}
+}
+

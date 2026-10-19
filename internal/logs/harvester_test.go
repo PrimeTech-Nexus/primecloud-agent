@@ -699,4 +699,80 @@ func TestHarvester_EndToEndDurableCheckpointCommitOnAck(t *testing.T) {
 	}
 }
 
+func TestHarvester_SameTimestampBatchSplitsAndCrashSafety(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "harvester_same_ts_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cursorPath := filepath.Join(tmpDir, "cursors.json")
+	store := NewFileCursorStore(cursorPath, 100, nil)
+
+	var serverBatchesReceived int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&serverBatchesReceived, 1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"persisted","accepted_count":2}`))
+	}))
+	defer server.Close()
+
+	// 3 lines sharing the EXACT same timestamp T1
+	sameTS := "2026-10-19T05:30:00.123456789Z"
+	parsedTS, _ := time.Parse(time.RFC3339Nano, sameTS)
+
+	mockRT := &mockRuntime{
+		logOutput: map[string][]byte{
+			"cnt-same-ts": makeDockerFrame(1,
+				sameTS+" Line 1\n"+
+					sameTS+" Line 2\n"+
+					sameTS+" Line 3\n"),
+		},
+	}
+
+	// Batch size of 2 ensures the 3 items must be split across 2 batches
+	h := NewHarvester(mockRT, server.URL, 2, 1*time.Second, nil)
+	h.SetCursorStore(store)
+
+	// Harvest
+	err = h.HarvestContainerWithMetadata(context.Background(), "cnt-same-ts", "app-same", "dep-same", ResourceTypeApplication)
+	if err != nil {
+		t.Fatalf("harvest error: %v", err)
+	}
+	if len(h.buffer) != 3 {
+		t.Fatalf("expected 3 items buffered, got %d", len(h.buffer))
+	}
+
+	// Flush Batch 1: sends Line 1 and Line 2; Line 3 remains in buffer
+	err = h.Flush(context.Background())
+	if err != nil {
+		t.Fatalf("flush 1 error: %v", err)
+	}
+	if len(h.buffer) != 1 {
+		t.Fatalf("expected 1 item remaining in buffer, got %d", len(h.buffer))
+	}
+
+	// CRITICAL SAFETY CHECK: Store checkpoint must NOT have advanced to T1 yet,
+	// because Line 3 with timestamp T1 is still waiting in buffer!
+	if savedTS, ok := store.Get("cnt-same-ts"); ok && !savedTS.Before(parsedTS) {
+		t.Fatalf("cursor prematurely advanced to %v while un-sent items with same timestamp remained in buffer", savedTS)
+	}
+
+	// Flush Batch 2: sends Line 3
+	err = h.Flush(context.Background())
+	if err != nil {
+		t.Fatalf("flush 2 error: %v", err)
+	}
+	if len(h.buffer) != 0 {
+		t.Fatalf("expected buffer empty, got %d", len(h.buffer))
+	}
+
+	// Now that ALL items with timestamp T1 are flushed, checkpoint advances to T1!
+	savedTS, ok := store.Get("cnt-same-ts")
+	if !ok || !savedTS.Equal(parsedTS) {
+		t.Fatalf("expected committed checkpoint %v, got %v (ok=%v)", parsedTS, savedTS, ok)
+	}
+}
+
+
 

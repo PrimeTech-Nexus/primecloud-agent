@@ -115,6 +115,7 @@ type Harvester struct {
 	containerCursors  map[string]time.Time
 	pendingWatermarks map[string]time.Time
 	cursorStore       CursorStore
+	caddyTailer       *CaddyLogTailer
 }
 
 // NewHarvester constructs a Harvester instance.
@@ -165,6 +166,12 @@ func NewHarvesterWithAuth(
 	store := NewFileCursorStore(cursorPath, DefaultMaxCursorEntries, logger)
 	_ = store.Load()
 
+	accessLogPath := os.Getenv("PRIMECLOUD_CADDY_ACCESS_LOG")
+	if accessLogPath == "" {
+		accessLogPath = "/var/log/primecloud/caddy-access.log"
+	}
+	tailer := NewCaddyLogTailer(accessLogPath, nil, logger)
+
 	return &Harvester{
 		rt:                rt,
 		controlPlaneURL:   cleanURL,
@@ -178,6 +185,7 @@ func NewHarvesterWithAuth(
 		containerCursors:  make(map[string]time.Time),
 		pendingWatermarks: make(map[string]time.Time),
 		cursorStore:       store,
+		caddyTailer:       tailer,
 		logger:            logger.With("component", "log_harvester"),
 	}
 }
@@ -187,6 +195,13 @@ func (h *Harvester) SetCursorStore(store CursorStore) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.cursorStore = store
+}
+
+// SetCaddyTailer configures an explicit Caddy log tailer (e.g. for testing).
+func (h *Harvester) SetCaddyTailer(tailer *CaddyLogTailer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.caddyTailer = tailer
 }
 
 // RedactSecrets applies regex masking to sensitive log content.
@@ -468,8 +483,25 @@ func (h *Harvester) Flush(ctx context.Context) error {
 		h.buffer = h.buffer[count:]
 
 		maxTimestamps := make(map[string]time.Time)
+		// Track earliest timestamp remaining in h.buffer per container to avoid advancing past un-sent items
+		remainingEarliest := make(map[string]time.Time)
+		for _, item := range h.buffer {
+			if item.ContainerID != "" && item.Timestamp != nil {
+				if cur, ok := remainingEarliest[item.ContainerID]; !ok || item.Timestamp.Before(cur) {
+					remainingEarliest[item.ContainerID] = *item.Timestamp
+				}
+			}
+		}
+
 		for _, item := range toSend {
 			if item.ContainerID != "" && item.Timestamp != nil {
+				// If remaining buffer still has records with this exact timestamp or earlier for this container,
+				// do NOT advance the committed checkpoint past them until they are also flushed
+				if earliest, hasRemaining := remainingEarliest[item.ContainerID]; hasRemaining {
+					if !item.Timestamp.Before(earliest) {
+						continue
+					}
+				}
 				if cur, ok := maxTimestamps[item.ContainerID]; !ok || item.Timestamp.After(cur) {
 					maxTimestamps[item.ContainerID] = *item.Timestamp
 				}
@@ -721,6 +753,28 @@ func (h *Harvester) DiscoverAndHarvestOnce(ctx context.Context) error {
 	return nil
 }
 
+// HarvestCaddyAccessLog drains new Caddy edge access logs and enqueues them into the harvester buffer.
+func (h *Harvester) HarvestCaddyAccessLog(ctx context.Context) error {
+	h.mu.Lock()
+	tailer := h.caddyTailer
+	h.mu.Unlock()
+
+	if tailer == nil {
+		return nil
+	}
+
+	items, err := tailer.DrainNewLogs()
+	if err != nil {
+		h.logger.Debug("caddy_access_log_drain_failed", "error", err)
+		return err
+	}
+
+	for _, item := range items {
+		h.EnqueueLog(item)
+	}
+	return nil
+}
+
 // Start boots background harvesting and flush loop.
 func (h *Harvester) Start(ctx context.Context) {
 	h.logger.Info("log_harvester_started",
@@ -746,7 +800,12 @@ func (h *Harvester) Start(ctx context.Context) {
 			_ = h.DiscoverAndHarvestOnce(harvestCtx)
 			cancelHarvest()
 
-			// 2. Flush batches to Control Plane
+			// 2. Periodically harvest Caddy edge ingress access logs
+			ingressCtx, cancelIngress := context.WithTimeout(ctx, 5*time.Second)
+			_ = h.HarvestCaddyAccessLog(ingressCtx)
+			cancelIngress()
+
+			// 3. Flush batches to Control Plane
 			flushCtx, cancelFlush := context.WithTimeout(ctx, 5*time.Second)
 			if err := h.Flush(flushCtx); err != nil {
 				h.logger.Warn("log_flush_failed", "error", err)
