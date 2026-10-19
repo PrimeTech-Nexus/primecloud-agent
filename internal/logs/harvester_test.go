@@ -774,5 +774,138 @@ func TestHarvester_SameTimestampBatchSplitsAndCrashSafety(t *testing.T) {
 	}
 }
 
+func TestHarvester_EmptyAndWhitespaceLogFiltering(t *testing.T) {
+	ts1 := "2026-10-19T06:00:00.100000000Z"
+	ts2 := "2026-10-19T06:00:01.200000000Z"
+	ts3 := "2026-10-19T06:00:02.300000000Z"
+
+	// Frame with Docker timestamp followed by empty string and whitespace string
+	frame := makeDockerFrame(1,
+		ts1+" Valid leading message\n"+
+			ts2+" \n"+
+			ts3+"    \t  \n"+
+			ts3+" Valid trailing message\n")
+
+	items, err := DemuxDockerLogStream(bytes.NewReader(frame), "stdout")
+	if err != nil {
+		t.Fatalf("unexpected demux error: %v", err)
+	}
+
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items after filtering empty messages, got %d", len(items))
+	}
+	if items[0].Message != "Valid leading message" {
+		t.Errorf("expected 'Valid leading message', got '%s'", items[0].Message)
+	}
+	if items[1].Message != "Valid trailing message" {
+		t.Errorf("expected 'Valid trailing message', got '%s'", items[1].Message)
+	}
+}
+
+func TestHarvester_AggregateMultiline_PreservesMeaningfulBlankLines(t *testing.T) {
+	now := time.Now().UTC()
+	items := []LogItem{
+		{Stream: StreamStderr, Severity: SeverityError, Message: "Traceback (most recent call last):", Timestamp: &now},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "  File \"main.py\", line 10, in <module>", Timestamp: &now},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    run()", Timestamp: &now},
+		{Stream: StreamStderr, Severity: SeverityError, Message: " ", Timestamp: &now}, // meaningful blank separator line in traceback
+		{Stream: StreamStderr, Severity: SeverityError, Message: "ZeroDivisionError: division by zero", Timestamp: &now},
+	}
+
+	aggregated := AggregateMultilineItems(items)
+	if len(aggregated) != 1 {
+		t.Fatalf("expected 1 aggregated multiline item, got %d", len(aggregated))
+	}
+
+	base := aggregated[0]
+	if base.Message != "ZeroDivisionError: division by zero" {
+		t.Errorf("expected summary 'ZeroDivisionError: division by zero', got '%s'", base.Message)
+	}
+
+	rawTraceback, ok := base.StructuredData["raw_traceback"].(string)
+	if !ok {
+		t.Fatalf("expected raw_traceback in structured data")
+	}
+	if !strings.Contains(rawTraceback, "ZeroDivisionError: division by zero") {
+		t.Errorf("raw_traceback missing exception message: %s", rawTraceback)
+	}
+	if !strings.Contains(rawTraceback, "  File \"main.py\"") {
+		t.Errorf("raw_traceback missing frame: %s", rawTraceback)
+	}
+}
+
+func TestHarvester_MixedBatchDeliveryAndEnqueueFilter(t *testing.T) {
+	var receivedLogs []LogItem
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload LogBatchPayload
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		receivedLogs = append(receivedLogs, payload.Logs...)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"persisted","accepted_count":2}`))
+	}))
+	defer server.Close()
+
+	h := NewHarvester(nil, server.URL, 10, 1*time.Second, nil)
+
+	// Enqueue valid, empty, whitespace-only, and valid
+	h.EnqueueLog(LogItem{ResourceID: "app-1", Message: "First valid message"})
+	h.EnqueueLog(LogItem{ResourceID: "app-1", Message: ""})
+	h.EnqueueLog(LogItem{ResourceID: "app-1", Message: "   \t  \n"})
+	h.EnqueueLog(LogItem{ResourceID: "app-1", Message: "Second valid message"})
+
+	if len(h.buffer) != 2 {
+		t.Fatalf("expected exactly 2 items in buffer after EnqueueLog filtering, got %d", len(h.buffer))
+	}
+
+	err := h.Flush(context.Background())
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	if len(receivedLogs) != 2 {
+		t.Fatalf("expected server to receive 2 logs, got %d", len(receivedLogs))
+	}
+	if receivedLogs[0].Message != "First valid message" || receivedLogs[1].Message != "Second valid message" {
+		t.Errorf("unexpected logs received: %+v", receivedLogs)
+	}
+}
+
+func TestHarvester_PermanentRejectionOnHTTP422(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":{"code":"VALIDATION_ERROR","message":"String should have at least 1 character"}}`))
+	}))
+	defer server.Close()
+
+	h := NewHarvester(nil, server.URL, 10, 1*time.Second, nil)
+	h.buffer = append(h.buffer, LogItem{ResourceID: "app-1", Message: "invalid-batch"})
+
+	// First flush encounters HTTP 422
+	err := h.Flush(context.Background())
+	if err == nil {
+		t.Fatalf("expected error on HTTP 422, got nil")
+	}
+	if !strings.Contains(err.Error(), "permanent log ingestion rejection (status 422)") {
+		t.Errorf("expected permanent rejection error string, got: %v", err)
+	}
+
+	// CRITICAL: inflight batch must be cleared so it does not loop infinitely
+	if h.inflight != nil {
+		t.Fatalf("expected h.inflight to be nil after permanent 422 rejection, got: %+v", h.inflight)
+	}
+
+	// Subsequent flush must see empty buffer and do nothing (no HTTP calls)
+	err = h.Flush(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error on second flush: %v", err)
+	}
+	if atomic.LoadInt32(&attempts) != 1 {
+		t.Fatalf("expected exactly 1 attempt to server, got %d", attempts)
+	}
+}
+
+
 
 

@@ -262,6 +262,11 @@ func NormalizeStream(stream string) string {
 
 // EnqueueLog adds a log item to the backpressure-controlled batch buffer.
 func (h *Harvester) EnqueueLog(item LogItem) {
+	// Reject log records whose primary message is empty or whitespace-only
+	if strings.TrimSpace(item.Message) == "" {
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -416,6 +421,11 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 					}
 				}
 
+				// Skip standalone log records whose primary message is empty or whitespace-only
+				if strings.TrimSpace(msg) == "" {
+					continue
+				}
+
 				sev := defaultSev
 				lowerMsg := strings.ToLower(msg)
 				if strings.Contains(lowerMsg, "error") || strings.Contains(lowerMsg, "fatal") || strings.Contains(lowerMsg, "panic") {
@@ -445,7 +455,7 @@ func DemuxDockerLogStream(reader io.Reader, fallbackStream string) ([]LogItem, e
 
 	for _, line := range lines {
 		trimmed := strings.TrimRight(line, "\r\n")
-		if trimmed == "" {
+		if strings.TrimSpace(trimmed) == "" {
 			continue
 		}
 		fallbackItems = append(fallbackItems, LogItem{
@@ -579,10 +589,11 @@ func (h *Harvester) transmitBatch(ctx context.Context, batch *BatchWithKey) erro
 		return nil
 	}
 
-	// Permanent failures (401/403 auth errors, 400 validation, 404 unmapped resource, 409 conflict):
+	// Permanent failures (401/403 auth errors, 400/422 validation, 404 unmapped resource, 409 conflict):
 	// Drop the rejected batch to avoid permanently stalling the ingestion queue.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
-		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusConflict {
+		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity ||
+		resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusConflict {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		h.mu.Lock()
 		h.inflight = nil
