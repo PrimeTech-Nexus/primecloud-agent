@@ -23,7 +23,7 @@ var caddySensitiveQueryRegex = regexp.MustCompile(`(?i)(token|key|api_key|secret
 // CaddyAccessLogEntry models Caddy v2's structured JSON access log format.
 type CaddyAccessLogEntry struct {
 	Level       string                 `json:"level"`
-	Ts          float64                `json:"ts"`
+	Ts          json.RawMessage        `json:"ts"`
 	Logger      string                 `json:"logger"`
 	Msg         string                 `json:"msg"`
 	Request     CaddyRequestDetails    `json:"request"`
@@ -134,11 +134,24 @@ func ParseCaddyAccessLogLine(line string, domainMap map[string]string) (*LogItem
 
 	// Timestamp
 	var ts time.Time
-	if entry.Ts > 0 {
-		sec := int64(entry.Ts)
-		nsec := int64((entry.Ts - float64(sec)) * 1e9)
-		ts = time.Unix(sec, nsec).UTC()
-	} else {
+	if len(entry.Ts) > 0 {
+		var tsFloat float64
+		if err := json.Unmarshal(entry.Ts, &tsFloat); err == nil && tsFloat > 0 {
+			sec := int64(tsFloat)
+			nsec := int64((tsFloat - float64(sec)) * 1e9)
+			ts = time.Unix(sec, nsec).UTC()
+		} else {
+			var tsStr string
+			if err := json.Unmarshal(entry.Ts, &tsStr); err == nil && tsStr != "" {
+				if parsedTs, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
+					ts = parsedTs.UTC()
+				} else if parsedTs, err := time.Parse(time.RFC3339, tsStr); err == nil {
+					ts = parsedTs.UTC()
+				}
+			}
+		}
+	}
+	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
 

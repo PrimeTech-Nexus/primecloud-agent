@@ -317,4 +317,43 @@ func TestCaddyLogTailer_RenameReplacementNewFileLargerThanOffset(t *testing.T) {
 	}
 }
 
+func TestParseCaddyAccessLogLine_ISO8601StringTimestamp(t *testing.T) {
+	isoJSON := `{
+		"level": "info",
+		"ts": "2026-10-19T21:58:52.803Z",
+		"logger": "http.log.access.log0",
+		"msg": "handled request",
+		"request": {
+			"remote_ip": "102.201.138.108",
+			"remote_port": "51086",
+			"client_ip": "102.201.138.108",
+			"proto": "HTTP/1.1",
+			"method": "GET",
+			"host": "sambackend.primecloud.cloud",
+			"uri": "/api/v1/salon/services"
+		},
+		"status": 422,
+		"duration": 0.00777546,
+		"uuid": "cbbad1e4-6192-4422-9941-12774d17b928"
+	}`
+
+	item, err := ParseCaddyAccessLogLine(isoJSON, nil)
+	if err != nil {
+		t.Fatalf("expected successful parsing of ISO8601 timestamp string, got: %v", err)
+	}
+	if item == nil {
+		t.Fatal("expected non-nil LogItem")
+	}
+	if item.Severity != SeverityWarn {
+		t.Errorf("expected SeverityWarn for HTTP 422, got %s", item.Severity)
+	}
+	expectedYear := 2026
+	if item.Timestamp.Year() != expectedYear {
+		t.Errorf("expected year %d, got %d", expectedYear, item.Timestamp.Year())
+	}
+	if item.ResourceID != "sambackend" {
+		t.Errorf("expected ResourceID 'sambackend', got '%s'", item.ResourceID)
+	}
+}
+
 
