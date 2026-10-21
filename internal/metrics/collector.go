@@ -208,6 +208,10 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 						if insp.Labels != nil {
 							if rid, ok := insp.Labels["primecloud.resource_id"]; ok && rid != "" {
 								stat.ResourceID = rid
+							} else if aid, ok := insp.Labels["primecloud.application_id"]; ok && aid != "" {
+								stat.ResourceID = aid
+							} else if wid, ok := insp.Labels["primecloud.workload.id"]; ok && wid != "" {
+								stat.ResourceID = wid
 							}
 						}
 
@@ -216,13 +220,27 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 							cntName = cnt.Names[0]
 						}
 
-						// Fallback: extract resource ID from standard container name pc-pg-<uuid> / pc-vk-<uuid>
+						cleanName := strings.TrimPrefix(cntName, "/")
+						if strings.HasPrefix(cleanName, "primecloud-") {
+							// Skip platform infrastructure and control-plane containers from tenant workload metrics
+							continue
+						}
+
+						// Fallback: extract resource ID from standard container name pc-pg-<uuid> / pc-vk-<uuid> / pc-app-<uuid>
 						if stat.ResourceID == "" {
-							cleanName := strings.TrimPrefix(cntName, "/")
 							if strings.HasPrefix(cleanName, "pc-pg-") {
 								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-pg-")
 							} else if strings.HasPrefix(cleanName, "pc-vk-") {
 								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-vk-")
+							} else if strings.HasPrefix(cleanName, "pc-app-") {
+								suffix := strings.TrimPrefix(cleanName, "pc-app-")
+								parts := strings.Split(suffix, "-")
+								if len(parts) >= 10 {
+									// Format pc-app-<account-uuid>-<app-uuid>: 5 parts per UUID
+									stat.ResourceID = strings.Join(parts[len(parts)-5:], "-")
+								} else if len(parts) == 5 {
+									stat.ResourceID = suffix
+								}
 							}
 						}
 

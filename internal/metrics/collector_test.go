@@ -146,3 +146,83 @@ func TestCollectorAuthoritativeResourceUUID(t *testing.T) {
 		t.Errorf("authoritative Valkey resource UUID e89a1b2c-3d4e-5f60-7182-93a4b5c6d7e8 was not found in ContainerStats")
 	}
 }
+
+type mockAppAndInfraRuntime struct {
+	agentruntime.ContainerRuntime
+}
+
+func (m *mockAppAndInfraRuntime) ListContainers(ctx context.Context, all bool) ([]agentruntime.ContainerSummary, error) {
+	return []agentruntime.ContainerSummary{
+		{ID: "cnt-app-label", Names: []string{"/pc-app-labeled"}, State: "running"},
+		{ID: "cnt-app-name", Names: []string{"/pc-app-01a134a0-bbfb-73fe-a2d1-c23a5ab815ec-3dbb740b-8e7a-4403-b71c-cb5f5b57704c"}, State: "running"},
+		{ID: "cnt-infra-cp", Names: []string{"/primecloud-control-plane"}, State: "running"},
+		{ID: "cnt-infra-vk", Names: []string{"/primecloud-valkey"}, State: "running"},
+	}, nil
+}
+
+func (m *mockAppAndInfraRuntime) InspectContainer(ctx context.Context, containerID string) (*agentruntime.ContainerInspect, error) {
+	if containerID == "cnt-app-label" {
+		return &agentruntime.ContainerInspect{
+			ID:      containerID,
+			Name:    "/pc-app-labeled",
+			Running: true,
+			Labels: map[string]string{
+				"primecloud.application_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+				"primecloud.managed":        "true",
+			},
+		}, nil
+	}
+	if containerID == "cnt-app-name" {
+		return &agentruntime.ContainerInspect{
+			ID:      containerID,
+			Name:    "/pc-app-01a134a0-bbfb-73fe-a2d1-c23a5ab815ec-3dbb740b-8e7a-4403-b71c-cb5f5b57704c",
+			Running: true,
+		}, nil
+	}
+	if containerID == "cnt-infra-cp" {
+		return &agentruntime.ContainerInspect{
+			ID:      containerID,
+			Name:    "/primecloud-control-plane",
+			Running: true,
+		}, nil
+	}
+	return &agentruntime.ContainerInspect{
+		ID:      containerID,
+		Name:    "/primecloud-valkey",
+		Running: true,
+	}, nil
+}
+
+func (m *mockAppAndInfraRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (m *mockAppAndInfraRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	return nil, nil, 0, nil
+}
+
+func TestCollectorApplicationResolutionAndInfraFilter(t *testing.T) {
+	rt := &mockAppAndInfraRuntime{}
+	coll := NewCollector(100*time.Millisecond, "node-001", "agent-001", rt, nil, nil)
+
+	payload, err := coll.Sample(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected sampling error: %v", err)
+	}
+
+	// Infra containers (primecloud-control-plane, primecloud-valkey) must be skipped from tenant stats
+	if len(payload.ContainerStats) != 2 {
+		t.Fatalf("expected 2 tenant containers in stats, got %d", len(payload.ContainerStats))
+	}
+
+	appByLabel := payload.ContainerStats["cnt-app-labe"]
+	if appByLabel.ResourceID != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
+		t.Errorf("expected label resolved UUID aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, got %s", appByLabel.ResourceID)
+	}
+
+	appByName := payload.ContainerStats["cnt-app-name"]
+	if appByName.ResourceID != "3dbb740b-8e7a-4403-b71c-cb5f5b57704c" {
+		t.Errorf("expected name resolved UUID 3dbb740b-8e7a-4403-b71c-cb5f5b57704c, got %s", appByName.ResourceID)
+	}
+}
+

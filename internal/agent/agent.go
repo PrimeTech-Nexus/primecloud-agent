@@ -454,10 +454,24 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			tlsEnabled = te
 		}
 
+		tlsMode := ""
+		if tm, ok := payload["tls_mode"].(string); ok {
+			tlsMode = strings.ToLower(strings.TrimSpace(tm))
+		}
+
+		customDomain := false
+		if cd, ok := payload["custom_domain"].(bool); ok {
+			customDomain = cd
+		} else if cd, ok := payload["is_custom_domain"].(bool); ok {
+			customDomain = cd
+		}
+
 		routeCfg := &caddy.RouteConfig{
-			Domain:   domain,
-			Upstream: upstream,
-			TLS:      tlsEnabled,
+			Domain:       domain,
+			Upstream:     upstream,
+			TLS:          tlsEnabled,
+			TLSMode:      tlsMode,
+			CustomDomain: customDomain,
 		}
 
 		if err := caddyMgr.ConfigureRoute(ctx, routeCfg); err != nil {
@@ -470,12 +484,20 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}, err
 		}
 
+		urlScheme := "https"
+		if !tlsEnabled || tlsMode == "none" || tlsMode == "off" || tlsMode == "http" {
+			urlScheme = "http"
+		}
+
 		resData := map[string]interface{}{
 			"route_id": fmt.Sprintf("route-%s", op.OperationId),
 			"domain":   domain,
 			"upstream": upstream,
 			"status":   "ACTIVE",
-			"url":      fmt.Sprintf("https://%s", domain),
+			"url":      fmt.Sprintf("%s://%s", urlScheme, domain),
+		}
+		if tlsMode != "" {
+			resData["tls_mode"] = tlsMode
 		}
 		resJSONBytes, _ := json.Marshal(resData)
 

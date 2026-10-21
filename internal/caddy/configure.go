@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,8 @@ type RouteConfig struct {
 	Domain          string            `json:"domain"`
 	Upstream        string            `json:"upstream"`
 	TLS             bool              `json:"tls"`
+	TLSMode         string            `json:"tls_mode,omitempty"`
+	CustomDomain    bool              `json:"custom_domain,omitempty"`
 	Headers         map[string]string `json:"headers,omitempty"`
 	HealthCheckPath string            `json:"health_check_path,omitempty"`
 	ResourceID      string            `json:"resource_id,omitempty"`
@@ -62,23 +65,124 @@ func (m *Manager) ConfigDir() string {
 
 var validDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 
+// ValidateHostname enforces RFC 1123 compliance and rejects SSRF, loopbacks, IP literals, and path traversal.
+func ValidateHostname(rawDomain string) (string, error) {
+	domain := strings.TrimSpace(rawDomain)
+	domain = strings.TrimPrefix(domain, "http://")
+	domain = strings.TrimPrefix(domain, "https://")
+	domain = strings.TrimSuffix(domain, "/")
+
+	if domain == "" {
+		return "", fmt.Errorf("domain cannot be empty")
+	}
+
+	// Reject path separators, control characters, colons, query parameters, fragments, or path traversals
+	if strings.ContainsAny(domain, "/\\?#@:") || strings.Contains(domain, "..") {
+		return "", fmt.Errorf("domain contains invalid characters, path components, or port: %q", rawDomain)
+	}
+
+	for _, ch := range domain {
+		if ch <= 32 || ch >= 127 {
+			return "", fmt.Errorf("domain contains whitespace or non-printable character: %q", rawDomain)
+		}
+	}
+
+	// RFC 1035 / RFC 1123 max length is 253 characters
+	if len(domain) > 253 {
+		return "", fmt.Errorf("domain exceeds maximum length of 253 characters: length=%d", len(domain))
+	}
+
+	lower := strings.ToLower(domain)
+
+	// Reject IP literals (both IPv4 and IPv6)
+	ipStr := strings.TrimPrefix(strings.TrimSuffix(lower, "]"), "[")
+	if ip := net.ParseIP(ipStr); ip != nil {
+		return "", fmt.Errorf("IP literal hostnames are rejected for ingress routes: %q", rawDomain)
+	}
+
+	// Reject loopback hostnames
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+		return "", fmt.Errorf("loopback hostnames are rejected for ingress routes: %q", rawDomain)
+	}
+
+	// Reject cloud metadata SSRF endpoints
+	if lower == "metadata" || lower == "instance-data" ||
+		lower == "metadata.google.internal" || strings.HasSuffix(lower, ".metadata.google.internal") ||
+		strings.Contains(lower, "169.254") {
+		return "", fmt.Errorf("cloud metadata service endpoints are rejected for ingress routes: %q", rawDomain)
+	}
+
+	// Wildcard handling: wildcards are strictly allowed only as a leading "*." prefix
+	checkDomain := lower
+	if strings.HasPrefix(checkDomain, "*.") {
+		checkDomain = strings.TrimPrefix(checkDomain, "*.")
+		if checkDomain == "" || strings.Contains(checkDomain, "*") {
+			return "", fmt.Errorf("malformed wildcard domain: %q", rawDomain)
+		}
+	} else if strings.Contains(checkDomain, "*") {
+		return "", fmt.Errorf("wildcards are only permitted as a leading '*.' prefix: %q", rawDomain)
+	}
+
+	labels := strings.Split(checkDomain, ".")
+	if len(labels) < 2 {
+		return "", fmt.Errorf("hostname must contain at least two labels (e.g. example.com): %q", rawDomain)
+	}
+
+	for i, label := range labels {
+		if len(label) == 0 {
+			return "", fmt.Errorf("hostname contains empty label: %q", rawDomain)
+		}
+		if len(label) > 63 {
+			return "", fmt.Errorf("hostname label %q exceeds maximum length of 63 characters", label)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", fmt.Errorf("hostname label %q cannot start or end with a hyphen", label)
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+				return "", fmt.Errorf("hostname label %q contains invalid character %q (only alphanumeric and hyphens are permitted)", label, r)
+			}
+		}
+		// Last label (TLD) must not be all-numeric (RFC 1123 / RFC 3696)
+		if i == len(labels)-1 {
+			isAllDigits := true
+			for _, r := range label {
+				if r < '0' || r > '9' {
+					isAllDigits = false
+					break
+				}
+			}
+			if isAllDigits {
+				return "", fmt.Errorf("top-level domain cannot be all-numeric: %q", label)
+			}
+		}
+	}
+
+	return lower, nil
+}
+
+// isInternalDomain checks if the given hostname corresponds to an internal or local domain.
+func isInternalDomain(domain string) bool {
+	lower := strings.ToLower(domain)
+	return strings.HasSuffix(lower, ".local") ||
+		strings.HasSuffix(lower, ".internal") ||
+		strings.HasSuffix(lower, ".intra") ||
+		strings.HasSuffix(lower, ".test") ||
+		lower == "localhost"
+}
+
 // GenerateSnippet renders a Caddyfile configuration block for the route.
 func GenerateSnippet(route *RouteConfig) (string, error) {
 	if route == nil {
 		return "", fmt.Errorf("route config cannot be nil")
 	}
-	domain := strings.TrimSpace(route.Domain)
-	if domain == "" {
-		return "", fmt.Errorf("domain cannot be empty")
+
+	cleanDomain, err := ValidateHostname(route.Domain)
+	if err != nil {
+		return "", err
 	}
-	domain = strings.TrimPrefix(domain, "http://")
-	domain = strings.TrimPrefix(domain, "https://")
-	domain = strings.TrimSuffix(domain, "/")
-	isWildcard := strings.HasPrefix(domain, "*.")
-	cleanCheck := strings.TrimPrefix(domain, "*.")
-	if !validDomainRegex.MatchString(domain) && !validDomainRegex.MatchString(cleanCheck) && domain != "localhost" && !strings.HasSuffix(domain, ".local") {
-		return "", fmt.Errorf("invalid domain format: %q", route.Domain)
-	}
+
+	isWildcard := strings.HasPrefix(cleanDomain, "*.")
 
 	upstream := strings.TrimSpace(route.Upstream)
 	if !isWildcard && upstream == "" {
@@ -88,19 +192,38 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 	upstream = strings.TrimPrefix(upstream, "https://")
 
 	var sb strings.Builder
-	if route.TLS {
-		// In Caddy, an unqualified domain name (or https://domain) triggers standard TLS.
-		// Never combine http:// and https:// in a block that specifies tls directives.
-		sb.WriteString(fmt.Sprintf("%s {\n", domain))
-		certPath := "/etc/primecloud/certs/origin.crt"
-		keyPath := "/etc/primecloud/certs/origin.key"
-		if _, err := os.Stat(certPath); err == nil {
-			sb.WriteString(fmt.Sprintf("    tls %s %s\n", certPath, keyPath))
-		} else {
-			sb.WriteString("    tls internal\n")
-		}
+
+	tlsMode := strings.ToLower(strings.TrimSpace(route.TLSMode))
+	isTLSDisabled := !route.TLS || tlsMode == "none" || tlsMode == "off" || tlsMode == "http"
+
+	if isTLSDisabled {
+		sb.WriteString(fmt.Sprintf("http://%s {\n", cleanDomain))
 	} else {
-		sb.WriteString(fmt.Sprintf("http://%s {\n", domain))
+		// In Caddy, an unqualified domain name triggers automated TLS.
+		sb.WriteString(fmt.Sprintf("%s {\n", cleanDomain))
+
+		isInternal := isInternalDomain(cleanDomain)
+		if tlsMode == "internal" || (tlsMode == "" && !route.CustomDomain && isInternal) {
+			sb.WriteString("    tls internal\n")
+		} else if tlsMode == "origin" {
+			certPath := os.Getenv("PRIMECLOUD_ORIGIN_CERT_PATH")
+			if certPath == "" {
+				certPath = "/etc/primecloud/certs/origin.crt"
+			}
+			keyPath := os.Getenv("PRIMECLOUD_ORIGIN_KEY_PATH")
+			if keyPath == "" {
+				keyPath = "/etc/primecloud/certs/origin.key"
+			}
+			if _, err := os.Stat(certPath); err == nil {
+				sb.WriteString(fmt.Sprintf("    tls %s %s\n", certPath, keyPath))
+			} else {
+				sb.WriteString("    tls internal\n")
+			}
+		} else {
+			// TLSMode == "acme", route.CustomDomain == true, or standard custom domain:
+			// Automated ACME TLS: Caddy automatically manages public certificates via Let's Encrypt / ZeroSSL.
+			// No origin certificate or explicit tls directive is attached.
+		}
 	}
 
 	// Request Correlation: Return X-Prime-Request-Id downstream to client (ADR-0004)
@@ -147,16 +270,9 @@ func (m *Manager) ConfigureRoute(ctx context.Context, route *RouteConfig) error 
 	if route == nil {
 		return fmt.Errorf("route config cannot be nil")
 	}
-	cleanDomain := strings.TrimSpace(route.Domain)
-	cleanDomain = strings.TrimPrefix(cleanDomain, "http://")
-	cleanDomain = strings.TrimPrefix(cleanDomain, "https://")
-	cleanDomain = strings.TrimSuffix(cleanDomain, "/")
-	if cleanDomain == "" {
-		return fmt.Errorf("domain cannot be empty")
-	}
-	cleanCheck := strings.TrimPrefix(cleanDomain, "*.")
-	if !validDomainRegex.MatchString(cleanDomain) && !validDomainRegex.MatchString(cleanCheck) && cleanDomain != "localhost" && !strings.HasSuffix(cleanDomain, ".local") {
-		return fmt.Errorf("invalid domain format: %q", route.Domain)
+	cleanDomain, err := ValidateHostname(route.Domain)
+	if err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(m.configDir, 0755); err != nil {
