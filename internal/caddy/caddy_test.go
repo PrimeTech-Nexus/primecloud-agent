@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -347,3 +348,345 @@ func TestManager_ValidationFailurePropagates(t *testing.T) {
 		t.Fatalf("Expected error for empty upstream")
 	}
 }
+
+func TestGenerateSnippet_CustomDomainACMETLS(t *testing.T) {
+	tests := []struct {
+		name  string
+		route *RouteConfig
+	}{
+		{
+			name: "explicit acme tls_mode",
+			route: &RouteConfig{
+				Domain:   "custom.example.com",
+				Upstream: "127.0.0.1:8080",
+				TLS:      true,
+				TLSMode:  "acme",
+			},
+		},
+		{
+			name: "custom_domain flag true",
+			route: &RouteConfig{
+				Domain:       "custom2.example.com",
+				Upstream:     "127.0.0.1:8080",
+				TLS:          true,
+				CustomDomain: true,
+			},
+		},
+		{
+			name: "default public custom domain without tls_mode",
+			route: &RouteConfig{
+				Domain:   "dashboard.customclient.org",
+				Upstream: "127.0.0.1:9000",
+				TLS:      true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snippet, err := GenerateSnippet(tt.route)
+			if err != nil {
+				t.Fatalf("GenerateSnippet() unexpected error = %v", err)
+			}
+
+			// Clean virtual host snippet for Caddy automated ACME
+			cleanDomain := strings.TrimSpace(tt.route.Domain)
+			if !strings.Contains(snippet, cleanDomain+" {") {
+				t.Errorf("Snippet missing site block declaration for %s in:\n%s", cleanDomain, snippet)
+			}
+			if !strings.Contains(snippet, "reverse_proxy "+tt.route.Upstream) {
+				t.Errorf("Snippet missing reverse_proxy in:\n%s", snippet)
+			}
+
+			// Must NOT hardcode origin.crt or origin.key
+			if strings.Contains(snippet, "origin.crt") || strings.Contains(snippet, "origin.key") {
+				t.Errorf("Custom domain snippet must NOT contain origin.crt/key, got:\n%s", snippet)
+			}
+
+			// Must NOT output tls internal for public custom domains
+			if strings.Contains(snippet, "tls internal") {
+				t.Errorf("Custom domain snippet must NOT contain 'tls internal', got:\n%s", snippet)
+			}
+
+			// Must pass Caddyfile syntax validation
+			if err := ValidateConfig(snippet); err != nil {
+				t.Errorf("ValidateConfig failed on generated snippet: %v\nSnippet:\n%s", err, snippet)
+			}
+		})
+	}
+}
+
+func TestGenerateSnippet_OriginDomain(t *testing.T) {
+	t.Run("with origin cert present", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		certPath := filepath.Join(tmpDir, "origin.crt")
+		keyPath := filepath.Join(tmpDir, "origin.key")
+
+		if err := os.WriteFile(certPath, []byte("fake-cert"), 0644); err != nil {
+			t.Fatalf("failed to write fake cert: %v", err)
+		}
+		if err := os.WriteFile(keyPath, []byte("fake-key"), 0600); err != nil {
+			t.Fatalf("failed to write fake key: %v", err)
+		}
+
+		t.Setenv("PRIMECLOUD_ORIGIN_CERT_PATH", certPath)
+		t.Setenv("PRIMECLOUD_ORIGIN_KEY_PATH", keyPath)
+
+		route := &RouteConfig{
+			Domain:   "platform.primecloud.cloud",
+			Upstream: "127.0.0.1:8080",
+			TLS:      true,
+			TLSMode:  "origin",
+		}
+
+		snippet, err := GenerateSnippet(route)
+		if err != nil {
+			t.Fatalf("GenerateSnippet() unexpected error = %v", err)
+		}
+
+		expectedTLS := fmt.Sprintf("tls %s %s", certPath, keyPath)
+		if !strings.Contains(snippet, expectedTLS) {
+			t.Errorf("Snippet missing origin tls directive %q, got:\n%s", expectedTLS, snippet)
+		}
+		if strings.Contains(snippet, "tls internal") {
+			t.Errorf("Snippet should not contain 'tls internal' when origin cert exists, got:\n%s", snippet)
+		}
+
+		if err := ValidateConfig(snippet); err != nil {
+			t.Errorf("ValidateConfig failed: %v", err)
+		}
+	})
+
+	t.Run("without origin cert fallback to internal", func(t *testing.T) {
+		t.Setenv("PRIMECLOUD_ORIGIN_CERT_PATH", filepath.Join(t.TempDir(), "nonexistent.crt"))
+		t.Setenv("PRIMECLOUD_ORIGIN_KEY_PATH", filepath.Join(t.TempDir(), "nonexistent.key"))
+
+		route := &RouteConfig{
+			Domain:   "platform.primecloud.cloud",
+			Upstream: "127.0.0.1:8080",
+			TLS:      true,
+			TLSMode:  "origin",
+		}
+
+		snippet, err := GenerateSnippet(route)
+		if err != nil {
+			t.Fatalf("GenerateSnippet() unexpected error = %v", err)
+		}
+
+		if !strings.Contains(snippet, "tls internal") {
+			t.Errorf("Snippet expected 'tls internal' fallback when origin cert missing, got:\n%s", snippet)
+		}
+
+		if err := ValidateConfig(snippet); err != nil {
+			t.Errorf("ValidateConfig failed: %v", err)
+		}
+	})
+}
+
+func TestGenerateSnippet_InternalTLS(t *testing.T) {
+	t.Run("explicit internal tls_mode", func(t *testing.T) {
+		route := &RouteConfig{
+			Domain:   "svc.corp.internal",
+			Upstream: "127.0.0.1:8080",
+			TLS:      true,
+			TLSMode:  "internal",
+		}
+
+		snippet, err := GenerateSnippet(route)
+		if err != nil {
+			t.Fatalf("GenerateSnippet() unexpected error: %v", err)
+		}
+
+		if !strings.Contains(snippet, "tls internal") {
+			t.Errorf("Snippet missing 'tls internal', got:\n%s", snippet)
+		}
+		if strings.Contains(snippet, "origin.crt") {
+			t.Errorf("Internal route must not reference origin.crt, got:\n%s", snippet)
+		}
+
+		if err := ValidateConfig(snippet); err != nil {
+			t.Errorf("ValidateConfig failed: %v", err)
+		}
+	})
+
+	t.Run("implicit internal domain .local", func(t *testing.T) {
+		route := &RouteConfig{
+			Domain:   "app.cluster.local",
+			Upstream: "127.0.0.1:3000",
+			TLS:      true,
+			TLSMode:  "",
+		}
+
+		snippet, err := GenerateSnippet(route)
+		if err != nil {
+			t.Fatalf("GenerateSnippet() unexpected error: %v", err)
+		}
+
+		if !strings.Contains(snippet, "tls internal") {
+			t.Errorf("Expected 'tls internal' for .local domain, got:\n%s", snippet)
+		}
+
+		if err := ValidateConfig(snippet); err != nil {
+			t.Errorf("ValidateConfig failed: %v", err)
+		}
+	})
+}
+
+func TestGenerateSnippet_UpstreamHostPortMapping(t *testing.T) {
+	upstreams := []string{
+		"127.0.0.1:8080",
+		"127.0.0.1:32768",
+		"10.0.1.15:4000",
+		"backend.service:9000",
+	}
+
+	for _, up := range upstreams {
+		t.Run("upstream_"+up, func(t *testing.T) {
+			route := &RouteConfig{
+				Domain:   "api.example.com",
+				Upstream: up,
+				TLS:      true,
+				TLSMode:  "acme",
+			}
+
+			snippet, err := GenerateSnippet(route)
+			if err != nil {
+				t.Fatalf("GenerateSnippet() error = %v", err)
+			}
+
+			expectedProxy := fmt.Sprintf("reverse_proxy %s {", up)
+			if !strings.Contains(snippet, expectedProxy) {
+				t.Errorf("Snippet missing %q in:\n%s", expectedProxy, snippet)
+			}
+			if !strings.Contains(snippet, "header_up Host {host}") {
+				t.Errorf("Snippet missing Host header forward in:\n%s", snippet)
+			}
+			if !strings.Contains(snippet, "header_up X-Prime-Request-Id {http.request.uuid}") {
+				t.Errorf("Snippet missing X-Prime-Request-Id header forward in:\n%s", snippet)
+			}
+		})
+	}
+}
+
+func TestGenerateSnippet_MalformedHostnameRejection(t *testing.T) {
+	badHostnames := []struct {
+		name     string
+		hostname string
+	}{
+		{"empty", ""},
+		{"whitespace", "   "},
+		{"ipv4 loopback literal", "127.0.0.1"},
+		{"ipv6 loopback literal", "::1"},
+		{"ipv4 private literal", "192.168.1.1"},
+		{"ipv4 zero literal", "0.0.0.0"},
+		{"cloud metadata ipv4", "169.254.169.254"},
+		{"loopback localhost", "localhost"},
+		{"loopback sub localhost", "api.localhost"},
+		{"gcp metadata domain", "metadata.google.internal"},
+		{"sub gcp metadata domain", "worker.metadata.google.internal"},
+		{"aws metadata domain", "instance-data"},
+		{"metadata word", "metadata"},
+		{"path traversal slash", "example.com/../etc/passwd"},
+		{"path component slash", "example.com/path"},
+		{"backslash path", "example.com\\path"},
+		{"port in hostname", "example.com:8080"},
+		{"consecutive dots", "app..example.com"},
+		{"leading dot", ".example.com"},
+		{"trailing dot", "example.com."},
+		{"leading hyphen in label", "-example.com"},
+		{"trailing hyphen in label", "example-.com"},
+		{"invalid underscore", "app_service.example.com"},
+		{"all numeric tld", "example.123"},
+		{"single label", "singlename"},
+		{"wildcard in middle", "sub.*.example.com"},
+		{"wildcard missing dot", "*example.com"},
+		{"label exceeding 63 chars", strings.Repeat("a", 64) + ".example.com"},
+		{"domain exceeding 253 chars", strings.Repeat("a.b", 86) + ".com"},
+	}
+
+	for _, tc := range badHostnames {
+		t.Run(tc.name, func(t *testing.T) {
+			route := &RouteConfig{
+				Domain:   tc.hostname,
+				Upstream: "127.0.0.1:8080",
+				TLS:      true,
+			}
+
+			snippet, err := GenerateSnippet(route)
+			if err == nil {
+				t.Errorf("GenerateSnippet() expected error for invalid hostname %q, got snippet:\n%s", tc.hostname, snippet)
+			}
+		})
+	}
+}
+
+func TestManager_RouteRemovalAndCleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	adminServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer adminServer.Close()
+
+	mgr := NewManager(tmpDir, adminServer.URL, nil)
+	ctx := context.Background()
+
+	// Pre-create an unrelated customer route
+	unrelatedRoute := &RouteConfig{
+		Domain:   "unrelated-app.domain.com",
+		Upstream: "127.0.0.1:7000",
+		TLS:      true,
+		TLSMode:  "acme",
+	}
+	if err := mgr.ConfigureRoute(ctx, unrelatedRoute); err != nil {
+		t.Fatalf("Failed to configure unrelated route: %v", err)
+	}
+
+	unrelatedFile := filepath.Join(tmpDir, "unrelated-app.domain.com.caddy")
+	if _, err := os.Stat(unrelatedFile); err != nil {
+		t.Fatalf("Expected unrelated route file to exist: %v", err)
+	}
+
+	// Configure target route
+	targetRoute := &RouteConfig{
+		Domain:       "custom-shop.mystore.org",
+		Upstream:     "127.0.0.1:8080",
+		TLS:          true,
+		TLSMode:      "acme",
+		CustomDomain: true,
+	}
+	if err := mgr.ConfigureRoute(ctx, targetRoute); err != nil {
+		t.Fatalf("Failed to configure target route: %v", err)
+	}
+
+	targetFile := filepath.Join(tmpDir, "custom-shop.mystore.org.caddy")
+	content, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("Expected target route file to exist: %v", err)
+	}
+	if strings.Contains(string(content), "origin.crt") {
+		t.Errorf("Target route file must not contain origin.crt")
+	}
+
+	// Remove target route
+	if err := mgr.RemoveRoute(ctx, "custom-shop.mystore.org"); err != nil {
+		t.Fatalf("RemoveRoute failed: %v", err)
+	}
+
+	// Verify target file is removed
+	if _, err := os.Stat(targetFile); !os.IsNotExist(err) {
+		t.Errorf("Expected target route file %s to be deleted", targetFile)
+	}
+
+	// Verify unrelated route is still present and intact
+	if _, err := os.Stat(unrelatedFile); err != nil {
+		t.Errorf("Unrelated route was unexpectedly deleted or corrupted: %v", err)
+	}
+
+	// Verify idempotent removal succeeds
+	if err := mgr.RemoveRoute(ctx, "custom-shop.mystore.org"); err != nil {
+		t.Errorf("Expected idempotent RemoveRoute to succeed, got: %v", err)
+	}
+}
+
