@@ -8,9 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/backup"
+	"github.com/primecloud/primecloud-agent/internal/mongodb"
+	"github.com/primecloud/primecloud-agent/internal/mysql"
 	"github.com/primecloud/primecloud-agent/internal/postgres"
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/valkey"
@@ -34,34 +35,28 @@ func NewReconstructor(rt agentruntime.ContainerRuntime, logger *slog.Logger) *Re
 	}
 }
 
-// ReconstructArtifact decrypts the encrypted backup file and verifies its checksum against the manifest.
+// ReconstructArtifact decrypts the encrypted backup file via streaming DecryptStream and verifies its checksum against the manifest.
 func (r *Reconstructor) ReconstructArtifact(ctx context.Context, encryptedPath, manifestPath string, encKey []byte, outputDir string) (string, *backup.Manifest, error) {
 	manifest, err := backup.LoadManifest(manifestPath)
+	if err != nil || manifest == nil {
+		return "", nil, fmt.Errorf("MANIFEST_NOT_FOUND: required manifest file missing or unreadable at %s: %w", manifestPath, err)
+	}
+	if strings.TrimSpace(manifest.ChecksumSHA256) == "" {
+		return "", nil, fmt.Errorf("MANIFEST_INVALID: manifest is missing required plaintext checksum_sha256")
+	}
 
-	ciphertext, errRead := os.ReadFile(encryptedPath)
+	encFile, errRead := os.Open(encryptedPath)
 	if errRead != nil {
-		return "", nil, fmt.Errorf("failed to read encrypted backup file: %w", errRead)
+		return "", nil, fmt.Errorf("failed to open encrypted backup file: %w", errRead)
 	}
+	defer encFile.Close()
 
-	plaintext, errDecrypt := backup.DecryptAESGCM(encKey, ciphertext)
-	if errDecrypt != nil {
-		return "", nil, fmt.Errorf("failed to decrypt backup artifact: %w", errDecrypt)
+	encStat, errStat := encFile.Stat()
+	if errStat != nil {
+		return "", nil, fmt.Errorf("failed to stat encrypted backup file: %w", errStat)
 	}
-
-	if err != nil {
-		// If manifest file was not locally present on disk, synthesize manifest from decrypted artifact
-		hash, _, _ := backup.ComputeSHA256(encryptedPath)
-		base := strings.TrimSuffix(filepath.Base(encryptedPath), filepath.Ext(encryptedPath))
-		manifest = &backup.Manifest{
-			BackupID:           base,
-			ResourceID:         base,
-			ResourceType:       "postgres",
-			Algorithm:          "AES-256-GCM",
-			ChecksumSHA256:     hash,
-			OriginalSizeBytes:  int64(len(plaintext)),
-			EncryptedSizeBytes: int64(len(ciphertext)),
-			CreatedAt:          time.Now(),
-		}
+	if encStat.Size() == 0 {
+		return "", nil, fmt.Errorf("encrypted backup file is empty")
 	}
 
 	if err := os.MkdirAll(outputDir, 0700); err != nil {
@@ -69,24 +64,49 @@ func (r *Reconstructor) ReconstructArtifact(ctx context.Context, encryptedPath, 
 	}
 
 	ext := ".dump"
-	if manifest.ResourceType == "valkey" || manifest.ResourceType == "keyvalue" || manifest.ResourceType == "redis" {
+	resType := "postgres"
+	resID := strings.TrimSuffix(filepath.Base(encryptedPath), filepath.Ext(encryptedPath))
+	if manifest != nil {
+		resType = manifest.ResourceType
+		if manifest.ResourceID != "" {
+			resID = manifest.ResourceID
+		}
+	}
+	if resType == "valkey" || resType == "keyvalue" || resType == "redis" || resType == "cache" {
 		ext = ".rdb"
+	} else if resType == "volume" {
+		ext = ".tar"
+	} else if resType == "mysql" || resType == "mysql_instance" {
+		ext = ".sql"
+	} else if resType == "mongodb" || resType == "mongo" || resType == "mongodb_instance" {
+		ext = ".archive.gz"
 	}
-	restoredPath := filepath.Join(outputDir, fmt.Sprintf("%s%s", manifest.ResourceID, ext))
+	restoredPath := filepath.Join(outputDir, fmt.Sprintf("%s%s", resID, ext))
 
-	if err := os.WriteFile(restoredPath, plaintext, 0600); err != nil {
-		return "", nil, fmt.Errorf("failed to write decrypted artifact: %w", err)
+	restoredFile, errCreate := os.OpenFile(restoredPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if errCreate != nil {
+		return "", nil, fmt.Errorf("failed to create decrypted artifact file: %w", errCreate)
 	}
 
-	// Immediate post-decryption integrity verification when manifest checksum is set
-	if manifest.ChecksumSHA256 != "" {
-		if err := manifest.VerifyIntegrity(restoredPath); err != nil {
-			// If original manifest size was synthesized or differs, verify hash only
-			hash, _, _ := backup.ComputeSHA256(restoredPath)
-			if hash != manifest.ChecksumSHA256 {
-				_ = os.Remove(restoredPath)
-				return "", nil, fmt.Errorf("post-decryption integrity verification failed: %w", err)
-			}
+	errDecrypt := backup.DecryptStream(encKey, encFile, restoredFile)
+	restoredFile.Close()
+	if errDecrypt != nil {
+		_ = os.Remove(restoredPath)
+		return "", nil, fmt.Errorf("failed to decrypt backup artifact: %w", errDecrypt)
+	}
+
+
+
+	// Immediate post-decryption plaintext integrity verification
+	if manifest != nil && manifest.ChecksumSHA256 != "" {
+		actualHash, _, hashErr := backup.ComputeSHA256(restoredPath)
+		if hashErr != nil {
+			_ = os.Remove(restoredPath)
+			return "", nil, fmt.Errorf("failed to compute hash of decrypted plaintext artifact: %w", hashErr)
+		}
+		if !strings.EqualFold(actualHash, manifest.ChecksumSHA256) {
+			_ = os.Remove(restoredPath)
+			return "", nil, fmt.Errorf("CHECKSUM_MISMATCH: post-decryption plaintext checksum mismatch: expected %s, got %s", manifest.ChecksumSHA256, actualHash)
 		}
 	}
 
@@ -103,9 +123,16 @@ func (r *Reconstructor) RestoreToWorkload(ctx context.Context, manifest *backup.
 		return postgres.RestorePostgres(ctx, r.rt, manifest.ResourceID, artifactPath)
 	case "valkey", "keyvalue", "redis", "cache":
 		return valkey.RestoreValkey(ctx, r.rt, manifest.ResourceID, artifactPath)
+	case "mysql", "mysql_instance":
+		return mysql.RestoreMySQL(ctx, r.rt, manifest.ResourceID, artifactPath)
+	case "mongodb", "mongo", "mongodb_instance":
+		return mongodb.RestoreMongoDB(ctx, r.rt, manifest.ResourceID, artifactPath)
 	default:
-		r.logger.Info("generic_workload_restored", "resource_id", manifest.ResourceID)
-		return nil
+		r.logger.Error("unsupported_resource_type_restore_failed", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
+		return &UnsupportedResourceTypeError{
+			ResourceType: manifest.ResourceType,
+			ResourceID:   manifest.ResourceID,
+		}
 	}
 }
 
@@ -118,8 +145,15 @@ func (r *Reconstructor) RestoreToWorkloadWithVault(ctx context.Context, manifest
 		return postgres.RestorePostgresWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
 	case "valkey", "keyvalue", "redis", "cache":
 		return valkey.RestoreValkeyWithVault(ctx, r.rt, vClient, baseResDir, projectID, manifest.ResourceID, artifactPath)
+	case "mysql", "mysql_instance":
+		return mysql.RestoreMySQLWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
+	case "mongodb", "mongo", "mongodb_instance":
+		return mongodb.RestoreMongoDBWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
 	default:
-		r.logger.Info("generic_workload_restored", "resource_id", manifest.ResourceID)
-		return nil
+		r.logger.Error("unsupported_resource_type_restore_failed", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
+		return &UnsupportedResourceTypeError{
+			ResourceType: manifest.ResourceType,
+			ResourceID:   manifest.ResourceID,
+		}
 	}
 }

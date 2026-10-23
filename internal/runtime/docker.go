@@ -21,6 +21,11 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
+// StreamingContainerRuntime extends ContainerRuntime with streaming execution capabilities.
+type StreamingContainerRuntime interface {
+	ExecContainerStream(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (exitCode int, err error)
+}
+
 // ContainerRuntime specifies the abstraction contract for container lifecycle on compute nodes.
 type ContainerRuntime interface {
 	PullImage(ctx context.Context, imageRef string) error
@@ -520,12 +525,21 @@ func (d *DockerRuntime) ListContainers(ctx context.Context, all bool) ([]Contain
 
 // GetContainerLogs returns a stream of stdout/stderr logs from the container.
 func (d *DockerRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
-	return d.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+	return d.GetContainerLogsSince(ctx, containerID, "")
+}
+
+// GetContainerLogsSince returns a stream of stdout/stderr logs from the container since a given timestamp or duration.
+func (d *DockerRuntime) GetContainerLogsSince(ctx context.Context, containerID string, since string) (io.ReadCloser, error) {
+	opts := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     false,
 		Timestamps: true,
-	})
+	}
+	if since != "" {
+		opts.Since = since
+	}
+	return d.cli.ContainerLogs(ctx, containerID, opts)
 }
 
 // GetContainerStats returns a stream of container resource usage statistics.
@@ -537,8 +551,66 @@ func (d *DockerRuntime) GetContainerStats(ctx context.Context, containerID strin
 	return resp.Body, nil
 }
 
+// ExecContainerStream streams container exec stdout and stderr directly to writers with bounded memory.
+func (d *DockerRuntime) ExecContainerStream(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (int, error) {
+	if d.cli == nil {
+		return -1, fmt.Errorf("docker client is nil")
+	}
+
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		Env:          env,
+		AttachStdout: stdout != nil,
+		AttachStderr: stderr != nil,
+		AttachStdin:  stdin != nil,
+	}
+
+	execCreateResp, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return -1, fmt.Errorf("failed to create container exec for %s: %w", containerID, err)
+	}
+
+	attachResp, err := d.cli.ContainerExecAttach(ctx, execCreateResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return -1, fmt.Errorf("failed to attach to container exec: %w", err)
+	}
+	defer attachResp.Close()
+
+	if stdin != nil {
+		go func() {
+			_, _ = io.Copy(attachResp.Conn, stdin)
+			_ = attachResp.CloseWrite()
+		}()
+	}
+
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	_, err = stdcopy.StdCopy(stdout, stderr, attachResp.Reader)
+	if err != nil && err != io.EOF {
+		return -1, fmt.Errorf("failed reading exec stream: %w", err)
+	}
+
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execCreateResp.ID)
+	if err != nil {
+		return 0, nil
+	}
+
+	return inspectResp.ExitCode, nil
+}
+
 // ExecContainer executes a command inside a running container with optional environment and stdin.
 func (d *DockerRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	var stdoutBuf, stderrBuf bytes.Buffer
+	code, err := d.ExecContainerStream(ctx, containerID, cmd, env, stdin, &stdoutBuf, &stderrBuf)
+	return stdoutBuf.Bytes(), stderrBuf.Bytes(), code, err
+}
+
+func _legacyExecContainer_unused(d *DockerRuntime, ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
 	if d.cli == nil {
 		return nil, nil, -1, fmt.Errorf("docker client is nil")
 	}

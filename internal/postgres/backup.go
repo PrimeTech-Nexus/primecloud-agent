@@ -2,6 +2,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -100,57 +101,73 @@ func BackupPostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, v
 	containerName := fmt.Sprintf("pc-pg-%s", resourceID)
 	creds, _ := resolvePostgresCredentials(ctx, vClient, projectID, resourceID)
 
-	var dumpBytes []byte
-
-	// 1. If runtime is available, check for a running PostgreSQL container
-	if rt != nil {
-		inspect, err := rt.InspectContainer(ctx, containerName)
-		if err == nil && inspect != nil && inspect.Running {
-			// Extract credentials from container environment if available
-			envList := inspect.Labels
-			_ = envList
-
-			cmd := []string{
-				"pg_dump",
-				"-U", creds.Username,
-				"-d", creds.Database,
-				"-Fc", // Custom format: compressed archive with TOC
-			}
-			env := []string{
-				fmt.Sprintf("PGPASSWORD=%s", creds.Password),
-			}
-
-			stdout, stderr, exitCode, execErr := rt.ExecContainer(ctx, containerName, cmd, env, nil)
-			if execErr != nil {
-				return nil, fmt.Errorf("failed executing pg_dump on %s: %w (stderr: %s)", containerName, execErr, string(stderr))
-			}
-			if exitCode != 0 {
-				return nil, fmt.Errorf("pg_dump exited with code %d: %s", exitCode, strings.TrimSpace(string(stderr)))
-			}
-			if len(stdout) == 0 {
-				return nil, fmt.Errorf("pg_dump produced empty output: %s", strings.TrimSpace(string(stderr)))
-			}
-
-			dumpBytes = stdout
-		}
+	// 1. Check container runtime and inspect running PostgreSQL container
+	if rt == nil {
+		return nil, fmt.Errorf("container runtime is nil: cannot backup postgres container %s", containerName)
 	}
 
-	// 2. Fallback for testing environments when container is not active
-	if len(dumpBytes) == 0 {
-		dumpContent := fmt.Sprintf("-- PrimeCloud PostgreSQL Backup\n-- ResourceID: %s\n-- BackupID: %s\n-- Timestamp: %s\nSELECT 1;\n",
-			resourceID, backupID, time.Now().Format(time.RFC3339))
-		dumpBytes = []byte(dumpContent)
-	}
-
-	// 3. Write dump to artifact file
-	if err := os.WriteFile(artifactFile, dumpBytes, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write backup dump file %s: %w", artifactFile, err)
-	}
-
-	fi, err := os.Stat(artifactFile)
+	inspect, err := rt.InspectContainer(ctx, containerName)
 	if err != nil {
+		return nil, fmt.Errorf("failed inspecting postgres container %s: %w", containerName, err)
+	}
+	if inspect == nil || !inspect.Running {
+		return nil, fmt.Errorf("postgres container %s is not running", containerName)
+	}
+
+	cmd := []string{
+		"pg_dump",
+		"-U", creds.Username,
+		"-d", creds.Database,
+		"-Fc", // Custom format: compressed archive with TOC
+	}
+	env := []string{
+		fmt.Sprintf("PGPASSWORD=%s", creds.Password),
+	}
+
+	// 2. Stream pg_dump directly to artifactFile with bounded memory
+	dstFile, err := os.OpenFile(artifactFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create backup dump file %s: %w", artifactFile, err)
+	}
+	defer dstFile.Close()
+
+	var stderrBuf bytes.Buffer
+	var exitCode int
+	var execErr error
+
+	if streamer, ok := rt.(runtime.StreamingContainerRuntime); ok {
+		exitCode, execErr = streamer.ExecContainerStream(ctx, containerName, cmd, env, nil, dstFile, &stderrBuf)
+	} else {
+		var stdout []byte
+		var stderr []byte
+		stdout, stderr, exitCode, execErr = rt.ExecContainer(ctx, containerName, cmd, env, nil)
+		if len(stdout) > 0 {
+			_, _ = dstFile.Write(stdout)
+		}
+		stderrBuf.Write(stderr)
+	}
+
+	if execErr != nil {
+		_ = os.Remove(artifactFile)
+		return nil, fmt.Errorf("failed executing pg_dump on %s: %w (stderr: %s)", containerName, execErr, stderrBuf.String())
+	}
+	if exitCode != 0 {
+		_ = os.Remove(artifactFile)
+		return nil, fmt.Errorf("pg_dump exited with code %d: %s", exitCode, strings.TrimSpace(stderrBuf.String()))
+	}
+
+	_ = dstFile.Sync()
+	fi, err := dstFile.Stat()
+	if err != nil {
+		_ = os.Remove(artifactFile)
 		return nil, err
 	}
+	if fi.Size() == 0 {
+		_ = os.Remove(artifactFile)
+		return nil, fmt.Errorf("pg_dump produced empty output: %s", strings.TrimSpace(stderrBuf.String()))
+	}
+
+
 
 	return &BackupResult{
 		BackupID:     backupID,

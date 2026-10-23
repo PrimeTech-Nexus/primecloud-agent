@@ -2,9 +2,11 @@
 package agent
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -23,6 +25,8 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/haproxy"
 	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/metrics"
+	"github.com/primecloud/primecloud-agent/internal/mongodb"
+	"github.com/primecloud/primecloud-agent/internal/mysql"
 	"github.com/primecloud/primecloud-agent/internal/network"
 	"github.com/primecloud/primecloud-agent/internal/operations"
 	"github.com/primecloud/primecloud-agent/internal/postgres"
@@ -391,6 +395,10 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	pgLC := postgres.NewLifecycleManager(rt)
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	vkLC := valkey.NewLifecycleManager(rt)
+	myProv := mysql.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
+	myLC := mysql.NewLifecycleManager(rt)
+	mgProv := mongodb.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
+	mgLC := mongodb.NewLifecycleManager(rt)
 
 	// Wire the managed-data network manager into all provisioners and the deployer.
 	// When netMgr is non-nil, each provisioner and the deployer will attach containers
@@ -398,6 +406,8 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	if netMgr != nil {
 		pgProv.SetNetworkManager(netMgr)
 		vkProv.SetNetworkManager(netMgr)
+		myProv.SetNetworkManager(netMgr)
+		mgProv.SetNetworkManager(netMgr)
 		deployer.SetNetworkManager(netMgr)
 	}
 
@@ -1042,6 +1052,447 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	registry.Register("health_check_keyvalue", valkeyHealthCheckHandler, nil)
 	registry.Register("health_check_valkey", valkeyHealthCheckHandler, nil)
 
+	// 16a. MySQL Operations (provision_mysql, start_mysql, stop_mysql, restart_mysql, deprovision_mysql, health_check_mysql)
+	registry.Register("provision_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		payload := parsePayloadMap(op.PayloadJson)
+
+		image := "mysql:8.0"
+		if img, ok := payload["image"].(string); ok && img != "" {
+			image = img
+		} else if ver, ok := payload["version"].(string); ok && ver != "" {
+			image = ver
+		}
+
+		hostPort := ""
+		if hp, ok := payload["host_port"].(string); ok {
+			hostPort = hp
+		}
+
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		provRes, err := myProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "PROVISION_MYSQL_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"resource_id":      provRes.ResourceID,
+			"container_id":     provRes.ContainerID,
+			"endpoint":         provRes.Endpoint,
+			"vault_secret_ref": provRes.VaultSecretRef,
+			"volume_path":      provRes.VolumePath,
+			"status":           "AVAILABLE",
+			"node_id":          cfg.NodeID,
+		}
+		resBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resBytes),
+			Message:         fmt.Sprintf("MySQL container %s provisioned and available", provRes.ContainerID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	registry.Register("start_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-my-") {
+			containerName = fmt.Sprintf("pc-my-%s", resID)
+		}
+		if err := myLC.Start(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "START_MYSQL_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MySQL container %s started successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("stop_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-my-") {
+			containerName = fmt.Sprintf("pc-my-%s", resID)
+		}
+		if err := myLC.Stop(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "STOP_MYSQL_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"STOPPED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MySQL container %s stopped successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("restart_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-my-") {
+			containerName = fmt.Sprintf("pc-my-%s", resID)
+		}
+		if err := myLC.Restart(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTART_MYSQL_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MySQL container %s restarted successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("deprovision_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-my-") {
+			containerName = fmt.Sprintf("pc-my-%s", resID)
+		}
+		if err := myLC.Remove(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DEPROVISION_MYSQL_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		volDir := filepath.Join(cfg.ResourceDir, "mysql", resID)
+		_ = os.RemoveAll(volDir)
+
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"DELETED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MySQL container %s and resources deprovisioned successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("health_check_mysql", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mysql_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-my-") {
+			containerName = fmt.Sprintf("pc-my-%s", resID)
+		}
+		if rt == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RUNTIME_UNAVAILABLE",
+				Message:         "container runtime is not available",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("runtime unavailable")
+		}
+		inspect, err := rt.InspectContainer(ctx, containerName)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "HEALTH_CHECK_FAILED",
+				Message:         fmt.Sprintf("failed to inspect container: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		if !inspect.Running {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_NOT_RUNNING",
+				Message:         fmt.Sprintf("container %s is not running (state=%s)", containerName, inspect.State),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is not running", containerName)
+		}
+		if inspect.Health == "unhealthy" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_UNHEALTHY",
+				Message:         fmt.Sprintf("container %s health status is unhealthy", containerName),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is unhealthy", containerName)
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("MySQL container %s is healthy", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 16b. MongoDB Operations (provision_mongodb, start_mongodb, stop_mongodb, restart_mongodb, deprovision_mongodb, health_check_mongodb)
+	registry.Register("provision_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		payload := parsePayloadMap(op.PayloadJson)
+
+		image := "mongo:7.0"
+		if img, ok := payload["image"].(string); ok && img != "" {
+			image = img
+		} else if ver, ok := payload["version"].(string); ok && ver != "" {
+			image = ver
+		}
+
+		hostPort := ""
+		if hp, ok := payload["host_port"].(string); ok {
+			hostPort = hp
+		}
+
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		provRes, err := mgProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "PROVISION_MONGODB_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"resource_id":      provRes.ResourceID,
+			"container_id":     provRes.ContainerID,
+			"endpoint":         provRes.Endpoint,
+			"replica_set":      provRes.ReplicaSet,
+			"vault_secret_ref": provRes.VaultSecretRef,
+			"volume_path":      provRes.VolumePath,
+			"status":           "AVAILABLE",
+			"node_id":          cfg.NodeID,
+		}
+		resBytes, _ := json.Marshal(resData)
+
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resBytes),
+			Message:         fmt.Sprintf("MongoDB container %s provisioned and available", provRes.ContainerID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
+		}, nil
+	}, nil)
+
+	registry.Register("start_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-mg-") {
+			containerName = fmt.Sprintf("pc-mg-%s", resID)
+		}
+		if err := mgLC.Start(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "START_MONGODB_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MongoDB container %s started successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("stop_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-mg-") {
+			containerName = fmt.Sprintf("pc-mg-%s", resID)
+		}
+		if err := mgLC.Stop(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "STOP_MONGODB_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"STOPPED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MongoDB container %s stopped successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("restart_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-mg-") {
+			containerName = fmt.Sprintf("pc-mg-%s", resID)
+		}
+		if err := mgLC.Restart(ctx, containerName, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RESTART_MONGODB_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"AVAILABLE","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MongoDB container %s restarted successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("deprovision_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-mg-") {
+			containerName = fmt.Sprintf("pc-mg-%s", resID)
+		}
+		if err := mgLC.Remove(ctx, containerName); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "DEPROVISION_MONGODB_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		volDir := filepath.Join(cfg.ResourceDir, "mongodb", resID)
+		_ = os.RemoveAll(volDir)
+
+		resJSON := fmt.Sprintf(`{"container_id":%q,"status":"DELETED","node_id":%q}`, containerName, cfg.NodeID)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      resJSON,
+			Message:         fmt.Sprintf("MongoDB container %s and resources deprovisioned successfully", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	registry.Register("health_check_mongodb", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "mongodb_id", "database_id")
+		containerName := resID
+		if !strings.HasPrefix(containerName, "pc-mg-") {
+			containerName = fmt.Sprintf("pc-mg-%s", resID)
+		}
+		if rt == nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "RUNTIME_UNAVAILABLE",
+				Message:         "container runtime is not available",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("runtime unavailable")
+		}
+		inspect, err := rt.InspectContainer(ctx, containerName)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "HEALTH_CHECK_FAILED",
+				Message:         fmt.Sprintf("failed to inspect container: %v", err),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		if !inspect.Running {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_NOT_RUNNING",
+				Message:         fmt.Sprintf("container %s is not running (state=%s)", containerName, inspect.State),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is not running", containerName)
+		}
+		if inspect.Health == "unhealthy" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_UNHEALTHY",
+				Message:         fmt.Sprintf("container %s health status is unhealthy", containerName),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container %s is unhealthy", containerName)
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("MongoDB container %s is healthy", containerName),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
 	// 17. backup_resource / snapshot_backup
 	backupHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		payload := parsePayloadMap(op.PayloadJson)
@@ -1092,10 +1543,14 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		// 1. Resolve or create encryption key from Vault
 		encKey, err := backup.GetOrCreateBackupKey(ctx, vaultClient, resID)
 		if err != nil {
+			errCode := "ENCRYPTION_KEY_FAILED"
+			if vaultClient == nil || strings.Contains(err.Error(), "vault service is unavailable") {
+				errCode = "VAULT_UNAVAILABLE"
+			}
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "ENCRYPTION_KEY_FAILED",
+				ErrorCode:       errCode,
 				Message:         fmt.Sprintf("failed resolving backup encryption key: %v", err),
 				CompletedAtUnix: time.Now().Unix(),
 			}, err
@@ -1132,18 +1587,127 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 			backupResultPath = res.ArtifactPath
 
-		case "application", "container", "volume", "workload", "app", "generic", "default", "":
+		case "mysql", "mysql_instance":
+			res, err := mysql.BackupMySQLWithVault(ctx, rt, vaultClient, projectID, resID, tempBackupDir)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "MYSQL_BACKUP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			backupResultPath = res.ArtifactPath
+
+		case "mongodb", "mongo", "mongodb_instance":
+			res, err := mongodb.BackupMongoDBWithVault(ctx, rt, vaultClient, projectID, resID, tempBackupDir)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "MONGODB_BACKUP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			backupResultPath = res.ArtifactPath
+
+		case "valkey_unused":
+			res, err := valkey.BackupValkeyWithVault(ctx, rt, vaultClient, cfg.ResourceDir, projectID, resID, tempBackupDir)
+			if err != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "VALKEY_BACKUP_FAILED",
+					Message:         err.Error(),
+					CompletedAtUnix: time.Now().Unix(),
+				}, err
+			}
+			backupResultPath = res.ArtifactPath
+
+		case "volume":
+			var volDir string
+			searchDirs := []string{
+				filepath.Join(cfg.ResourceDir, "volumes", resID),
+				filepath.Join("/opt/primecloud/resources", "volumes", resID),
+				filepath.Join(os.TempDir(), "primecloud-resources", "volumes", resID),
+			}
+			for _, d := range searchDirs {
+				if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+					volDir = d
+					break
+				}
+			}
+
+			if volDir == "" {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "VOLUME_NOT_FOUND",
+					Message:         fmt.Sprintf("volume directory not found for resource %s", resID),
+					CompletedAtUnix: time.Now().Unix(),
+				}, fmt.Errorf("volume directory not found for resource %s", resID)
+			}
+
 			_ = os.MkdirAll(tempBackupDir, 0700)
-			backupResultPath = filepath.Join(tempBackupDir, fmt.Sprintf("%s-%s.dump", resType, resID))
-			content := fmt.Sprintf(`{"resource_id": "%s", "resource_type": "%s", "project_id": "%s", "timestamp": %d}`, resID, resType, projectID, time.Now().Unix())
-			if err := os.WriteFile(backupResultPath, []byte(content), 0600); err != nil {
+			backupResultPath = filepath.Join(tempBackupDir, fmt.Sprintf("volume-%s.tar", resID))
+
+			tarFile, err := os.OpenFile(backupResultPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if err != nil {
 				return &pb.OperationResponse{
 					OperationId:     op.OperationId,
 					Status:          "FAILED",
 					ErrorCode:       "BACKUP_DUMP_FAILED",
-					Message:         err.Error(),
+					Message:         fmt.Sprintf("failed to create volume tar archive: %v", err),
 					CompletedAtUnix: time.Now().Unix(),
 				}, err
+			}
+
+			tw := tar.NewWriter(tarFile)
+			walkErr := filepath.Walk(volDir, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				relPath, err := filepath.Rel(volDir, path)
+				if err != nil {
+					return err
+				}
+				if relPath == "." {
+					return nil
+				}
+				hdr, err := tar.FileInfoHeader(info, "")
+				if err != nil {
+					return err
+				}
+				hdr.Name = filepath.ToSlash(relPath)
+				if err := tw.WriteHeader(hdr); err != nil {
+					return err
+				}
+				if info.Mode().IsRegular() {
+					f, err := os.Open(path)
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+					if _, err := io.Copy(tw, f); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			tw.Close()
+			tarFile.Close()
+
+			if walkErr != nil {
+				_ = os.Remove(backupResultPath)
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "BACKUP_DUMP_FAILED",
+					Message:         fmt.Sprintf("failed archiving volume files: %v", walkErr),
+					CompletedAtUnix: time.Now().Unix(),
+				}, walkErr
 			}
 
 		default:
@@ -1196,13 +1760,46 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 			storagePath := filepath.Join(baseStorage, storageTarget)
 			_ = os.MkdirAll(filepath.Dir(storagePath), 0700)
-			if encData, rErr := os.ReadFile(encFile); rErr == nil {
-				_ = os.WriteFile(storagePath, encData, 0600)
+			if srcF, oErr := os.Open(encFile); oErr == nil {
+				if dstF, cErr := os.OpenFile(storagePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); cErr == nil {
+					_, _ = io.Copy(dstF, srcF)
+					dstF.Close()
+				}
+				srcF.Close()
 			}
 			manifestSource := filepath.Join(targetDir, fmt.Sprintf("%s.manifest.json", backupID))
 			manifestTarget := filepath.Join(filepath.Dir(storagePath), fmt.Sprintf("%s.manifest.json", filepath.Base(storagePath)))
-			if mData, mErr := os.ReadFile(manifestSource); mErr == nil {
-				_ = os.WriteFile(manifestTarget, mData, 0600)
+			if srcM, oErr := os.Open(manifestSource); oErr == nil {
+				if dstM, cErr := os.OpenFile(manifestTarget, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); cErr == nil {
+					_, _ = io.Copy(dstM, srcM)
+					dstM.Close()
+				}
+				srcM.Close()
+			}
+		}
+
+		// Off-node upload streaming via HTTP PUT if upload_url is provided
+		if uploadURL, ok := payload["upload_url"].(string); ok && uploadURL != "" {
+			if uErr := uploader.UploadToURL(ctx, uploadURL, encFile); uErr != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "UPLOAD_FAILED",
+					Message:         fmt.Sprintf("failed uploading artifact to storage: %v", uErr),
+					CompletedAtUnix: time.Now().Unix(),
+				}, uErr
+			}
+		}
+		if manifestUploadURL, ok := payload["manifest_upload_url"].(string); ok && manifestUploadURL != "" {
+			manifestPath := filepath.Join(targetDir, fmt.Sprintf("%s.manifest.json", backupID))
+			if uErr := uploader.UploadToURL(ctx, manifestUploadURL, manifestPath); uErr != nil {
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "MANIFEST_UPLOAD_FAILED",
+					Message:         fmt.Sprintf("failed uploading manifest to storage: %v", uErr),
+					CompletedAtUnix: time.Now().Unix(),
+				}, uErr
 			}
 		}
 
@@ -1311,14 +1908,36 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 
+		// If artifact not found locally, attempt streaming download from presigned URL
+		var tempEncFile, tempManifestFile string
+		if encPath == "" {
+			if downloadURL, ok := payload["download_url"].(string); ok && downloadURL != "" {
+				tmpDir := filepath.Join(os.TempDir(), "primecloud-recovery", op.OperationId)
+				_ = os.MkdirAll(tmpDir, 0700)
+				tempEncFile = filepath.Join(tmpDir, "artifact.enc")
+				if dErr := backup.DownloadFromURL(ctx, downloadURL, tempEncFile); dErr == nil {
+					encPath = tempEncFile
+					if mURL, ok := payload["manifest_download_url"].(string); ok && mURL != "" {
+						tempManifestFile = filepath.Join(tmpDir, "artifact.manifest.json")
+						if mdErr := backup.DownloadFromURL(ctx, mURL, tempManifestFile); mdErr == nil {
+							manifestPath = tempManifestFile
+						}
+					}
+				}
+			}
+		}
+		if tempEncFile != "" {
+			defer os.RemoveAll(filepath.Dir(tempEncFile))
+		}
+
 		if encPath == "" {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
 				ErrorCode:       "ARTIFACT_NOT_FOUND",
-				Message:         fmt.Sprintf("backup artifact %s not found on node", storageRef),
+				Message:         fmt.Sprintf("backup artifact %s not found on node or remote storage", storageRef),
 				CompletedAtUnix: time.Now().Unix(),
-			}, fmt.Errorf("backup artifact %s not found on node", storageRef)
+			}, fmt.Errorf("backup artifact %s not found on node or remote storage", storageRef)
 		}
 
 		// 2. Validate Checksum: FAIL CLOSED if mismatch
@@ -1346,7 +1965,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}
 
 		// 3. Resolve encryption key from Vault
-		encKey, err := backup.GetOrCreateBackupKey(ctx, vaultClient, resID)
+		keyRef := resID
+		if kr, ok := payload["encryption_key_ref"].(string); ok && kr != "" {
+			keyRef = kr
+		}
+		encKey, err := backup.GetBackupKey(ctx, vaultClient, keyRef)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1419,18 +2042,107 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	deleteBackupHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		payload := parsePayloadMap(op.PayloadJson)
 		backupID := ""
-		if bID, ok := payload["backup_id"].(string); ok {
+		if bID, ok := payload["backup_id"].(string); ok && bID != "" {
 			backupID = bID
-		} else {
+		} else if op.ResourceId != "" {
 			backupID = op.ResourceId
 		}
+
+		if backupID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "INVALID_PAYLOAD",
+				Message:         "missing backup_id in delete_backup payload",
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("missing backup_id in delete_backup payload")
+		}
+
+		storageRef := ""
+		if sRef, ok := payload["storage_ref"].(string); ok {
+			storageRef = sRef
+		}
+
+		deletedCount := 0
+
+		// Target filenames to match
+		encName := fmt.Sprintf("%s.enc", backupID)
+		manifestName := fmt.Sprintf("%s.manifest.json", backupID)
+
+		// 1. Check cfg.ResourceDir/backups
+		resourceBackupsDir := filepath.Join(cfg.ResourceDir, "backups")
+		if _, err := os.Stat(resourceBackupsDir); err == nil {
+			_ = filepath.Walk(resourceBackupsDir, func(path string, info os.FileInfo, err error) error {
+				if err != nil || info == nil || info.IsDir() {
+					return nil
+				}
+				name := info.Name()
+				if name == encName || name == manifestName || (strings.Contains(name, backupID) && (strings.HasSuffix(name, ".enc") || strings.HasSuffix(name, ".manifest.json"))) {
+					if rmErr := os.Remove(path); rmErr == nil {
+						deletedCount++
+						a.logger.Info("backup_file_removed", "path", path)
+					}
+				}
+				return nil
+			})
+		}
+
+		// 2. Check .primecloud_storage/backups or PRIMECLOUD_BACKUP_DIR
+		baseStorage := os.Getenv("PRIMECLOUD_BACKUP_DIR")
+		if baseStorage == "" {
+			baseStorage = filepath.Join(".primecloud_storage", "backups")
+		}
+		if _, err := os.Stat(baseStorage); err == nil {
+			_ = filepath.Walk(baseStorage, func(path string, info os.FileInfo, err error) error {
+				if err != nil || info == nil || info.IsDir() {
+					return nil
+				}
+				name := info.Name()
+				if name == encName || name == manifestName || (strings.Contains(name, backupID) && (strings.HasSuffix(name, ".enc") || strings.HasSuffix(name, ".manifest.json"))) {
+					if rmErr := os.Remove(path); rmErr == nil {
+						deletedCount++
+						a.logger.Info("backup_storage_file_removed", "path", path)
+					}
+				}
+				return nil
+			})
+		}
+
+		// 3. Check storage_ref specific paths if provided
+		if storageRef != "" {
+			candidates := []string{
+				storageRef,
+				fmt.Sprintf("%s.manifest.json", strings.TrimSuffix(storageRef, filepath.Ext(storageRef))),
+				filepath.Join(baseStorage, storageRef),
+				filepath.Join(filepath.Dir(filepath.Join(baseStorage, storageRef)), fmt.Sprintf("%s.manifest.json", filepath.Base(storageRef))),
+				filepath.Join(cfg.ResourceDir, storageRef),
+			}
+			for _, cPath := range candidates {
+				if info, sErr := os.Stat(cPath); sErr == nil && !info.IsDir() {
+					if rmErr := os.Remove(cPath); rmErr == nil {
+						deletedCount++
+						a.logger.Info("backup_storage_ref_file_removed", "path", cPath)
+					}
+				}
+			}
+		}
+
+		a.logger.Info("delete_backup_handler_completed", "backup_id", backupID, "storage_ref", storageRef, "deleted_count", deletedCount)
+
+		resultMap := map[string]interface{}{
+			"status":        "SUCCEEDED",
+			"backup_id":     backupID,
+			"deleted_count": deletedCount,
+		}
+		resJSON, _ := json.Marshal(resultMap)
 
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
-			Message:         fmt.Sprintf("Backup %s deleted", backupID),
+			Message:         fmt.Sprintf("Backup %s deleted (%d files removed)", backupID, deletedCount),
 			CompletedAtUnix: time.Now().Unix(),
 			ProgressPercent: 100,
+			ResultJson:      string(resJSON),
 		}, nil
 	}
 	registry.Register("delete_backup", deleteBackupHandler, nil)
