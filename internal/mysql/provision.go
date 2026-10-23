@@ -227,6 +227,9 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 
 	var containerID string
 	if p.rt != nil {
+		if err := p.rt.PullImage(ctx, pinnedImage); err != nil {
+			p.logger.Warn("image_pull_attempt_failed_proceeding", "image", pinnedImage, "error", err)
+		}
 		cid, err := p.rt.CreateContainer(ctx, cfg, limits, profile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create mysql container: %w", err)
