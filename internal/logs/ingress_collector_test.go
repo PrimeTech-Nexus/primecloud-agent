@@ -356,4 +356,107 @@ func TestParseCaddyAccessLogLine_ISO8601StringTimestamp(t *testing.T) {
 	}
 }
 
+func TestUUIDv7ValidationAndGeneration(t *testing.T) {
+	generated := GenerateUUIDv7()
+	if !IsValidUUIDv7(generated) {
+		t.Fatalf("expected generated UUIDv7 %q to pass IsValidUUIDv7", generated)
+	}
+
+	validV7 := "0192a3f4-5678-7123-8abc-def012345678"
+	if !IsValidUUIDv7(validV7) {
+		t.Errorf("expected %q to be valid UUIDv7", validV7)
+	}
+
+	invalidUUIDs := []string{
+		"",
+		"not-a-uuid",
+		"550e8400-e29b-41d4-a716-446655440000", // UUIDv4 (version 4, not 7)
+		"0192a3f4-5678-7123-0abc-def012345678", // Invalid variant
+	}
+	for _, inv := range invalidUUIDs {
+		if IsValidUUIDv7(inv) {
+			t.Errorf("expected %q to fail IsValidUUIDv7", inv)
+		}
+	}
+
+	// EnsureRequestID preserves existing or generates UUIDv7
+	preserved := EnsureRequestID(validV7)
+	if preserved != validV7 {
+		t.Errorf("expected %q to be preserved, got %q", validV7, preserved)
+	}
+	fallback := EnsureRequestID("")
+	if !IsValidUUIDv7(fallback) {
+		t.Errorf("expected fallback request ID %q to be valid UUIDv7", fallback)
+	}
+}
+
+func TestParseCaddyAccessLogLine_AuthHeaderAndExpandedQueryRedaction(t *testing.T) {
+	rawJSON := `{
+		"level": "info",
+		"ts": "2026-10-22T12:00:00Z",
+		"logger": "http.log.access",
+		"msg": "handled request",
+		"request": {
+			"remote_ip": "10.0.0.9",
+			"method": "GET",
+			"host": "auth.primecloud.cloud",
+			"uri": "/oauth/callback?client_secret=cs_123&private_key=pk_456&credential=cred_789&passwd=pw_000&ok=1",
+			"headers": {
+				"Authorization": ["Bearer super-secret-jwt"],
+				"Proxy-Authorization": ["Basic dXNlcjpwYXNz"],
+				"Cookie": ["session_id=s123; token=t456"],
+				"User-Agent": ["Mozilla/5.0"]
+			}
+		},
+		"duration": 0.012,
+		"status": 200
+	}`
+
+	item, err := ParseCaddyAccessLogLine(rawJSON, nil)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	// Verify expanded query redaction in Message and route
+	for _, secret := range []string{"cs_123", "pk_456", "cred_789", "pw_000"} {
+		if strings.Contains(item.Message, secret) {
+			t.Errorf("secret %q leaked in Message: %s", secret, item.Message)
+		}
+	}
+	for _, expected := range []string{"client_secret=[REDACTED]", "private_key=[REDACTED]", "credential=[REDACTED]", "passwd=[REDACTED]", "ok=1"} {
+		if !strings.Contains(item.Message, expected) {
+			t.Errorf("expected %q in Message: %s", expected, item.Message)
+		}
+	}
+
+	// Verify fallback UUIDv7 request_id was generated when missing from headers
+	reqID, _ := item.StructuredData["request_id"].(string)
+	if !IsValidUUIDv7(reqID) {
+		t.Errorf("expected auto-generated UUIDv7 request_id when headers omitted it, got %q", reqID)
+	}
+
+	// Verify RedactAuthHeaders was invoked on request headers
+	httpMeta, ok := item.StructuredData["http"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected http map in StructuredData")
+	}
+	headers, ok := httpMeta["headers"].(map[string][]string)
+	if !ok {
+		t.Fatalf("expected headers map in http metadata")
+	}
+	if headers["Authorization"][0] != "[REDACTED]" {
+		t.Errorf("expected Authorization header to be [REDACTED], got %v", headers["Authorization"])
+	}
+	if headers["Proxy-Authorization"][0] != "[REDACTED]" {
+		t.Errorf("expected Proxy-Authorization header to be [REDACTED], got %v", headers["Proxy-Authorization"])
+	}
+	if headers["Cookie"][0] != "[REDACTED_COOKIES]" {
+		t.Errorf("expected Cookie header to be [REDACTED_COOKIES], got %v", headers["Cookie"])
+	}
+	if headers["User-Agent"][0] != "Mozilla/5.0" {
+		t.Errorf("expected User-Agent header to be preserved, got %v", headers["User-Agent"])
+	}
+}
+
+
 

@@ -439,3 +439,22 @@ func TestMissingNetworkRecovery(t *testing.T) {
 		t.Errorf("expected same network name on recovery: %s vs %s", net1.Name, net2.Name)
 	}
 }
+
+// 13. MySQL and MongoDB alias formatters
+func TestFormatMySQLAndMongoDBAliases(t *testing.T) {
+	myAliases := network.FormatMySQLAliases("db-1")
+	if len(myAliases) != 2 {
+		t.Fatalf("expected 2 aliases, got %d", len(myAliases))
+	}
+	if myAliases[0] != "mysql-db-1.internal.primecloud" || myAliases[1] != "mysql-db-1" {
+		t.Fatalf("unexpected mysql aliases: %v", myAliases)
+	}
+
+	mongoAliases := network.FormatMongoDBAliases("db-2")
+	if len(mongoAliases) != 2 {
+		t.Fatalf("expected 2 aliases, got %d", len(mongoAliases))
+	}
+	if mongoAliases[0] != "mongodb-db-2.internal.primecloud" || mongoAliases[1] != "mongodb-db-2" {
+		t.Fatalf("unexpected mongodb aliases: %v", mongoAliases)
+	}
+}

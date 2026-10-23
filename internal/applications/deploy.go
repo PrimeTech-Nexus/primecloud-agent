@@ -456,6 +456,10 @@ func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map
 				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/postgres/%s", resID))
 			} else if resType == "keyvalue" || resType == "redis" || resType == "valkey" {
 				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/valkey/%s", resID))
+			} else if resType == "mysql" {
+				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/mysql/%s", resID))
+			} else if resType == "mongodb" || resType == "mongo" {
+				pathsToTry = append(pathsToTry, fmt.Sprintf("primecloud/resources/mongodb/%s", resID))
 			}
 		}
 	}
@@ -471,6 +475,33 @@ func (d *Deployer) readSecretWithFallback(ctx context.Context, path string) (map
 }
 
 func synthesizeURL(data map[string]interface{}, path string) (string, bool) {
+	lowerPath := strings.ToLower(path)
+	if strings.Contains(lowerPath, "mongodb") || strings.Contains(lowerPath, "mongo") {
+		if db, ok := data["database"]; ok {
+			u, _ := data["username"].(string)
+			p, _ := data["password"].(string)
+			host, _ := data["host"].(string)
+			if host == "" {
+				host = "localhost"
+			}
+			rs, _ := data["replica_set"].(string)
+			if rs == "" {
+				rs = "rs0"
+			}
+			return fmt.Sprintf("mongodb://%s:%s@%s:27017/%v?authSource=%v&replicaSet=%s", u, p, host, db, db, rs), true
+		}
+	}
+	if strings.Contains(lowerPath, "mysql") {
+		if db, ok := data["database"]; ok {
+			u, _ := data["username"].(string)
+			p, _ := data["password"].(string)
+			host, _ := data["host"].(string)
+			if host == "" {
+				host = "localhost"
+			}
+			return fmt.Sprintf("mysql://%s:%s@%s:3306/%v", u, p, host, db), true
+		}
+	}
 	// 1. PostgreSQL check
 	if db, ok := data["database"]; ok {
 		u := "postgres"

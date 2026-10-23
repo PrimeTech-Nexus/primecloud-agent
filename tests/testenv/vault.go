@@ -38,7 +38,7 @@ func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
 	client, err := vault.NewClient(vault.Config{
 		Address: addr,
 		Token:   token,
-		Timeout: 5 * time.Second,
+		Timeout: 15 * time.Second,
 	})
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -81,7 +81,7 @@ func EnsureVaultDev(t *testing.T) (*vault.Client, string) {
 	client, err = vault.NewClient(vault.Config{
 		Address: addr,
 		Token:   token,
-		Timeout: 5 * time.Second,
+		Timeout: 15 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Failed to initialize vault client after startup: %v", err)

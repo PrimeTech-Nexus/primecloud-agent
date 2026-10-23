@@ -269,3 +269,81 @@ func TestAgent_ManagedValkey_RegistrationAndDispatch(t *testing.T) {
 		}
 	}
 }
+
+func TestAgent_DeleteBackup_RealDiskCleanup(t *testing.T) {
+	ag, tempDir := setupTestAgent(t)
+	ctx := context.Background()
+	dispatcher := ag.Dispatcher()
+
+	backupID := "bk-del-test-123"
+
+	// 1. Setup files in ResourceDir/backups
+	resBackupDir := filepath.Join(tempDir, "backups", "postgres", "res-1")
+	if err := os.MkdirAll(resBackupDir, 0700); err != nil {
+		t.Fatalf("Failed creating resBackupDir: %v", err)
+	}
+	encFile1 := filepath.Join(resBackupDir, backupID+".enc")
+	manifestFile1 := filepath.Join(resBackupDir, backupID+".manifest.json")
+	_ = os.WriteFile(encFile1, []byte("encrypted data 1"), 0600)
+	_ = os.WriteFile(manifestFile1, []byte(`{"backup_id":"`+backupID+`"}`), 0600)
+
+	// 2. Setup files in PRIMECLOUD_BACKUP_DIR
+	baseStorage := filepath.Join(tempDir, "storage_backups")
+	t.Setenv("PRIMECLOUD_BACKUP_DIR", baseStorage)
+	if err := os.MkdirAll(baseStorage, 0700); err != nil {
+		t.Fatalf("Failed creating baseStorage: %v", err)
+	}
+	encFile2 := filepath.Join(baseStorage, backupID+".enc")
+	manifestFile2 := filepath.Join(baseStorage, backupID+".manifest.json")
+	_ = os.WriteFile(encFile2, []byte("encrypted data 2"), 0600)
+	_ = os.WriteFile(manifestFile2, []byte(`{"backup_id":"`+backupID+`"}`), 0600)
+
+	// 3. Setup custom storage_ref file
+	customRef := filepath.Join(tempDir, "custom_backup_artifact.enc")
+	_ = os.WriteFile(customRef, []byte("custom ref data"), 0600)
+
+	// Verify all files exist before deletion
+	for _, f := range []string{encFile1, manifestFile1, encFile2, manifestFile2, customRef} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("Pre-condition failed: expected file %s to exist: %v", f, err)
+		}
+	}
+
+	// 4. Dispatch delete_backup operation
+	escapedCustomRef, _ := json.Marshal(customRef)
+	payloadJSON := `{"backup_id":"` + backupID + `","storage_ref":` + string(escapedCustomRef) + `}`
+	delOp := &pb.OperationEnvelope{
+		OperationId:   "op-del-bk-1",
+		OperationType: "delete_backup",
+		ResourceId:    backupID,
+		PayloadJson:   payloadJSON,
+	}
+
+	resp, err := dispatcher.Dispatch(ctx, delOp)
+	if err != nil {
+		t.Fatalf("Dispatch delete_backup failed: %v", err)
+	}
+	if resp.Status != "SUCCEEDED" {
+		t.Fatalf("Expected SUCCEEDED, got %s (message: %s)", resp.Status, resp.Message)
+	}
+
+	// Verify all files are removed
+	for _, f := range []string{encFile1, manifestFile1, encFile2, manifestFile2, customRef} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("Expected file %s to be deleted, but it still exists", f)
+		}
+	}
+
+	// 5. Verify fail-closed behavior on missing backup_id
+	emptyOp := &pb.OperationEnvelope{
+		OperationId:   "op-del-bk-empty",
+		OperationType: "delete_backup",
+		ResourceId:    "",
+		PayloadJson:   `{}`,
+	}
+	respEmpty, errEmpty := dispatcher.Dispatch(ctx, emptyOp)
+	if errEmpty == nil && respEmpty.Status != "FAILED" {
+		t.Errorf("Expected FAILED status for empty backup_id, got %v", respEmpty)
+	}
+}
+

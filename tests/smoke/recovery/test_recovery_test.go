@@ -3,14 +3,60 @@ package recovery_test
 import (
 	"context"
 	"crypto/rand"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/primecloud/primecloud-agent/internal/backup"
 	"github.com/primecloud/primecloud-agent/internal/recovery"
+	"github.com/primecloud/primecloud-agent/internal/runtime"
 )
+
+type mockRecoveryRuntime struct {
+	inspectFunc func(ctx context.Context, id string) (*runtime.ContainerInspect, error)
+	execFunc    func(ctx context.Context, id string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error)
+}
+
+func (m *mockRecoveryRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *mockRecoveryRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
+	return nil
+}
+func (m *mockRecoveryRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
+	return "mock-cid", nil
+}
+func (m *mockRecoveryRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *mockRecoveryRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+	return nil
+}
+func (m *mockRecoveryRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	return nil
+}
+func (m *mockRecoveryRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+	if m.inspectFunc != nil {
+		return m.inspectFunc(ctx, id)
+	}
+	return &runtime.ContainerInspect{ID: id, Running: true, Health: "healthy"}, nil
+}
+func (m *mockRecoveryRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockRecoveryRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+func (m *mockRecoveryRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	if m.execFunc != nil {
+		return m.execFunc(ctx, containerID, cmd, env, stdin)
+	}
+	return nil, nil, 0, nil
+}
+func (m *mockRecoveryRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockRecoveryRuntime) Ping(ctx context.Context) error { return nil }
+func (m *mockRecoveryRuntime) Close() error                   { return nil }
 
 func TestRecovery_FullPipeline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -66,9 +112,17 @@ func TestRecovery_FullPipeline(t *testing.T) {
 		t.Fatalf("VerifyFormat failed: %v", err)
 	}
 
-	// 6. Restore to Workload driver
-	if err := reconstructor.RestoreToWorkload(ctx, manifest, restoredPath); err != nil {
-		t.Fatalf("RestoreToWorkload failed: %v", err)
+	// 6. Test Restore to Workload driver
+	// 6a. Fails closed with nil runtime
+	if err := reconstructor.RestoreToWorkload(ctx, manifest, restoredPath); err == nil {
+		t.Fatal("Expected RestoreToWorkload to fail closed when runtime is nil")
+	}
+
+	// 6b. Succeeds with mock runtime
+	mockRT := &mockRecoveryRuntime{}
+	reconstructorWithRT := recovery.NewReconstructor(mockRT, nil)
+	if err := reconstructorWithRT.RestoreToWorkload(ctx, manifest, restoredPath); err != nil {
+		t.Fatalf("RestoreToWorkload with mock runtime failed: %v", err)
 	}
 
 	// 7. Verify tamper detection on corrupt payload
@@ -76,5 +130,21 @@ func TestRecovery_FullPipeline(t *testing.T) {
 	_ = os.WriteFile(corruptEncFile, []byte("random corrupted invalid data"), 0600)
 	if _, _, err := reconstructor.ReconstructArtifact(ctx, corruptEncFile, manifestFile, key, restoreDir); err == nil {
 		t.Error("Expected error decrypting corrupt artifact")
+	}
+
+	// 8. Verify CHECKSUM_MISMATCH fail-closed on tampered manifest checksum
+	tamperedManifest := &backup.Manifest{
+		BackupID:       manifest.BackupID,
+		ResourceID:     manifest.ResourceID,
+		ResourceType:   manifest.ResourceType,
+		Algorithm:      manifest.Algorithm,
+		ChecksumSHA256: "0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	tamperedManifestFile := filepath.Join(backupDir, "tampered.manifest.json")
+	if err := backup.SaveManifest(tamperedManifest, tamperedManifestFile); err != nil {
+		t.Fatalf("Failed to save tampered manifest: %v", err)
+	}
+	if _, _, err := reconstructor.ReconstructArtifact(ctx, encFile, tamperedManifestFile, key, restoreDir); err == nil || !strings.Contains(err.Error(), "CHECKSUM_MISMATCH") {
+		t.Errorf("Expected CHECKSUM_MISMATCH error on manifest hash mismatch, got %v", err)
 	}
 }

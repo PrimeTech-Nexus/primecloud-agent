@@ -292,27 +292,71 @@ func (h *Harvester) EnqueueLog(item LogItem) {
 	h.buffer = append(h.buffer, item)
 }
 
+// ContainerLogsSinceReader is an optional interface that a ContainerRuntime can implement
+// to support incremental log fetching starting from an RFC3339 timestamp cursor.
+type ContainerLogsSinceReader interface {
+	GetContainerLogsSince(ctx context.Context, containerID string, since string) (io.ReadCloser, error)
+}
+
 // AggregateMultilineItems groups consecutive traceback or panic frames into a single LogItem.
+// Supports Python 3 tracebacks (including chained exceptions), Go panics, and Node.js V8 stack traces.
 func AggregateMultilineItems(items []LogItem) []LogItem {
 	if len(items) <= 1 {
 		return items
 	}
 
-	isTracebackStart := func(msg string) bool {
+	isPythonOrGoStart := func(msg string) bool {
 		lower := strings.ToLower(msg)
 		return strings.HasPrefix(lower, "traceback (most recent call last):") ||
 			strings.HasPrefix(msg, "panic:")
+	}
+
+	isNodeErrorStart := func(msg string) bool {
+		if strings.HasPrefix(msg, " ") || strings.HasPrefix(msg, "\t") {
+			return false
+		}
+		if strings.HasPrefix(msg, "Error:") ||
+			strings.HasPrefix(msg, "TypeError:") ||
+			strings.HasPrefix(msg, "ReferenceError:") ||
+			strings.HasPrefix(msg, "SyntaxError:") ||
+			strings.HasPrefix(msg, "RangeError:") ||
+			strings.HasPrefix(msg, "URIError:") ||
+			strings.HasPrefix(msg, "EvalError:") {
+			return true
+		}
+		if idx := strings.Index(msg, "Error: "); idx > 0 {
+			prefix := msg[:idx]
+			if !strings.ContainsAny(prefix, " \t:.") {
+				return true
+			}
+		}
+		return false
+	}
+
+	isNodeContinuation := func(msg string) bool {
+		trimmed := strings.TrimSpace(msg)
+		return strings.HasPrefix(msg, "    at ") ||
+			strings.HasPrefix(msg, "\tat ") ||
+			strings.HasPrefix(trimmed, "at ") ||
+			strings.HasPrefix(trimmed, "[cause]:")
 	}
 
 	isTracebackContinuation := func(msg string) bool {
 		return strings.HasPrefix(msg, " ") ||
 			strings.HasPrefix(msg, "\t") ||
 			strings.HasPrefix(msg, "goroutine ") ||
-			strings.HasPrefix(msg, "[signal ")
+			strings.HasPrefix(msg, "[signal ") ||
+			isNodeContinuation(msg)
+	}
+
+	isPythonChainingNotice := func(msg string) bool {
+		return strings.HasPrefix(msg, "During handling of the above exception, another exception occurred:") ||
+			strings.HasPrefix(msg, "The above exception was the direct cause of the following exception:")
 	}
 
 	var result []LogItem
 	var currentGroup []LogItem
+	var groupMode string // "python_or_go" or "node"
 
 	flushGroup := func() {
 		if len(currentGroup) == 0 {
@@ -321,6 +365,7 @@ func AggregateMultilineItems(items []LogItem) []LogItem {
 		if len(currentGroup) == 1 {
 			result = append(result, currentGroup[0])
 			currentGroup = nil
+			groupMode = ""
 			return
 		}
 
@@ -335,9 +380,11 @@ func AggregateMultilineItems(items []LogItem) []LogItem {
 		fullText := sb.String()
 
 		summary := base.Message
-		lastLine := currentGroup[len(currentGroup)-1].Message
-		if strings.Contains(lastLine, ": ") && !strings.HasPrefix(lastLine, " ") && !strings.HasPrefix(lastLine, "\t") {
-			summary = lastLine
+		if groupMode != "node" {
+			lastLine := currentGroup[len(currentGroup)-1].Message
+			if strings.Contains(lastLine, ": ") && !strings.HasPrefix(lastLine, " ") && !strings.HasPrefix(lastLine, "\t") {
+				summary = lastLine
+			}
 		}
 
 		if base.StructuredData == nil {
@@ -350,27 +397,53 @@ func AggregateMultilineItems(items []LogItem) []LogItem {
 		base.Message = summary
 		result = append(result, base)
 		currentGroup = nil
+		groupMode = ""
 	}
 
 	for _, item := range items {
 		if len(currentGroup) == 0 {
-			if isTracebackStart(item.Message) {
+			if isPythonOrGoStart(item.Message) {
 				currentGroup = append(currentGroup, item)
+				groupMode = "python_or_go"
+			} else if isNodeErrorStart(item.Message) {
+				currentGroup = append(currentGroup, item)
+				groupMode = "node"
 			} else {
 				result = append(result, item)
 			}
+		} else if groupMode == "node" {
+			if isNodeContinuation(item.Message) {
+				currentGroup = append(currentGroup, item)
+			} else {
+				flushGroup()
+				if isPythonOrGoStart(item.Message) {
+					currentGroup = append(currentGroup, item)
+					groupMode = "python_or_go"
+				} else if isNodeErrorStart(item.Message) {
+					currentGroup = append(currentGroup, item)
+					groupMode = "node"
+				} else {
+					result = append(result, item)
+				}
+			}
 		} else {
-			if isTracebackContinuation(item.Message) {
+			// python_or_go mode
+			if isTracebackContinuation(item.Message) || isPythonChainingNotice(item.Message) ||
+				strings.HasPrefix(strings.ToLower(item.Message), "traceback (most recent call last):") {
 				currentGroup = append(currentGroup, item)
 			} else {
 				lastMsg := currentGroup[len(currentGroup)-1].Message
 				if isTracebackContinuation(lastMsg) && (strings.Contains(item.Message, "Error") || strings.Contains(item.Message, "Exception") || strings.Contains(item.Message, ":")) {
 					currentGroup = append(currentGroup, item)
-					flushGroup()
+					// Do not flush immediately in case a Python 3 chained exception notice follows on the next line
 				} else {
 					flushGroup()
-					if isTracebackStart(item.Message) {
+					if isPythonOrGoStart(item.Message) {
 						currentGroup = append(currentGroup, item)
+						groupMode = "python_or_go"
+					} else if isNodeErrorStart(item.Message) {
+						currentGroup = append(currentGroup, item)
+						groupMode = "node"
 					} else {
 						result = append(result, item)
 					}
@@ -617,17 +690,6 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 		return nil
 	}
 
-	reader, err := h.rt.GetContainerLogs(ctx, containerID)
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	items, err := DemuxDockerLogStream(reader, StreamStdout)
-	if err != nil {
-		return err
-	}
-
 	h.mu.Lock()
 	var lastAcked time.Time
 	var hasAcked bool
@@ -639,6 +701,23 @@ func (h *Harvester) HarvestContainerWithMetadata(ctx context.Context, containerI
 	}
 	pendingMax := h.pendingWatermarks[containerID]
 	h.mu.Unlock()
+
+	var reader io.ReadCloser
+	var err error
+	if sinceReader, ok := h.rt.(ContainerLogsSinceReader); ok && hasAcked && !lastAcked.IsZero() {
+		reader, err = sinceReader.GetContainerLogsSince(ctx, containerID, lastAcked.UTC().Format(time.RFC3339Nano))
+	} else {
+		reader, err = h.rt.GetContainerLogs(ctx, containerID)
+	}
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	items, err := DemuxDockerLogStream(reader, StreamStdout)
+	if err != nil {
+		return err
+	}
 
 	var newMaxSeen time.Time
 	if hasAcked {

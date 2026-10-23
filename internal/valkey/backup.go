@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,100 +81,117 @@ func BackupValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vCl
 	containerName := fmt.Sprintf("pc-vk-%s", resourceID)
 	authToken, _ := resolveValkeyAuthToken(ctx, vClient, projectID, resourceID)
 
-	var rdbBytes []byte
+	var hostRdbPath string
 
-	// 1. If runtime is available, check for a running Valkey container
+	// 1. If runtime is available, check for a running Valkey container and trigger BGSAVE
 	if rt != nil {
 		inspect, err := rt.InspectContainer(ctx, containerName)
-		if err == nil && inspect != nil && inspect.Running {
-			// Trigger BGSAVE
-			bgsaveCmd := []string{"valkey-cli"}
+		if err != nil {
+			return nil, fmt.Errorf("failed inspecting valkey container %s: %w", containerName, err)
+		}
+		if inspect == nil || !inspect.Running {
+			return nil, fmt.Errorf("valkey container %s is not running", containerName)
+		}
+
+		// Trigger BGSAVE
+		bgsaveCmd := []string{"valkey-cli"}
+		if authToken != "" {
+			bgsaveCmd = append(bgsaveCmd, "-a", authToken)
+		}
+		bgsaveCmd = append(bgsaveCmd, "BGSAVE")
+
+		stdout, stderr, exitCode, execErr := rt.ExecContainer(ctx, containerName, bgsaveCmd, nil, nil)
+		outStr := string(stdout) + string(stderr)
+		if execErr != nil && !strings.Contains(outStr, "Background saving already in progress") {
+			// Try redis-cli fallback
+			bgsaveCmd[0] = "redis-cli"
+			stdout, stderr, exitCode, execErr = rt.ExecContainer(ctx, containerName, bgsaveCmd, nil, nil)
+			outStr = string(stdout) + string(stderr)
+		}
+
+		if execErr != nil && !strings.Contains(outStr, "Background saving already in progress") {
+			return nil, fmt.Errorf("failed executing BGSAVE on %s: %w (%s)", containerName, execErr, outStr)
+		}
+		if exitCode != 0 && !strings.Contains(outStr, "Background saving already in progress") {
+			return nil, fmt.Errorf("BGSAVE failed with code %d: %s", exitCode, outStr)
+		}
+
+		// 2. Poll until persistence completes
+		pollDeadline := time.Now().Add(30 * time.Second)
+		saved := false
+
+		for time.Now().Before(pollDeadline) {
+			infoCmd := []string{bgsaveCmd[0]}
 			if authToken != "" {
-				bgsaveCmd = append(bgsaveCmd, "-a", authToken)
+				infoCmd = append(infoCmd, "-a", authToken)
 			}
-			bgsaveCmd = append(bgsaveCmd, "BGSAVE")
+			infoCmd = append(infoCmd, "INFO", "persistence")
 
-			stdout, stderr, exitCode, execErr := rt.ExecContainer(ctx, containerName, bgsaveCmd, nil, nil)
-			outStr := string(stdout) + string(stderr)
-			if execErr != nil && !strings.Contains(outStr, "Background saving already in progress") {
-				// Try redis-cli fallback
-				bgsaveCmd[0] = "redis-cli"
-				stdout, stderr, exitCode, execErr = rt.ExecContainer(ctx, containerName, bgsaveCmd, nil, nil)
-				outStr = string(stdout) + string(stderr)
-			}
-
-			if execErr != nil && !strings.Contains(outStr, "Background saving already in progress") {
-				return nil, fmt.Errorf("failed executing BGSAVE on %s: %w (%s)", containerName, execErr, outStr)
-			}
-			if exitCode != 0 && !strings.Contains(outStr, "Background saving already in progress") {
-				return nil, fmt.Errorf("BGSAVE failed with code %d: %s", exitCode, outStr)
-			}
-
-			// 2. Poll until persistence completes
-			pollDeadline := time.Now().Add(30 * time.Second)
-			saved := false
-
-			for time.Now().Before(pollDeadline) {
-				infoCmd := []string{bgsaveCmd[0]}
-				if authToken != "" {
-					infoCmd = append(infoCmd, "-a", authToken)
-				}
-				infoCmd = append(infoCmd, "INFO", "persistence")
-
-				iStdout, _, _, iErr := rt.ExecContainer(ctx, containerName, infoCmd, nil, nil)
-				if iErr == nil {
-					infoStr := string(iStdout)
-					if strings.Contains(infoStr, "rdb_bgsave_in_progress:0") {
-						if strings.Contains(infoStr, "rdb_last_bgsave_status:ok") {
-							saved = true
-							break
-						}
+			iStdout, _, _, iErr := rt.ExecContainer(ctx, containerName, infoCmd, nil, nil)
+			if iErr == nil {
+				infoStr := string(iStdout)
+				if strings.Contains(infoStr, "rdb_bgsave_in_progress:0") {
+					if strings.Contains(infoStr, "rdb_last_bgsave_status:ok") {
+						saved = true
+						break
 					}
 				}
-				time.Sleep(200 * time.Millisecond)
 			}
+			time.Sleep(200 * time.Millisecond)
+		}
 
-			if !saved {
-				return nil, fmt.Errorf("timed out waiting for Valkey BGSAVE to complete on %s", containerName)
-			}
-
-			// Extract directly from container /data/dump.rdb
-			catCmd := []string{"cat", "/data/dump.rdb"}
-			cStdout, _, cCode, cErr := rt.ExecContainer(ctx, containerName, catCmd, nil, nil)
-			if cErr == nil && cCode == 0 && len(cStdout) > 0 {
-				rdbBytes = cStdout
-			}
+		if !saved {
+			return nil, fmt.Errorf("timed out waiting for Valkey BGSAVE to complete on %s", containerName)
 		}
 	}
 
-	// 3. Extract dump.rdb from host volume if available (or if container extract wasn't used)
-	if len(rdbBytes) == 0 {
-		searchDirs := []string{}
-		if baseResDir != "" {
-			searchDirs = append(searchDirs, baseResDir)
-		}
-		searchDirs = append(searchDirs, "/opt/primecloud/resources", filepath.Join(os.TempDir(), "primecloud-resources"))
-		for _, dir := range searchDirs {
-			hostRdbPath := filepath.Join(dir, "valkey", resourceID, "dump.rdb")
-			if data, rErr := os.ReadFile(hostRdbPath); rErr == nil && len(data) > 0 {
-				rdbBytes = data
-				break
-			}
+	// 3. Locate dump.rdb from host volume (eliminating in-memory cat buffer)
+	searchDirs := []string{}
+	if baseResDir != "" {
+		searchDirs = append(searchDirs, baseResDir)
+	}
+	searchDirs = append(searchDirs, "/opt/primecloud/resources", filepath.Join(os.TempDir(), "primecloud-resources"))
+	for _, dir := range searchDirs {
+		candidate := filepath.Join(dir, "valkey", resourceID, "dump.rdb")
+		if fi, err := os.Stat(candidate); err == nil && fi.Size() > 0 {
+			hostRdbPath = candidate
+			break
 		}
 	}
 
-	if len(rdbBytes) == 0 {
-		return nil, fmt.Errorf("failed to extract RDB from container or host volume")
+	if hostRdbPath == "" {
+		return nil, fmt.Errorf("failed to extract RDB: no snapshot found on host volume for %s", resourceID)
 	}
 
-	// Verify RDB header magic number
-	if !bytes.HasPrefix(rdbBytes, []byte("REDIS")) {
+	// Verify RDB header magic number by reading only the first 5 bytes
+	srcFile, err := os.Open(hostRdbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open extracted RDB file: %w", err)
+	}
+	defer srcFile.Close()
+
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(srcFile, header); err != nil || !bytes.Equal(header, []byte("REDIS")) {
 		return nil, fmt.Errorf("extracted Valkey artifact does not have valid REDIS header")
 	}
 
-	if err := os.WriteFile(artifactFile, rdbBytes, 0600); err != nil {
-		return nil, fmt.Errorf("failed writing valkey rdb file: %w", err)
+	// Rewind to beginning for full streaming copy
+	if _, err := srcFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed seeking RDB stream: %w", err)
 	}
+
+	// Stream directly to artifactFile via io.Copy
+	dstFile, err := os.OpenFile(artifactFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating valkey rdb artifact file: %w", err)
+	}
+	defer dstFile.Close()
+
+	copiedBytes, err := io.Copy(dstFile, srcFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed streaming valkey rdb snapshot: %w", err)
+	}
+	_ = copiedBytes
 
 	fi, err := os.Stat(artifactFile)
 	if err != nil {

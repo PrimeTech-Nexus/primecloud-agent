@@ -690,3 +690,52 @@ func TestManager_RouteRemovalAndCleanup(t *testing.T) {
 	}
 }
 
+
+func TestGenerateSnippet_FormatFilterAndCredentialScrubbing(t *testing.T) {
+	route := &RouteConfig{
+		Domain:   "secure-api.primecloud.cloud",
+		Upstream: "127.0.0.1:8000",
+		TLS:      true,
+	}
+
+	snippet, err := GenerateSnippet(route)
+	if err != nil {
+		t.Fatalf("GenerateSnippet() unexpected error: %v", err)
+	}
+
+	expectedFilterDirectives := []string{
+		"header X-Prime-Request-Id {http.request.uuid}",
+		"header_up X-Prime-Request-Id {http.request.uuid}",
+		"format filter {",
+		"wrap json {",
+		"time_format \"iso8601\"",
+		"request>headers>Authorization delete",
+		"request>headers>Proxy-Authorization delete",
+		"request>headers>Cookie cookie {",
+		"delete session_id",
+		"delete token",
+		"delete access_token",
+		"delete refresh_token",
+		"replace jwt [REDACTED]",
+		"request>uri query {",
+		"replace token [REDACTED]",
+		"replace auth [REDACTED]",
+		"replace key [REDACTED]",
+		"replace api_key [REDACTED]",
+		"replace secret [REDACTED]",
+		"replace password [REDACTED]",
+		"replace access_token [REDACTED]",
+		"replace refresh_token [REDACTED]",
+		"replace client_secret [REDACTED]",
+	}
+
+	for _, dir := range expectedFilterDirectives {
+		if !strings.Contains(snippet, dir) {
+			t.Errorf("expected Caddy snippet to contain %q, got:\n%s", dir, snippet)
+		}
+	}
+
+	if err := ValidateConfig(snippet); err != nil {
+		t.Errorf("ValidateConfig failed on format filter snippet: %v", err)
+	}
+}

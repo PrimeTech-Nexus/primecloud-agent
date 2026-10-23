@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,8 +22,7 @@ import (
 	agentruntime "github.com/primecloud/primecloud-agent/internal/runtime"
 )
 
-// MetricPayload encapsulates node and workload resource telemetry.
-
+// ContainerMetric encapsulates workload container and database telemetry.
 type ContainerMetric struct {
 	ResourceID        string  `json:"resource_id,omitempty"`
 	Engine            string  `json:"engine,omitempty"`
@@ -44,12 +45,29 @@ type ContainerMetric struct {
 	ReplicationStatus string  `json:"replication_status,omitempty"`
 }
 
+// HostMetricsSample represents a single host OS resource measurement with explicit availability flags.
+// Unavailable metrics are never reported as fake zeros.
+type HostMetricsSample struct {
+	CPUUsagePercent    float64
+	CPUAvailable       bool
+	MemoryUsagePercent float64
+	MemoryAvailable    bool
+	AllocatedMemoryMB  int64
+	TotalMemoryMB      int64
+	DiskUsagePercent   float64
+	DiskAvailable      bool
+}
+
+// MetricPayload encapsulates node and workload resource telemetry.
 type MetricPayload struct {
 	NodeID             string                     `json:"node_id"`
 	AgentID            string                     `json:"agent_id"`
 	CPUUsagePercent    float64                    `json:"cpu_usage_percent"`
+	CPUAvailable       bool                       `json:"cpu_available"`
 	MemoryUsagePercent float64                    `json:"memory_usage_percent"`
+	MemoryAvailable    bool                       `json:"memory_available"`
 	DiskUsagePercent   float64                    `json:"disk_usage_percent"`
+	DiskAvailable      bool                       `json:"disk_available"`
 	AllocatedMemoryMB  int64                      `json:"allocated_memory_mb"`
 	TotalMemoryMB      int64                      `json:"total_memory_mb"`
 	ContainerCount     int                        `json:"container_count"`
@@ -71,6 +89,14 @@ type Collector struct {
 	logger          *slog.Logger
 	draining        bool
 	failedCount     int
+
+	// Host OS telemetry state & injectable readers for deterministic testing across OS targets
+	goos            string
+	prevCPUTotal    uint64
+	prevCPUIdle     uint64
+	hasPrevCPU      bool
+	readFileFunc    func(path string) ([]byte, error)
+	runCommandFunc  func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 // NewCollector constructs a Collector instance.
@@ -88,13 +114,16 @@ func NewCollector(
 		logger = slog.Default()
 	}
 	return &Collector{
-		interval:   interval,
-		nodeID:     nodeID,
-		agentID:    agentID,
-		rt:         rt,
-		grpcClient: grpcClient,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		logger:     logger.With("component", "metrics_collector"),
+		interval:       interval,
+		nodeID:         nodeID,
+		agentID:        agentID,
+		rt:             rt,
+		grpcClient:     grpcClient,
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		logger:         logger.With("component", "metrics_collector"),
+		goos:           runtime.GOOS,
+		readFileFunc:   os.ReadFile,
+		runCommandFunc: defaultRunCommand,
 	}
 }
 
@@ -131,7 +160,15 @@ func NewCollectorWithAuth(
 		agentKey:        agentKey,
 		httpClient:      &http.Client{Timeout: 10 * time.Second},
 		logger:          logger.With("component", "metrics_collector"),
+		goos:            runtime.GOOS,
+		readFileFunc:    os.ReadFile,
+		runCommandFunc:  defaultRunCommand,
 	}
+}
+
+func defaultRunCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	return cmd.Output()
 }
 
 // SetDrain updates the collector's node drain awareness.
@@ -141,32 +178,282 @@ func (c *Collector) SetDrain(draining bool) {
 	c.draining = draining
 }
 
+// parseLinuxProcStat parses the aggregate "cpu " line from /proc/stat and returns (total, idle, ok).
+func parseLinuxProcStat(raw string) (uint64, uint64, bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "cpu ") {
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				return 0, 0, false
+			}
+			var total uint64
+			var idle uint64
+			for i := 1; i < len(fields); i++ {
+				v, err := strconv.ParseUint(fields[i], 10, 64)
+				if err != nil {
+					return 0, 0, false
+				}
+				total += v
+				// idle (index 4) + iowait (index 5)
+				if i == 4 || i == 5 {
+					idle += v
+				}
+			}
+			if total == 0 {
+				return 0, 0, false
+			}
+			return total, idle, true
+		}
+	}
+	return 0, 0, false
+}
+
+// parseLinuxMeminfo parses MemTotal and MemAvailable (or MemFree+Buffers+Cached) from /proc/meminfo.
+func parseLinuxMeminfo(raw string) (usedPct float64, allocMB int64, totalMB int64, ok bool) {
+	var memTotalKB, memAvailKB, memFreeKB, buffersKB, cachedKB uint64
+	var hasTotal, hasAvail, hasFree bool
+
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		val, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSuffix(fields[0], ":") {
+		case "MemTotal":
+			memTotalKB = val
+			hasTotal = true
+		case "MemAvailable":
+			memAvailKB = val
+			hasAvail = true
+		case "MemFree":
+			memFreeKB = val
+			hasFree = true
+		case "Buffers":
+			buffersKB = val
+		case "Cached":
+			cachedKB = val
+		}
+	}
+
+	if !hasTotal || memTotalKB == 0 {
+		return 0, 0, 0, false
+	}
+	if !hasAvail {
+		if !hasFree {
+			return 0, 0, 0, false
+		}
+		memAvailKB = memFreeKB + buffersKB + cachedKB
+	}
+	if memAvailKB > memTotalKB {
+		memAvailKB = memTotalKB
+	}
+	usedKB := memTotalKB - memAvailKB
+	usedPct = (float64(usedKB) / float64(memTotalKB)) * 100.0
+	allocMB = int64(usedKB / 1024)
+	totalMB = int64(memTotalKB / 1024)
+	return usedPct, allocMB, totalMB, true
+}
+
+// parsePOSIXDfOutput parses `df -kP /` output and returns disk usage percentage in [0, 100].
+func parsePOSIXDfOutput(raw string) (float64, bool) {
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(lines) < 2 {
+		return 0, false
+	}
+	// Find the last non-empty line
+	dataLine := strings.TrimSpace(lines[len(lines)-1])
+	fields := strings.Fields(dataLine)
+	if len(fields) < 5 {
+		return 0, false
+	}
+	// Prefer exact block calculation from 1K-blocks Used and Available (fields[2], fields[3])
+	usedBlocks, errUsed := strconv.ParseFloat(fields[2], 64)
+	availBlocks, errAvail := strconv.ParseFloat(fields[3], 64)
+	if errUsed == nil && errAvail == nil && (usedBlocks+availBlocks) > 0 {
+		pct := (usedBlocks / (usedBlocks + availBlocks)) * 100.0
+		if pct >= 0.0 && pct <= 100.0 {
+			return pct, true
+		}
+	}
+	// Fallback to capacity column (e.g. "42%")
+	capStr := strings.TrimSuffix(fields[4], "%")
+	if pct, err := strconv.ParseFloat(capStr, 64); err == nil && pct >= 0.0 && pct <= 100.0 {
+		return pct, true
+	}
+	return 0, false
+}
+
+// collectHostMetrics gathers real OS CPU, memory, and disk utilization.
+// Never emits synthetic zero values when a measurement is unavailable.
+func (c *Collector) collectHostMetrics(ctx context.Context) HostMetricsSample {
+	var sample HostMetricsSample
+
+	readFile := c.readFileFunc
+	if readFile == nil {
+		readFile = os.ReadFile
+	}
+	runCmd := c.runCommandFunc
+	if runCmd == nil {
+		runCmd = defaultRunCommand
+	}
+	goos := c.goos
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+
+	switch goos {
+	case "linux":
+		// 1. CPU via /proc/stat delta (or /proc/loadavg on initial sample)
+		if rawStat, err := readFile("/proc/stat"); err == nil {
+			if total, idle, ok := parseLinuxProcStat(string(rawStat)); ok {
+				c.mu.Lock()
+				hasPrev := c.hasPrevCPU
+				prevTotal := c.prevCPUTotal
+				prevIdle := c.prevCPUIdle
+				c.prevCPUTotal = total
+				c.prevCPUIdle = idle
+				c.hasPrevCPU = true
+				c.mu.Unlock()
+
+				if hasPrev && total > prevTotal {
+					totalDelta := total - prevTotal
+					idleDelta := uint64(0)
+					if idle >= prevIdle {
+						idleDelta = idle - prevIdle
+					}
+					if totalDelta >= idleDelta {
+						sample.CPUUsagePercent = (float64(totalDelta-idleDelta) / float64(totalDelta)) * 100.0
+						sample.CPUAvailable = true
+					}
+				}
+			}
+		}
+		if !sample.CPUAvailable {
+			if rawLoad, err := readFile("/proc/loadavg"); err == nil {
+				parts := strings.Fields(string(rawLoad))
+				if len(parts) > 0 {
+					if load1, err := strconv.ParseFloat(parts[0], 64); err == nil && load1 >= 0 {
+						cpuCount := float64(runtime.NumCPU())
+						if cpuCount <= 0 {
+							cpuCount = 1.0
+						}
+						pct := (load1 / cpuCount) * 100.0
+						if pct > 100.0 {
+							pct = 100.0
+						}
+						sample.CPUUsagePercent = pct
+						sample.CPUAvailable = true
+					}
+				}
+			}
+		}
+
+		// 2. Memory via /proc/meminfo
+		if rawMem, err := readFile("/proc/meminfo"); err == nil {
+			if pct, allocMB, totalMB, ok := parseLinuxMeminfo(string(rawMem)); ok {
+				sample.MemoryUsagePercent = pct
+				sample.AllocatedMemoryMB = allocMB
+				sample.TotalMemoryMB = totalMB
+				sample.MemoryAvailable = true
+			}
+		}
+
+		// 3. Disk via POSIX df -kP /
+		cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		dfOut, err := runCmd(cmdCtx, "df", "-kP", "/")
+		cancel()
+		if err == nil {
+			if pct, ok := parsePOSIXDfOutput(string(dfOut)); ok {
+				sample.DiskUsagePercent = pct
+				sample.DiskAvailable = true
+			}
+		}
+
+	case "windows":
+		// 1. CPU via wmic
+		cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		cpuOut, err := runCmd(cmdCtx, "wmic", "cpu", "get", "loadpercentage")
+		cancel()
+		if err == nil {
+			for _, line := range strings.Split(string(cpuOut), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.EqualFold(line, "LoadPercentage") {
+					continue
+				}
+				if v, parseErr := strconv.ParseFloat(line, 64); parseErr == nil && v >= 0.0 && v <= 100.0 {
+					sample.CPUUsagePercent = v
+					sample.CPUAvailable = true
+					break
+				}
+			}
+		}
+
+		// 2. Memory via wmic OS
+		cmdCtx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
+		memOut, err := runCmd(cmdCtx2, "wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize")
+		cancel2()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(memOut)), "\n") {
+				fields := strings.Fields(strings.TrimSpace(line))
+				if len(fields) >= 2 && !strings.EqualFold(fields[0], "FreePhysicalMemory") {
+					freeKB, err1 := strconv.ParseFloat(fields[0], 64)
+					totalKB, err2 := strconv.ParseFloat(fields[1], 64)
+					if err1 == nil && err2 == nil && totalKB > 0 && freeKB <= totalKB {
+						usedKB := totalKB - freeKB
+						sample.MemoryUsagePercent = (usedKB / totalKB) * 100.0
+						sample.AllocatedMemoryMB = int64(usedKB / 1024.0)
+						sample.TotalMemoryMB = int64(totalKB / 1024.0)
+						sample.MemoryAvailable = true
+						break
+					}
+				}
+			}
+		}
+
+		// 3. Disk via wmic logicaldisk
+		cmdCtx3, cancel3 := context.WithTimeout(ctx, 2*time.Second)
+		diskOut, err := runCmd(cmdCtx3, "wmic", "logicaldisk", "where", "DeviceID='C:'", "get", "FreeSpace,Size")
+		cancel3()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(diskOut)), "\n") {
+				fields := strings.Fields(strings.TrimSpace(line))
+				if len(fields) >= 2 && !strings.EqualFold(fields[0], "FreeSpace") {
+					freeB, err1 := strconv.ParseFloat(fields[0], 64)
+					totalB, err2 := strconv.ParseFloat(fields[1], 64)
+					if err1 == nil && err2 == nil && totalB > 0 && freeB <= totalB {
+						sample.DiskUsagePercent = ((totalB - freeB) / totalB) * 100.0
+						sample.DiskAvailable = true
+						break
+					}
+				}
+			}
+		}
+	default:
+		// Unsupported operating system: explicitly mark host OS CPU and Disk as unavailable
+		// rather than fabricating 0.0 values.
+		sample.CPUAvailable = false
+		sample.DiskAvailable = false
+		sample.MemoryAvailable = false
+	}
+
+	return sample
+}
+
 // Sample collects current utilization metrics.
 func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 	c.mu.Lock()
 	draining := c.draining
 	c.mu.Unlock()
 
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
-	allocatedMB := int64(memStats.Alloc / (1024 * 1024))
-	sysMB := int64(memStats.Sys / (1024 * 1024))
-	if sysMB == 0 {
-		sysMB = 1024
-	}
-
-	memPercent := 5.0
-	if memStats.Sys > 0 {
-		memPercent = float64(memStats.Alloc) / float64(memStats.Sys) * 100.0
-	}
+	hostSample := c.collectHostMetrics(ctx)
 
 	containerCount := 0
 	containerStats := make(map[string]ContainerMetric)
-
-	var nodeCPU float64 = 0.0
-	var nodeDisk float64 = 0.0
-	// Real OS metrics would be collected here.
 
 	if c.rt != nil {
 		if containers, err := c.rt.ListContainers(ctx, true); err == nil {
@@ -177,13 +464,19 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 
 				if cnt.State == "running" {
 					if statsReader, err := c.rt.GetContainerStats(ctx, cnt.ID); err == nil && statsReader != nil {
-						defer statsReader.Close()
 						var v types.StatsJSON
 						if err := json.NewDecoder(statsReader).Decode(&v); err == nil {
 							cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage) - float64(v.PreCPUStats.CPUUsage.TotalUsage)
 							systemDelta := float64(v.CPUStats.SystemUsage) - float64(v.PreCPUStats.SystemUsage)
 							if systemDelta > 0.0 && cpuDelta > 0.0 {
-								stat.CPUUsagePercent = (cpuDelta / systemDelta) * float64(len(v.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+								cpuCount := len(v.CPUStats.CPUUsage.PercpuUsage)
+								if cpuCount == 0 {
+									cpuCount = int(v.CPUStats.OnlineCPUs)
+								}
+								if cpuCount == 0 {
+									cpuCount = 1
+								}
+								stat.CPUUsagePercent = (cpuDelta / systemDelta) * float64(cpuCount) * 100.0
 							}
 							stat.MemoryUsageBytes = int64(v.MemoryStats.Usage)
 							stat.MemoryLimitBytes = int64(v.MemoryStats.Limit)
@@ -232,6 +525,10 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-pg-")
 							} else if strings.HasPrefix(cleanName, "pc-vk-") {
 								stat.ResourceID = strings.TrimPrefix(cleanName, "pc-vk-")
+							} else if strings.HasPrefix(cleanName, "pc-my-") || strings.HasPrefix(cleanName, "pc-mysql-") {
+								stat.ResourceID = strings.TrimPrefix(strings.TrimPrefix(cleanName, "pc-mysql-"), "pc-my-")
+							} else if strings.HasPrefix(cleanName, "pc-mg-") || strings.HasPrefix(cleanName, "pc-mongodb-") {
+								stat.ResourceID = strings.TrimPrefix(strings.TrimPrefix(cleanName, "pc-mongodb-"), "pc-mg-")
 							} else if strings.HasPrefix(cleanName, "pc-app-") {
 								suffix := strings.TrimPrefix(cleanName, "pc-app-")
 								parts := strings.Split(suffix, "-")
@@ -246,9 +543,11 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 
 						if isPostgres(cnt.Image) || isPostgres(cntName) {
 							stat.Engine = "postgres"
+							stat.QueryHealth = "failed"
 							cmd := []string{"psql", "-U", "postgres", "-c", "SELECT count(*) FROM pg_stat_activity;"}
 							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
 							if err == nil && exit == 0 {
+								stat.QueryHealth = "healthy"
 								lines := strings.Split(string(stdout), "\n")
 								for _, line := range lines {
 									line = strings.TrimSpace(line)
@@ -271,11 +570,90 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 							}
 						}
 
+						if isMySQL(cnt.Image) || isMySQL(cntName) {
+							stat.Engine = "mysql"
+							stat.QueryHealth = "failed"
+							cmd := []string{"mysql", "-h", "127.0.0.1", "-u", "root", "-N", "-B", "-e", "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected', 'Questions', 'Uptime');"}
+							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
+							if err == nil && exit == 0 {
+								stat.QueryHealth = "healthy"
+								lines := strings.Split(string(stdout), "\n")
+								for _, line := range lines {
+									fields := strings.Fields(strings.TrimSpace(line))
+									if len(fields) >= 2 {
+										val, parseErr := strconv.ParseInt(fields[1], 10, 64)
+										if parseErr == nil {
+											switch fields[0] {
+											case "Threads_connected":
+												stat.ActiveConnections = val
+											case "Questions":
+												stat.CommandsProcessed = val
+											case "Uptime":
+												if stat.UptimeSeconds == 0 {
+													stat.UptimeSeconds = val
+												}
+											}
+										}
+									}
+								}
+							}
+
+							sizeCmd := []string{"mysql", "-h", "127.0.0.1", "-u", "root", "-N", "-B", "-e", "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables;"}
+							sOut, _, sExit, sErr := c.rt.ExecContainer(ctx, cnt.ID, sizeCmd, nil, nil)
+							if sErr == nil && sExit == 0 {
+								if val, err := strconv.ParseInt(strings.TrimSpace(string(sOut)), 10, 64); err == nil {
+									stat.DatabaseSizeBytes = val
+								}
+							}
+						}
+
+						if isMongoDB(cnt.Image) || isMongoDB(cntName) {
+							stat.Engine = "mongodb"
+							stat.QueryHealth = "failed"
+							cmd := []string{"mongosh", "--quiet", "--eval", "JSON.stringify(db.serverStatus())"}
+							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
+							if err == nil && exit == 0 {
+								stat.QueryHealth = "healthy"
+								var srv map[string]interface{}
+								if jsonErr := json.Unmarshal(stdout, &srv); jsonErr == nil {
+									if conns, ok := srv["connections"].(map[string]interface{}); ok {
+										if cur, ok := conns["current"].(float64); ok {
+											stat.ActiveConnections = int64(cur)
+										}
+									}
+									if ops, ok := srv["opcounters"].(map[string]interface{}); ok {
+										var totalOps int64
+										for _, k := range []string{"insert", "query", "update", "delete", "command"} {
+											if v, ok := ops[k].(float64); ok {
+												totalOps += int64(v)
+											}
+										}
+										stat.CommandsProcessed = totalOps
+									}
+									if mem, ok := srv["mem"].(map[string]interface{}); ok {
+										if resMB, ok := mem["resident"].(float64); ok && stat.MemoryUsageBytes == 0 {
+											stat.MemoryUsageBytes = int64(resMB) * 1024 * 1024
+										}
+									}
+								}
+							}
+
+							sizeCmd := []string{"mongosh", "--quiet", "--eval", "db.stats().dataSize || 0"}
+							sOut, _, sExit, sErr := c.rt.ExecContainer(ctx, cnt.ID, sizeCmd, nil, nil)
+							if sErr == nil && sExit == 0 {
+								if val, err := strconv.ParseInt(strings.TrimSpace(string(sOut)), 10, 64); err == nil {
+									stat.DatabaseSizeBytes = val
+								}
+							}
+						}
+
 						if isValkey(cnt.Image) || isValkey(cntName) {
 							stat.Engine = "valkey"
+							stat.QueryHealth = "failed"
 							cmd := []string{"valkey-cli", "info"}
 							stdout, _, exit, err := c.rt.ExecContainer(ctx, cnt.ID, cmd, nil, nil)
 							if err == nil && exit == 0 {
+								stat.QueryHealth = "healthy"
 								lines := strings.Split(string(stdout), "\n")
 								for _, line := range lines {
 									line = strings.TrimSpace(line)
@@ -299,6 +677,23 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 						}
 					}
 				}
+				if cnt.State != "running" {
+					stat.HealthStatus = "stopped"
+					stat.QueryHealth = "failed"
+					cntName := ""
+					if len(cnt.Names) > 0 {
+						cntName = strings.TrimPrefix(cnt.Names[0], "/")
+					}
+					if isPostgres(cnt.Image) || isPostgres(cntName) {
+						stat.Engine = "postgres"
+					} else if isMySQL(cnt.Image) || isMySQL(cntName) {
+						stat.Engine = "mysql"
+					} else if isMongoDB(cnt.Image) || isMongoDB(cntName) {
+						stat.Engine = "mongodb"
+					} else if isValkey(cnt.Image) || isValkey(cntName) {
+						stat.Engine = "valkey"
+					}
+				}
 				containerStats[shortID] = stat
 			}
 		}
@@ -311,16 +706,18 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 	return &MetricPayload{
 		NodeID:             c.nodeID,
 		AgentID:            c.agentID,
-		CPUUsagePercent:    nodeCPU,
-		MemoryUsagePercent: memPercent,
-		DiskUsagePercent:   nodeDisk,
-		AllocatedMemoryMB:  allocatedMB,
-		TotalMemoryMB:      sysMB,
+		CPUUsagePercent:    hostSample.CPUUsagePercent,
+		CPUAvailable:       hostSample.CPUAvailable,
+		MemoryUsagePercent: hostSample.MemoryUsagePercent,
+		MemoryAvailable:    hostSample.MemoryAvailable,
+		DiskUsagePercent:   hostSample.DiskUsagePercent,
+		DiskAvailable:      hostSample.DiskAvailable,
+		AllocatedMemoryMB:  hostSample.AllocatedMemoryMB,
+		TotalMemoryMB:      hostSample.TotalMemoryMB,
 		ContainerCount:     containerCount,
 		ContainerStats:     containerStats,
 		SampledAt:          time.Now(),
 	}, nil
-
 }
 
 // Start boots the continuous collection ticker in a background goroutine.
@@ -395,41 +792,43 @@ type IngestMetricBatch struct {
 	Metrics []IngestMetricPoint `json:"metrics"`
 }
 
-func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
-	if c.controlPlaneURL == "" {
-		return
-	}
-
+// BuildIngestBatch converts a MetricPayload into the canonical IngestMetricBatch contract.
+// Host metrics are only included when their corresponding *Available flag is true, preventing fake zero emissions.
+func (c *Collector) BuildIngestBatch(metrics *MetricPayload) IngestMetricBatch {
 	sampledIso := metrics.SampledAt.UTC().Format(time.RFC3339)
 	var points []IngestMetricPoint
 
-	// 1. Host Node Level Metrics
-	points = append(points,
-		IngestMetricPoint{
+	// 1. Host Node Level Metrics (only emitted when genuinely available)
+	if metrics.CPUAvailable {
+		points = append(points, IngestMetricPoint{
 			ResourceID:   c.nodeID,
 			ResourceType: "node",
 			MetricName:   "cpu_usage_percent",
 			Value:        metrics.CPUUsagePercent,
 			Unit:         "percent",
 			Timestamp:    sampledIso,
-		},
-		IngestMetricPoint{
+		})
+	}
+	if metrics.MemoryAvailable {
+		points = append(points, IngestMetricPoint{
 			ResourceID:   c.nodeID,
 			ResourceType: "node",
 			MetricName:   "memory_usage_percent",
 			Value:        metrics.MemoryUsagePercent,
 			Unit:         "percent",
 			Timestamp:    sampledIso,
-		},
-		IngestMetricPoint{
+		})
+	}
+	if metrics.DiskAvailable {
+		points = append(points, IngestMetricPoint{
 			ResourceID:   c.nodeID,
 			ResourceType: "node",
 			MetricName:   "disk_usage_percent",
 			Value:        metrics.DiskUsagePercent,
 			Unit:         "percent",
 			Timestamp:    sampledIso,
-		},
-	)
+		})
+	}
 
 	// 2. Container / Workload Level Metrics
 	for shortID, stat := range metrics.ContainerStats {
@@ -442,24 +841,47 @@ func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
 			resType = stat.Engine
 		}
 
-		points = append(points,
-			IngestMetricPoint{
-				ResourceID:   resID,
-				ResourceType: resType,
-				MetricName:   "cpu_usage_percent",
-				Value:        stat.CPUUsagePercent,
-				Unit:         "percent",
-				Timestamp:    sampledIso,
-			},
-			IngestMetricPoint{
-				ResourceID:   resID,
-				ResourceType: resType,
-				MetricName:   "memory_usage_bytes",
-				Value:        float64(stat.MemoryUsageBytes),
-				Unit:         "bytes",
-				Timestamp:    sampledIso,
-			},
-		)
+		// Only emit running container CPU/memory points so stopped containers don't masquerade as healthy 0% usage
+		if stat.State == "running" {
+			points = append(points,
+				IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "cpu_usage_percent",
+					Value:        stat.CPUUsagePercent,
+					Unit:         "percent",
+					Timestamp:    sampledIso,
+				},
+				IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "memory_usage_bytes",
+					Value:        float64(stat.MemoryUsageBytes),
+					Unit:         "bytes",
+					Timestamp:    sampledIso,
+				},
+			)
+			if stat.NetworkRxBytes > 0 {
+				points = append(points, IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "network_rx_bytes",
+					Value:        float64(stat.NetworkRxBytes),
+					Unit:         "bytes",
+					Timestamp:    sampledIso,
+				})
+			}
+			if stat.NetworkTxBytes > 0 {
+				points = append(points, IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "network_tx_bytes",
+					Value:        float64(stat.NetworkTxBytes),
+					Unit:         "bytes",
+					Timestamp:    sampledIso,
+				})
+			}
+		}
 
 		if stat.UptimeSeconds > 0 {
 			points = append(points, IngestMetricPoint{
@@ -511,11 +933,36 @@ func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
 				Timestamp:    sampledIso,
 			})
 		}
+		if stat.QueryHealth != "" {
+			qVal := 0.0
+			if stat.QueryHealth == "healthy" {
+				qVal = 1.0
+			}
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "query_health",
+				Value:        qVal,
+				Unit:         "status",
+				Timestamp:    sampledIso,
+			})
+		}
 	}
 
-	batch := IngestMetricBatch{
+	return IngestMetricBatch{
 		NodeID:  c.nodeID,
 		Metrics: points,
+	}
+}
+
+func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
+	if c.controlPlaneURL == "" {
+		return
+	}
+
+	batch := c.BuildIngestBatch(metrics)
+	if len(batch.Metrics) == 0 {
+		return
 	}
 
 	bodyBytes, err := json.Marshal(batch)
@@ -556,7 +1003,7 @@ func (c *Collector) transmitHTTP(ctx context.Context, metrics *MetricPayload) {
 		c.mu.Lock()
 		c.failedCount = 0
 		c.mu.Unlock()
-		c.logger.Debug("metrics_http_ingest_successful", "accepted_points", len(points))
+		c.logger.Debug("metrics_http_ingest_successful", "accepted_points", len(batch.Metrics))
 	} else {
 		c.mu.Lock()
 		c.failedCount++
@@ -577,5 +1024,19 @@ func isPostgres(name string) bool {
 }
 
 func isValkey(name string) bool {
+	return strings.Contains(strings.ToLower(name), "valkey")
+}
+
+func isMySQL(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "mysql") || strings.HasPrefix(strings.TrimPrefix(lower, "/"), "pc-my-")
+}
+
+func isMongoDB(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "mongo") || strings.HasPrefix(strings.TrimPrefix(lower, "/"), "pc-mg-")
+}
+
+func isValkeyLegacy(name string) bool {
 	return strings.Contains(strings.ToLower(name), "valkey")
 }

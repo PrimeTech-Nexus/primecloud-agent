@@ -234,7 +234,7 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 	if logPath == "" {
 		logPath = "/var/log/primecloud/caddy-access.log"
 	}
-	sb.WriteString(fmt.Sprintf("    log {\n        output file %s {\n            roll_size 20mb\n            roll_keep 3\n        }\n        format json {\n            time_format \"iso8601\"\n        }\n    }\n", logPath))
+	sb.WriteString(fmt.Sprintf("    log {\n        output file %s {\n            roll_size 20mb\n            roll_keep 3\n        }\n        format filter {\n            wrap json {\n                time_format \"iso8601\"\n            }\n            fields {\n                request>headers>Authorization delete\n                request>headers>Proxy-Authorization delete\n                request>headers>Cookie cookie {\n                    delete session_id\n                    delete token\n                    delete access_token\n                    delete refresh_token\n                    replace jwt [REDACTED]\n                }\n                request>uri query {\n                    replace token [REDACTED]\n                    replace auth [REDACTED]\n                    replace key [REDACTED]\n                    replace api_key [REDACTED]\n                    replace secret [REDACTED]\n                    replace password [REDACTED]\n                    replace access_token [REDACTED]\n                    replace refresh_token [REDACTED]\n                    replace client_secret [REDACTED]\n                }\n            }\n        }\n    }\n", logPath))
 
 	if isWildcard {
 		// Wildcard fallback: unconfigured customer domain does NOT proxy to dead port; returns deterministic 404

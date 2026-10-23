@@ -3,6 +3,7 @@ package logs
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,21 +18,59 @@ import (
 // HeaderXPrimeRequestID is the canonical HTTP request correlation header (ADR-0004).
 const HeaderXPrimeRequestID = "X-Prime-Request-Id"
 
+// uuidv7Regex matches a compliant RFC 9562 UUIDv7 string.
+var uuidv7Regex = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// uuidv4Regex matches a compliant RFC 4122 UUIDv4 string.
+var uuidv4Regex = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// IsValidUUIDv7 returns true if s is a valid RFC 9562 UUIDv7 string.
+func IsValidUUIDv7(s string) bool {
+	return uuidv7Regex.MatchString(strings.TrimSpace(s))
+}
+
+// GenerateUUIDv7 generates a compliant RFC 9562 v7 UUID string.
+func GenerateUUIDv7() string {
+	var b [16]byte
+	now := time.Now().UnixMilli()
+	b[0] = byte(now >> 40)
+	b[1] = byte(now >> 32)
+	b[2] = byte(now >> 24)
+	b[3] = byte(now >> 16)
+	b[4] = byte(now >> 8)
+	b[5] = byte(now)
+	_, _ = rand.Read(b[6:])
+	b[6] = (b[6] & 0x0f) | 0x70 // Version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// EnsureRequestID returns existing if non-empty (preserving valid UUIDv7/v4 or correlation ID),
+// or generates a fresh RFC 9562 UUIDv7 when missing.
+func EnsureRequestID(existing string) string {
+	trimmed := strings.TrimSpace(existing)
+	if trimmed != "" {
+		return trimmed
+	}
+	return GenerateUUIDv7()
+}
+
 // caddySensitiveQueryRegex strips passwords, tokens, API keys, and session IDs from URLs.
-var caddySensitiveQueryRegex = regexp.MustCompile(`(?i)(token|key|api_key|secret|password|auth|access_token|refresh_token|session_id)=([^&]+)`)
+var caddySensitiveQueryRegex = regexp.MustCompile(`(?i)(token|key|api_key|secret|password|passwd|auth|access_token|refresh_token|session_id|client_secret|private_key|credential)=([^&]+)`)
 
 // CaddyAccessLogEntry models Caddy v2's structured JSON access log format.
 type CaddyAccessLogEntry struct {
-	Level       string                 `json:"level"`
-	Ts          json.RawMessage        `json:"ts"`
-	Logger      string                 `json:"logger"`
-	Msg         string                 `json:"msg"`
-	Request     CaddyRequestDetails    `json:"request"`
-	BytesRead   int64                  `json:"bytes_read"`
-	Duration    float64                `json:"duration"` // Duration in seconds
-	Size        int64                  `json:"size"`
-	Status      int                    `json:"status"`
-	RespHeaders map[string][]string    `json:"resp_headers"`
+	Level       string              `json:"level"`
+	Ts          json.RawMessage     `json:"ts"`
+	Logger      string              `json:"logger"`
+	Msg         string              `json:"msg"`
+	UUID        string              `json:"uuid,omitempty"`
+	Request     CaddyRequestDetails `json:"request"`
+	BytesRead   int64               `json:"bytes_read"`
+	Duration    float64             `json:"duration"` // Duration in seconds
+	Size        int64               `json:"size"`
+	Status      int                 `json:"status"`
+	RespHeaders map[string][]string `json:"resp_headers"`
 }
 
 // CaddyRequestDetails captures incoming HTTP request metadata.
@@ -56,6 +95,7 @@ func SanitizeURI(rawURI string) string {
 }
 
 // ExtractRequestID extracts the canonical X-Prime-Request-Id from request or response headers.
+// If present in request or response headers (or top-level entry UUID), it is preserved.
 func ExtractRequestID(entry *CaddyAccessLogEntry) string {
 	if entry == nil {
 		return ""
@@ -64,8 +104,8 @@ func ExtractRequestID(entry *CaddyAccessLogEntry) string {
 	if entry.Request.Headers != nil {
 		for k, v := range entry.Request.Headers {
 			if strings.EqualFold(k, HeaderXPrimeRequestID) || strings.EqualFold(k, "X-Request-Id") {
-				if len(v) > 0 && v[0] != "" {
-					return v[0]
+				if len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+					return strings.TrimSpace(v[0])
 				}
 			}
 		}
@@ -74,13 +114,25 @@ func ExtractRequestID(entry *CaddyAccessLogEntry) string {
 	if entry.RespHeaders != nil {
 		for k, v := range entry.RespHeaders {
 			if strings.EqualFold(k, HeaderXPrimeRequestID) || strings.EqualFold(k, "X-Request-Id") {
-				if len(v) > 0 && v[0] != "" {
-					return v[0]
+				if len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+					return strings.TrimSpace(v[0])
 				}
 			}
 		}
 	}
+	// 3. Check top-level Caddy uuid field if present
+	if strings.TrimSpace(entry.UUID) != "" {
+		return strings.TrimSpace(entry.UUID)
+	}
 	return ""
+}
+
+// ExtractOrGenerateRequestID extracts the request ID from entry or generates a fresh RFC 9562 UUIDv7 when missing.
+func ExtractOrGenerateRequestID(entry *CaddyAccessLogEntry) string {
+	if id := ExtractRequestID(entry); id != "" {
+		return id
+	}
+	return GenerateUUIDv7()
 }
 
 // ParseCaddyAccessLogLine transforms a raw Caddy JSON access line into a normalized LogItem.
@@ -95,7 +147,11 @@ func ParseCaddyAccessLogLine(line string, domainMap map[string]string) (*LogItem
 		return nil, fmt.Errorf("invalid caddy json access log: %w", err)
 	}
 
-	reqID := ExtractRequestID(&entry)
+	if entry.Request.Headers != nil {
+		entry.Request.Headers = RedactAuthHeaders(entry.Request.Headers)
+	}
+
+	reqID := ExtractOrGenerateRequestID(&entry)
 	sanitizedURI := SanitizeURI(entry.Request.URI)
 	durationMs := entry.Duration * 1000.0
 
@@ -156,23 +212,25 @@ func ParseCaddyAccessLogLine(line string, domainMap map[string]string) (*LogItem
 	}
 
 	// Build structured HTTP metadata
+	httpMeta := map[string]interface{}{
+		"method":      entry.Request.Method,
+		"host":        entry.Request.Host,
+		"route":       sanitizedURI,
+		"status_code": entry.Status,
+		"duration_ms": durationMs,
+		"client_ip":   entry.Request.RemoteIP,
+	}
+	if entry.Request.Headers != nil {
+		httpMeta["headers"] = entry.Request.Headers
+	}
 	structuredData := map[string]interface{}{
 		"status_code": entry.Status,
 		"duration_ms": durationMs,
-		"http": map[string]interface{}{
-			"method":      entry.Request.Method,
-			"host":        entry.Request.Host,
-			"route":       sanitizedURI,
-			"status_code": entry.Status,
-			"duration_ms": durationMs,
-			"client_ip":   entry.Request.RemoteIP,
-		},
+		"http":        httpMeta,
 	}
 	if reqID != "" {
 		structuredData["request_id"] = reqID
-		if httpMap, ok := structuredData["http"].(map[string]interface{}); ok {
-			httpMap["request_id"] = reqID
-		}
+		httpMeta["request_id"] = reqID
 	}
 
 	return &LogItem{

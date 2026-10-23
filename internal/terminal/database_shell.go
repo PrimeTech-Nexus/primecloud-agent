@@ -39,6 +39,9 @@ var AllowedCommands = map[string]string{
 	"valkey":     "valkey-cli",
 	"keyvalue":   "valkey-cli",
 	"redis":      "valkey-cli",
+	"mysql":      "mysql",
+	"mongodb":    "mongosh",
+	"mongo":      "mongosh",
 }
 
 // Explicitly forbidden commands that must never be executed under any circumstances.

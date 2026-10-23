@@ -132,6 +132,24 @@ func FormatValkeyAliases(resourceID string) []string {
 	}
 }
 
+// FormatMySQLAliases produces canonical DNS aliases for MySQL in an environment.
+func FormatMySQLAliases(resourceID string) []string {
+	cleanID := strings.TrimSpace(resourceID)
+	return []string{
+		fmt.Sprintf("mysql-%s.internal.primecloud", cleanID),
+		fmt.Sprintf("mysql-%s", cleanID),
+	}
+}
+
+// FormatMongoDBAliases produces canonical DNS aliases for MongoDB in an environment.
+func FormatMongoDBAliases(resourceID string) []string {
+	cleanID := strings.TrimSpace(resourceID)
+	return []string{
+		fmt.Sprintf("mongodb-%s.internal.primecloud", cleanID),
+		fmt.Sprintf("mongodb-%s", cleanID),
+	}
+}
+
 // FormatApplicationAliases produces DNS aliases for an application container.
 func FormatApplicationAliases(applicationID, slug string) []string {
 	cleanAppID := strings.TrimSpace(applicationID)

@@ -906,6 +906,125 @@ func TestHarvester_PermanentRejectionOnHTTP422(t *testing.T) {
 	}
 }
 
+func TestAggregateMultilineItems_NodeJSV8Traceback(t *testing.T) {
+	ts := time.Now().UTC()
+	rawItems := []LogItem{
+		{Stream: StreamStderr, Severity: SeverityError, Message: "TypeError: Cannot read properties of undefined (reading 'token')", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    at authenticateUser (/app/src/auth.js:84:19)", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    at processTicksAndRejections (node:internal/process/task_queues:95:5)", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "  [cause]: Error: Invalid token structure", Timestamp: &ts},
+		{Stream: StreamStdout, Severity: SeverityInfo, Message: "Server listening on port 3000", Timestamp: &ts},
+	}
+
+	aggregated := AggregateMultilineItems(rawItems)
+	if len(aggregated) != 2 {
+		t.Fatalf("expected 2 items after Node.js V8 multiline aggregation, got %d", len(aggregated))
+	}
+
+	first := aggregated[0]
+	if first.Severity != SeverityError {
+		t.Errorf("expected Severity ERROR, got %s", first.Severity)
+	}
+	if first.Message != "TypeError: Cannot read properties of undefined (reading 'token')" {
+		t.Errorf("expected Node.js error header as summary Message, got: %s", first.Message)
+	}
+	if first.StructuredData == nil || first.StructuredData["is_multiline"] != true {
+		t.Fatalf("expected is_multiline=true in StructuredData")
+	}
+	if first.StructuredData["line_count"] != 4 {
+		t.Errorf("expected line_count=4, got %v", first.StructuredData["line_count"])
+	}
+	rawTb, _ := first.StructuredData["raw_traceback"].(string)
+	if !strings.Contains(rawTb, "at authenticateUser") || !strings.Contains(rawTb, "[cause]: Error:") {
+		t.Errorf("expected raw_traceback to contain all frames, got:\n%s", rawTb)
+	}
+
+	if aggregated[1].Message != "Server listening on port 3000" {
+		t.Errorf("expected trailing single-line log to remain separate, got: %s", aggregated[1].Message)
+	}
+}
+
+func TestAggregateMultilineItems_Python3ChainedExceptions(t *testing.T) {
+	ts := time.Now().UTC()
+	rawItems := []LogItem{
+		{Stream: StreamStderr, Severity: SeverityError, Message: "Traceback (most recent call last):", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "  File \"/app/db.py\", line 19, in connect", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    conn = low_level_connect()", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "ConnectionRefusedError: [Errno 111] Connection refused", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "During handling of the above exception, another exception occurred:", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "Traceback (most recent call last):", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "  File \"/app/service.py\", line 55, in get_user", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "    db.connect()", Timestamp: &ts},
+		{Stream: StreamStderr, Severity: SeverityError, Message: "RuntimeError: Database unavailable while fetching user", Timestamp: &ts},
+		{Stream: StreamStdout, Severity: SeverityInfo, Message: "Health check completed", Timestamp: &ts},
+	}
+
+	aggregated := AggregateMultilineItems(rawItems)
+	if len(aggregated) != 2 {
+		t.Fatalf("expected 2 items after Python 3 chained exception aggregation, got %d", len(aggregated))
+	}
+
+	chained := aggregated[0]
+	if chained.Severity != SeverityError {
+		t.Errorf("expected Severity ERROR, got %s", chained.Severity)
+	}
+	if chained.Message != "RuntimeError: Database unavailable while fetching user" {
+		t.Errorf("expected final exception line as summary Message, got: %s", chained.Message)
+	}
+	rawTb, _ := chained.StructuredData["raw_traceback"].(string)
+	if !strings.Contains(rawTb, "ConnectionRefusedError:") ||
+		!strings.Contains(rawTb, "During handling of the above exception, another exception occurred:") ||
+		!strings.Contains(rawTb, "RuntimeError: Database unavailable while fetching user") {
+		t.Errorf("expected complete chained traceback in raw_traceback, got:\n%s", rawTb)
+	}
+}
+
+type mockRuntimeWithSince struct {
+	mockRuntime
+	lastSince map[string]string
+}
+
+func (m *mockRuntimeWithSince) GetContainerLogsSince(ctx context.Context, containerID string, since string) (io.ReadCloser, error) {
+	if m.lastSince == nil {
+		m.lastSince = make(map[string]string)
+	}
+	m.lastSince[containerID] = since
+	return m.GetContainerLogs(ctx, containerID)
+}
+
+func TestHarvestContainer_UsesGetContainerLogsSinceWhenCursorExists(t *testing.T) {
+	t1 := "2026-10-22T10:00:00.123456789Z"
+	t2 := "2026-10-22T10:00:05.000000000Z"
+
+	mockRT := &mockRuntimeWithSince{
+		mockRuntime: mockRuntime{
+			logOutput: map[string][]byte{
+				"cnt-since-1": makeDockerFrame(1, t1+" First line\n"),
+			},
+		},
+	}
+
+	h := NewHarvester(mockRT, "http://localhost:59999", 50, 1*time.Second, nil)
+
+	// Pass 1: No prior cursor -> falls back to GetContainerLogs (lastSince not set)
+	if err := h.HarvestContainerWithMetadata(context.Background(), "cnt-since-1", "app-1", "dep-1", ResourceTypeApplication); err != nil {
+		t.Fatalf("pass 1 error: %v", err)
+	}
+	if sinceVal := mockRT.lastSince["cnt-since-1"]; sinceVal != "" {
+		t.Errorf("expected empty since on initial harvest without cursor, got %q", sinceVal)
+	}
+
+	// Pass 2: Cursor exists from pass 1 -> calls GetContainerLogsSince with t1
+	mockRT.logOutput["cnt-since-1"] = makeDockerFrame(1, t2+" Second line\n")
+	if err := h.HarvestContainerWithMetadata(context.Background(), "cnt-since-1", "app-1", "dep-1", ResourceTypeApplication); err != nil {
+		t.Fatalf("pass 2 error: %v", err)
+	}
+	if sinceVal := mockRT.lastSince["cnt-since-1"]; sinceVal != t1 {
+		t.Errorf("expected GetContainerLogsSince called with %q, got %q", t1, sinceVal)
+	}
+}
+
+
 
 
 

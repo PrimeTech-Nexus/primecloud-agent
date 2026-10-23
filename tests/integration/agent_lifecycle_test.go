@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	pb "github.com/primecloud/primecloud-agent/internal/protocol"
 	"github.com/primecloud/primecloud-agent/internal/reconciliation"
 	"github.com/primecloud/primecloud-agent/internal/recovery"
+	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/state"
 	"github.com/primecloud/primecloud-agent/internal/telemetry"
 	"github.com/primecloud/primecloud-agent/internal/transport"
@@ -31,6 +33,40 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/vault"
 	"github.com/primecloud/primecloud-agent/tests/testenv"
 )
+
+type mockIntegrationRuntime struct{}
+
+func (m *mockIntegrationRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *mockIntegrationRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
+	return nil
+}
+func (m *mockIntegrationRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
+	return "mock-cid", nil
+}
+func (m *mockIntegrationRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *mockIntegrationRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+	return nil
+}
+func (m *mockIntegrationRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	return nil
+}
+func (m *mockIntegrationRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+	return &runtime.ContainerInspect{ID: id, Running: true, Health: "healthy"}, nil
+}
+func (m *mockIntegrationRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockIntegrationRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+func (m *mockIntegrationRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	return []byte("PGDMP\x01\x02\x00\x00-- Integration PostgreSQL Dump\nCREATE TABLE items (id int);\n"), nil, 0, nil
+}
+func (m *mockIntegrationRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockIntegrationRuntime) Ping(ctx context.Context) error { return nil }
+func (m *mockIntegrationRuntime) Close() error                   { return nil }
 
 type fullLifecycleControlPlaneServer struct {
 	pb.UnimplementedAgentServiceServer
@@ -335,7 +371,8 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	// Step 12: Backup & Restore
 	// =========================================================================
 	t.Log("STEP 12/13: Backup & Restore — Generating dump, Vault-managed key encryption, and verifying recovery")
-	pgBackup, err := postgres.BackupPostgres(ctx, nil, "pg-lifecycle-db", backupDir)
+	mockRT := &mockIntegrationRuntime{}
+	pgBackup, err := postgres.BackupPostgres(ctx, mockRT, "pg-lifecycle-db", backupDir)
 	if err != nil || pgBackup.SizeBytes == 0 {
 		t.Fatalf("PostgreSQL backup failed: %v", err)
 	}
@@ -352,7 +389,7 @@ func TestPhase03_FullAgentLifecycle(t *testing.T) {
 	}
 
 	manifestPath := filepath.Join(tempDir, "encrypted-backups", "bk-lifecycle-pg.manifest.json")
-	reconstructor := recovery.NewReconstructor(nil, logger)
+	reconstructor := recovery.NewReconstructor(mockRT, logger)
 	restoredPath, restoredManifest, err := reconstructor.ReconstructArtifact(ctx, encPath, manifestPath, encKey, filepath.Join(tempDir, "restored-data"))
 	if err != nil {
 		t.Fatalf("ReconstructArtifact failed: %v", err)

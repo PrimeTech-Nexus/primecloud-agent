@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 	"github.com/primecloud/primecloud-agent/internal/valkey"
 	"github.com/primecloud/primecloud-agent/tests/testenv"
@@ -15,6 +16,13 @@ import (
 
 func TestValkey_ProvisioningAndVaultCredentials(t *testing.T) {
 	vClient, _ := testenv.EnsureVaultDev(t)
+	if vClient != nil {
+		_ = vClient.RawClient().Sys().UnmountWithContext(context.Background(), "primecloud")
+		_ = vClient.RawClient().Sys().MountWithContext(context.Background(), "primecloud", &vaultapi.MountInput{
+			Type:    "kv",
+			Options: map[string]string{"version": "1"},
+		})
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -201,5 +209,135 @@ func TestValkey_ContainerConfig_NoPort8000Inherited(t *testing.T) {
 	}
 	if len(bindings) != 0 {
 		t.Errorf("Managed valkey container must NOT have host port bindings when hostPort is empty, got %v", bindings)
+	}
+}
+
+// mockValkeyBackupRuntime implements runtime.ContainerRuntime for Valkey backup tests.
+type mockValkeyBackupRuntime struct {
+	inspectFunc func(ctx context.Context, id string) (*runtime.ContainerInspect, error)
+	execFunc    func(ctx context.Context, id string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error)
+}
+
+func (m *mockValkeyBackupRuntime) PullImage(ctx context.Context, ref string) error { return nil }
+func (m *mockValkeyBackupRuntime) PullImageWithAuth(ctx context.Context, ref, auth string) error {
+	return nil
+}
+func (m *mockValkeyBackupRuntime) CreateContainer(ctx context.Context, cfg *runtime.ContainerConfig, l *runtime.ResourceLimits, p *runtime.HardenedIsolationProfile) (string, error) {
+	return "mock-cid", nil
+}
+func (m *mockValkeyBackupRuntime) StartContainer(ctx context.Context, id string) error { return nil }
+func (m *mockValkeyBackupRuntime) StopContainer(ctx context.Context, id string, timeout *int) error {
+	return nil
+}
+func (m *mockValkeyBackupRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	return nil
+}
+func (m *mockValkeyBackupRuntime) InspectContainer(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+	if m.inspectFunc != nil {
+		return m.inspectFunc(ctx, id)
+	}
+	return &runtime.ContainerInspect{ID: id, Running: true, Health: "healthy"}, nil
+}
+func (m *mockValkeyBackupRuntime) GetContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockValkeyBackupRuntime) ListContainers(ctx context.Context, all bool) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+func (m *mockValkeyBackupRuntime) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+	if m.execFunc != nil {
+		return m.execFunc(ctx, containerID, cmd, env, stdin)
+	}
+	return nil, nil, 0, nil
+}
+func (m *mockValkeyBackupRuntime) GetContainerStats(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockValkeyBackupRuntime) Ping(ctx context.Context) error { return nil }
+func (m *mockValkeyBackupRuntime) Close() error                   { return nil }
+
+func TestValkeyBackup_BGSAVEPersistenceAndStreaming(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	baseResDir := filepath.Join(tempDir, "resources")
+	backupDir := filepath.Join(tempDir, "backups")
+	resID := "res-vk-stream-1"
+
+	// Prepare RDB file in volume directory
+	volDir := filepath.Join(baseResDir, "valkey", resID)
+	_ = os.MkdirAll(volDir, 0700)
+	rdbPath := filepath.Join(volDir, "dump.rdb")
+	genuineRDB := []byte("REDIS0009\xfa\x09redis-ver\x057.2.0\xff\x00\x00\x00\x00\x00\x00\x00\x00")
+	if err := os.WriteFile(rdbPath, genuineRDB, 0600); err != nil {
+		t.Fatalf("Failed writing dump.rdb: %v", err)
+	}
+
+	bgsaveCalled := false
+	infoPersistenceCalled := false
+
+	mockRT := &mockValkeyBackupRuntime{
+		execFunc: func(ctx context.Context, id string, cmd []string, env []string, stdin io.Reader) ([]byte, []byte, int, error) {
+			if len(cmd) > 0 && cmd[len(cmd)-1] == "BGSAVE" {
+				bgsaveCalled = true
+				return []byte("Background saving started\n"), nil, 0, nil
+			}
+			if len(cmd) >= 2 && cmd[len(cmd)-2] == "INFO" && cmd[len(cmd)-1] == "persistence" {
+				infoPersistenceCalled = true
+				return []byte("rdb_bgsave_in_progress:0\r\nrdb_last_bgsave_status:ok\r\n"), nil, 0, nil
+			}
+			return nil, nil, 0, nil
+		},
+	}
+
+	res, err := valkey.BackupValkeyWithVault(ctx, mockRT, nil, baseResDir, "default", resID, backupDir)
+	if err != nil {
+		t.Fatalf("BackupValkeyWithVault failed: %v", err)
+	}
+
+	if !bgsaveCalled {
+		t.Error("Expected BGSAVE command to be executed")
+	}
+	if !infoPersistenceCalled {
+		t.Error("Expected INFO persistence polling to be executed")
+	}
+
+	// Verify artifact content
+	artifactData, err := os.ReadFile(res.ArtifactPath)
+	if err != nil {
+		t.Fatalf("Failed reading artifact: %v", err)
+	}
+	if string(artifactData) != string(genuineRDB) {
+		t.Errorf("Artifact content mismatch: got %v, want %v", artifactData, genuineRDB)
+	}
+}
+
+func TestValkeyBackup_FailClosedScenarios(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	baseResDir := filepath.Join(tempDir, "resources")
+	backupDir := filepath.Join(tempDir, "backups")
+
+	// 1. Missing volume snapshot fails closed
+	if _, err := valkey.BackupValkeyWithVault(ctx, nil, nil, baseResDir, "default", "res-missing-rdb", backupDir); err == nil {
+		t.Error("Expected error when no RDB is found")
+	}
+
+	// 2. Invalid REDIS header fails closed
+	resBad := "res-bad-header"
+	volBad := filepath.Join(baseResDir, "valkey", resBad)
+	_ = os.MkdirAll(volBad, 0700)
+	_ = os.WriteFile(filepath.Join(volBad, "dump.rdb"), []byte("NOT_REDIS_INVALID_MAGIC"), 0600)
+	if _, err := valkey.BackupValkeyWithVault(ctx, nil, nil, baseResDir, "default", resBad, backupDir); err == nil {
+		t.Error("Expected error when RDB header is invalid")
+	}
+
+	// 3. Container stopped fails closed
+	stoppedRT := &mockValkeyBackupRuntime{
+		inspectFunc: func(ctx context.Context, id string) (*runtime.ContainerInspect, error) {
+			return &runtime.ContainerInspect{ID: id, Running: false}, nil
+		},
+	}
+	if _, err := valkey.BackupValkeyWithVault(ctx, stoppedRT, nil, baseResDir, "default", "res-stopped", backupDir); err == nil {
+		t.Error("Expected error when container is stopped")
 	}
 }

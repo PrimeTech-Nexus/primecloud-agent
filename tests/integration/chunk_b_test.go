@@ -168,7 +168,8 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 		t.Fatalf("Postgres credentials missing in Vault: %v", err)
 	}
 
-	pgBackup, err := postgres.BackupPostgres(ctx, nil, "pg-test-res", backupDir)
+	mockRT := &mockIntegrationRuntime{}
+	pgBackup, err := postgres.BackupPostgres(ctx, mockRT, "pg-test-res", backupDir)
 	if err != nil || pgBackup.SizeBytes == 0 {
 		t.Fatalf("Postgres backup failed: %v", err)
 	}
@@ -270,7 +271,7 @@ func TestChunkB_FullPipelineIntegration(t *testing.T) {
 	}
 
 	manifestFile := filepath.Join(tempDir, "pkg-backups", "bk-chunk-b-1.manifest.json")
-	reconstructor := recovery.NewReconstructor(nil, nil)
+	reconstructor := recovery.NewReconstructor(mockRT, nil)
 	restoredPath, restoredManifest, err := reconstructor.ReconstructArtifact(ctx, encFile, manifestFile, encKey, filepath.Join(tempDir, "pkg-restores"))
 	if err != nil {
 		t.Fatalf("ReconstructArtifact failed: %v", err)

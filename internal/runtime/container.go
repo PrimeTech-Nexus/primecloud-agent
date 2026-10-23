@@ -15,6 +15,10 @@ const (
 	WorkloadTypeManagedPostgres WorkloadType = "MANAGED_POSTGRES"
 	// WorkloadTypeManagedValkey is a managed Valkey key-value cache/store container.
 	WorkloadTypeManagedValkey WorkloadType = "MANAGED_VALKEY"
+	// WorkloadTypeManagedMySQL is a managed MySQL database container.
+	WorkloadTypeManagedMySQL WorkloadType = "MANAGED_MYSQL"
+	// WorkloadTypeManagedMongoDB is a managed MongoDB database container.
+	WorkloadTypeManagedMongoDB WorkloadType = "MANAGED_MONGODB"
 )
 
 // ContainerConfig defines specifications for creating and running a workload container.

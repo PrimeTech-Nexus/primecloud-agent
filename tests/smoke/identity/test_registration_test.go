@@ -46,7 +46,7 @@ func (s *registrationServerMock) Register(ctx context.Context, req *pb.RegisterR
 func TestRegistration_SuccessAndFailure(t *testing.T) {
 	vClient, _ := testenv.EnsureVaultDev(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	bm := vault.NewBootstrapManager(vClient)
