@@ -346,4 +346,3 @@ func TestAgent_DeleteBackup_RealDiskCleanup(t *testing.T) {
 		t.Errorf("Expected FAILED status for empty backup_id, got %v", respEmpty)
 	}
 }
-

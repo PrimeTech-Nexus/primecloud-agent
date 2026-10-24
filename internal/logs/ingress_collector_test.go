@@ -457,6 +457,3 @@ func TestParseCaddyAccessLogLine_AuthHeaderAndExpandedQueryRedaction(t *testing.
 		t.Errorf("expected User-Agent header to be preserved, got %v", headers["User-Agent"])
 	}
 }
-
-
-

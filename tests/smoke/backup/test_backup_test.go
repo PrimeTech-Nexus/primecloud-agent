@@ -410,5 +410,3 @@ func TestBackup_VaultKey_FailClosed_UnreachableVault(t *testing.T) {
 		t.Errorf("Expected error message to contain 'vault service is unavailable', got %v", err)
 	}
 }
-
-

@@ -1023,8 +1023,3 @@ func TestHarvestContainer_UsesGetContainerLogsSinceWhenCursorExists(t *testing.T
 		t.Errorf("expected GetContainerLogsSince called with %q, got %q", t1, sinceVal)
 	}
 }
-
-
-
-
-

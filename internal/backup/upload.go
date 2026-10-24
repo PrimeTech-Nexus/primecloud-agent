@@ -405,7 +405,6 @@ func UploadToURL(ctx context.Context, uploadURL, artifactPath string) error {
 	return NewUploader(nil).UploadToURL(ctx, uploadURL, artifactPath)
 }
 
-
 // DownloadFromURL streams the remote artifact from downloadURL to targetFilePath using bounded memory.
 func (u *Uploader) DownloadFromURL(ctx context.Context, downloadURL, targetFilePath string) error {
 	if downloadURL == "" {

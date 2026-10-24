@@ -167,8 +167,6 @@ func BackupPostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, v
 		return nil, fmt.Errorf("pg_dump produced empty output: %s", strings.TrimSpace(stderrBuf.String()))
 	}
 
-
-
 	return &BackupResult{
 		BackupID:     backupID,
 		ResourceID:   resourceID,

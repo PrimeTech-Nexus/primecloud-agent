@@ -690,7 +690,6 @@ func TestManager_RouteRemovalAndCleanup(t *testing.T) {
 	}
 }
 
-
 func TestGenerateSnippet_FormatFilterAndCredentialScrubbing(t *testing.T) {
 	route := &RouteConfig{
 		Domain:   "secure-api.primecloud.cloud",

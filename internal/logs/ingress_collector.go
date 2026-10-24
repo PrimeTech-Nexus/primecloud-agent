@@ -411,4 +411,3 @@ func (t *CaddyLogTailer) DrainNewLogs() ([]LogItem, error) {
 
 	return items, nil
 }
-

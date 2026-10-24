@@ -95,8 +95,6 @@ func (r *Reconstructor) ReconstructArtifact(ctx context.Context, encryptedPath, 
 		return "", nil, fmt.Errorf("failed to decrypt backup artifact: %w", errDecrypt)
 	}
 
-
-
 	// Immediate post-decryption plaintext integrity verification
 	if manifest != nil && manifest.ChecksumSHA256 != "" {
 		actualHash, _, hashErr := backup.ComputeSHA256(restoredPath)

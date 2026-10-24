@@ -91,12 +91,12 @@ type Collector struct {
 	failedCount     int
 
 	// Host OS telemetry state & injectable readers for deterministic testing across OS targets
-	goos            string
-	prevCPUTotal    uint64
-	prevCPUIdle     uint64
-	hasPrevCPU      bool
-	readFileFunc    func(path string) ([]byte, error)
-	runCommandFunc  func(ctx context.Context, name string, args ...string) ([]byte, error)
+	goos           string
+	prevCPUTotal   uint64
+	prevCPUIdle    uint64
+	hasPrevCPU     bool
+	readFileFunc   func(path string) ([]byte, error)
+	runCommandFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 // NewCollector constructs a Collector instance.

@@ -462,4 +462,3 @@ func TestPostgresRestore_FailClosedScenarios(t *testing.T) {
 		t.Errorf("Expected RestoreDatabase alias to succeed, got %v", err)
 	}
 }
-
