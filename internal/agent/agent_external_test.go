@@ -447,3 +447,99 @@ func TestPostgresExternalAccess_NestedPayloadJsonDecodesPort30001(t *testing.T) 
 		t.Fatalf("expected HAProxy cfg file to contain 'bind *:30001', got:\n%s", string(data))
 	}
 }
+
+func TestMySQLExternalAccess_RoutesPort3306(t *testing.T) {
+	tempConfDir := t.TempDir()
+	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
+
+	mockRT := &recordingMockRuntime{}
+	cfg := DefaultConfig()
+	cfg.VaultAddr = ""
+	cfg.ResourceDir = t.TempDir()
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
+	if err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"mysql_id":      "my-test-1234",
+		"external_port": 33006,
+		"engine":        "mysql",
+	})
+
+	op := &pb.OperationEnvelope{
+		OperationId:   "op-mysql-ext-1",
+		OperationType: "enable_external_access",
+		ResourceId:    "my-test-1234",
+		PayloadJson:   string(payloadJSON),
+	}
+
+	res, err := agent.dispatcher.Dispatch(context.Background(), op)
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Fatalf("expected SUCCEEDED, got %s: %s", res.Status, res.Message)
+	}
+
+	cfgFile := filepath.Join(tempConfDir, "tcp_my-test-1234.cfg")
+	data, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("expected HAProxy cfg file to exist: %v", err)
+	}
+	cfgStr := string(data)
+	if !strings.Contains(cfgStr, "bind *:33006") {
+		t.Errorf("expected 'bind *:33006', got: %s", cfgStr)
+	}
+	if !strings.Contains(cfgStr, ":3306 check") {
+		t.Errorf("expected target port ':3306 check', got: %s", cfgStr)
+	}
+}
+
+func TestMongoDBExternalAccess_RoutesPort27017(t *testing.T) {
+	tempConfDir := t.TempDir()
+	t.Setenv("PRIMECLOUD_HAPROXY_CONFIG_DIR", tempConfDir)
+
+	mockRT := &recordingMockRuntime{}
+	cfg := DefaultConfig()
+	cfg.VaultAddr = ""
+	cfg.ResourceDir = t.TempDir()
+	agent, err := NewAgentWithRuntime(cfg, mockRT, nil)
+	if err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"mongodb_id":    "mg-test-5678",
+		"external_port": 37017,
+		"engine":        "mongodb",
+	})
+
+	op := &pb.OperationEnvelope{
+		OperationId:   "op-mongo-ext-1",
+		OperationType: "enable_external_access",
+		ResourceId:    "mg-test-5678",
+		PayloadJson:   string(payloadJSON),
+	}
+
+	res, err := agent.dispatcher.Dispatch(context.Background(), op)
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Fatalf("expected SUCCEEDED, got %s: %s", res.Status, res.Message)
+	}
+
+	cfgFile := filepath.Join(tempConfDir, "tcp_mg-test-5678.cfg")
+	data, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("expected HAProxy cfg file to exist: %v", err)
+	}
+	cfgStr := string(data)
+	if !strings.Contains(cfgStr, "bind *:37017") {
+		t.Errorf("expected 'bind *:37017', got: %s", cfgStr)
+	}
+	if !strings.Contains(cfgStr, ":27017 check") {
+		t.Errorf("expected target port ':27017 check', got: %s", cfgStr)
+	}
+}

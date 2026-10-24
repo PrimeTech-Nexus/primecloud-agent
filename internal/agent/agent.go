@@ -2266,7 +2266,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		payloadMap := parsePayloadMap(op.PayloadJson)
 		resID := op.ResourceId
 		if resID == "" {
-			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id")
+			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id", "mysql_id", "mongodb_id")
 		}
 
 		extPort := extractExternalPort(payloadMap)
@@ -2280,14 +2280,42 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}, fmt.Errorf("invalid external port %d", extPort)
 		}
 
-		isPostgres := !strings.Contains(strings.ToLower(op.OperationType), "valkey") &&
-			!strings.Contains(strings.ToLower(op.OperationType), "keyvalue") &&
-			!strings.Contains(strings.ToLower(resID), "vk")
-
-		targetPort := 6379
-		if isPostgres {
-			targetPort = 5432
+		engine := ""
+		if eng, ok := payloadMap["engine"].(string); ok {
+			engine = strings.ToLower(eng)
 		}
+		opType := strings.ToLower(op.OperationType)
+		resLower := strings.ToLower(resID)
+
+		targetPort := 5432
+		var containerCandidates []string
+
+		if engine == "mysql" || strings.Contains(opType, "mysql") || strings.Contains(resLower, "mysql") || strings.HasPrefix(resLower, "my-") || strings.HasPrefix(resLower, "pc-my-") {
+			targetPort = 3306
+			containerCandidates = []string{
+				fmt.Sprintf("pc-my-%s", resID),
+				resID,
+			}
+		} else if engine == "mongodb" || engine == "mongo" || strings.Contains(opType, "mongodb") || strings.Contains(opType, "mongo") || strings.Contains(resLower, "mongodb") || strings.Contains(resLower, "mongo") || strings.HasPrefix(resLower, "mg-") || strings.HasPrefix(resLower, "pc-mg-") {
+			targetPort = 27017
+			containerCandidates = []string{
+				fmt.Sprintf("pc-mg-%s", resID),
+				resID,
+			}
+		} else if engine == "valkey" || engine == "redis" || strings.Contains(opType, "valkey") || strings.Contains(opType, "keyvalue") || strings.Contains(resLower, "vk") {
+			targetPort = 6379
+			containerCandidates = []string{
+				fmt.Sprintf("pc-vk-%s", resID),
+				resID,
+			}
+		} else {
+			targetPort = 5432
+			containerCandidates = []string{
+				fmt.Sprintf("pc-pg-%s", resID),
+				resID,
+			}
+		}
+
 		if tp, ok := payloadMap["target_port"].(float64); ok && int(tp) > 0 {
 			targetPort = int(tp)
 		} else if tp, ok := payloadMap["target_port"].(int); ok && tp > 0 {
@@ -2301,19 +2329,6 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}
 
 		if containerIP == "" && rt != nil {
-			var containerCandidates []string
-			if isPostgres {
-				containerCandidates = []string{
-					fmt.Sprintf("pc-pg-%s", resID),
-					resID,
-				}
-			} else {
-				containerCandidates = []string{
-					fmt.Sprintf("pc-vk-%s", resID),
-					resID,
-				}
-			}
-
 			for _, cName := range containerCandidates {
 				if insp, err := rt.InspectContainer(ctx, cName); err == nil && insp != nil {
 					if insp.IPAddress != "" {
@@ -2365,7 +2380,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	registry.Register("disable_external_access", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		resID := op.ResourceId
 		if resID == "" {
-			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id")
+			resID = extractResourceID(op, "postgres_id", "keyvalue_id", "valkey_id", "mysql_id", "mongodb_id")
 		}
 
 		if err := haproxyMgr.RemoveTCPRoute(ctx, resID); err != nil {
