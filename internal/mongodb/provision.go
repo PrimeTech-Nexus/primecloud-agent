@@ -318,7 +318,8 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 	return result, nil
 }
 
-// bootstrapReplicaSetAndTenantUser idempotently initializes single-node replica set rs0 and creates the scoped tenant user.
+// bootstrapReplicaSetAndTenantUser idempotently initializes single-node replica set rs0,
+// waits for the node to elect itself writable primary, and creates the scoped tenant user.
 func (p *Provisioner) bootstrapReplicaSetAndTenantUser(ctx context.Context, containerID string, creds *Credentials) error {
 	js := fmt.Sprintf(`
 try {
@@ -326,6 +327,23 @@ try {
 } catch (e) {
     rs.initiate({ _id: %q, members: [{ _id: 0, host: "127.0.0.1:27017" }] });
 }
+
+// Wait for this replica set node to elect itself writable primary before creating users
+var isPrimary = false;
+for (var i = 0; i < 30; i++) {
+    try {
+        var h = db.hello();
+        if (h && (h.isWritablePrimary || h.ismaster)) {
+            isPrimary = true;
+            break;
+        }
+    } catch (err) {}
+    sleep(1000);
+}
+if (!isPrimary) {
+    throw new Error("timed out waiting for mongodb replica set to elect primary");
+}
+
 var dbRef = db.getSiblingDB(%q);
 var existing = dbRef.getUser(%q);
 if (!existing) {
