@@ -20,8 +20,10 @@ import (
 
 // Reconstructor orchestrates decryption and restoration of backup artifacts.
 type Reconstructor struct {
-	rt     agentruntime.ContainerRuntime
-	logger *slog.Logger
+	rt                  agentruntime.ContainerRuntime
+	logger              *slog.Logger
+	targetContainerName string
+	targetMode          string
 }
 
 // NewReconstructor constructs a Reconstructor.
@@ -33,6 +35,60 @@ func NewReconstructor(rt agentruntime.ContainerRuntime, logger *slog.Logger) *Re
 		rt:     rt,
 		logger: logger.With("component", "reconstructor"),
 	}
+}
+
+// WithTarget configures the Reconstructor with target container name and target mode.
+func (r *Reconstructor) WithTarget(targetContainerName, targetMode string) *Reconstructor {
+	r.targetContainerName = targetContainerName
+	r.targetMode = targetMode
+	return r
+}
+
+// RestoreSafetyConfig holds safety parameters for restore dispatching.
+type RestoreSafetyConfig struct {
+	TargetMode       string
+	TargetContainer  string
+	ConfirmOverwrite bool
+	ResourceID       string
+}
+
+// ValidateRestoreSafety validates security constraints for disaster recovery restores (AC-1.1, AC-1.3, AC-1.9, AC-1.14).
+func ValidateRestoreSafety(cfg RestoreSafetyConfig) error {
+	mode := strings.ToUpper(strings.TrimSpace(cfg.TargetMode))
+	if mode == "" {
+		mode = "NEW_INSTANCE"
+	}
+
+	if mode == "IN_PLACE_OVERWRITE" {
+		if !cfg.ConfirmOverwrite {
+			return fmt.Errorf("OVERWRITE_CONFIRMATION_REQUIRED: in-place overwrite restore rejected without explicit confirm_overwrite=true")
+		}
+		return nil
+	}
+
+	if mode == "NEW_INSTANCE" {
+		targetName := strings.TrimSpace(cfg.TargetContainer)
+		if targetName == "" {
+			return fmt.Errorf("TARGET_CONTAINER_REQUIRED: new instance restore requires non-empty target_container_name")
+		}
+
+		resID := strings.TrimSpace(cfg.ResourceID)
+		sourceContainers := []string{
+			resID,
+			fmt.Sprintf("pc-pg-%s", resID),
+			fmt.Sprintf("pc-my-%s", resID),
+			fmt.Sprintf("pc-mg-%s", resID),
+			fmt.Sprintf("pc-vk-%s", resID),
+		}
+		for _, sc := range sourceContainers {
+			if targetName == sc {
+				return fmt.Errorf("TARGET_CONTAINER_INVALID: cannot substitute source container %s as target in NEW_INSTANCE mode", targetName)
+			}
+		}
+		return nil
+	}
+
+	return fmt.Errorf("TARGET_MODE_INVALID: unknown target restore mode: %q", mode)
 }
 
 // ReconstructArtifact decrypts the encrypted backup file via streaming DecryptStream and verifies its checksum against the manifest.
@@ -113,18 +169,22 @@ func (r *Reconstructor) ReconstructArtifact(ctx context.Context, encryptedPath, 
 }
 
 // RestoreToWorkload applies the reconstructed artifact to the corresponding database/service.
-func (r *Reconstructor) RestoreToWorkload(ctx context.Context, manifest *backup.Manifest, artifactPath string) error {
-	r.logger.Info("restoring_to_workload", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
+func (r *Reconstructor) RestoreToWorkload(ctx context.Context, manifest *backup.Manifest, artifactPath string, targetOpts ...string) error {
+	targetContainerName := r.targetContainerName
+	if len(targetOpts) > 0 && targetOpts[0] != "" {
+		targetContainerName = targetOpts[0]
+	}
+	r.logger.Info("restoring_to_workload", "resource_id", manifest.ResourceID, "type", manifest.ResourceType, "target_container", targetContainerName)
 
 	switch manifest.ResourceType {
 	case "postgres", "postgresql", "postgres_instance", "database", "db":
-		return postgres.RestorePostgres(ctx, r.rt, manifest.ResourceID, artifactPath)
+		return postgres.RestorePostgres(ctx, r.rt, manifest.ResourceID, artifactPath, targetContainerName)
 	case "valkey", "keyvalue", "redis", "cache":
-		return valkey.RestoreValkey(ctx, r.rt, manifest.ResourceID, artifactPath)
+		return valkey.RestoreValkey(ctx, r.rt, manifest.ResourceID, artifactPath, targetContainerName)
 	case "mysql", "mysql_instance":
-		return mysql.RestoreMySQL(ctx, r.rt, manifest.ResourceID, artifactPath)
+		return mysql.RestoreMySQL(ctx, r.rt, manifest.ResourceID, artifactPath, targetContainerName)
 	case "mongodb", "mongo", "mongodb_instance":
-		return mongodb.RestoreMongoDB(ctx, r.rt, manifest.ResourceID, artifactPath)
+		return mongodb.RestoreMongoDB(ctx, r.rt, manifest.ResourceID, artifactPath, targetContainerName)
 	default:
 		r.logger.Error("unsupported_resource_type_restore_failed", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
 		return &UnsupportedResourceTypeError{
@@ -135,18 +195,26 @@ func (r *Reconstructor) RestoreToWorkload(ctx context.Context, manifest *backup.
 }
 
 // RestoreToWorkloadWithVault applies the reconstructed artifact to the database/service using Vault credentials and configuration.
-func (r *Reconstructor) RestoreToWorkloadWithVault(ctx context.Context, manifest *backup.Manifest, artifactPath string, vClient *vault.Client, baseResDir, projectID string) error {
-	r.logger.Info("restoring_to_workload", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
+func (r *Reconstructor) RestoreToWorkloadWithVault(ctx context.Context, manifest *backup.Manifest, artifactPath string, vClient *vault.Client, baseResDir, projectID string, targetOpts ...string) error {
+	targetContainerName := r.targetContainerName
+	targetMode := r.targetMode
+	if len(targetOpts) > 0 && targetOpts[0] != "" {
+		targetContainerName = targetOpts[0]
+	}
+	if len(targetOpts) > 1 && targetOpts[1] != "" {
+		targetMode = targetOpts[1]
+	}
+	r.logger.Info("restoring_to_workload", "resource_id", manifest.ResourceID, "type", manifest.ResourceType, "target_container", targetContainerName, "target_mode", targetMode)
 
 	switch manifest.ResourceType {
 	case "postgres", "postgresql", "postgres_instance", "database", "db":
-		return postgres.RestorePostgresWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
+		return postgres.RestorePostgresWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath, targetContainerName)
 	case "valkey", "keyvalue", "redis", "cache":
-		return valkey.RestoreValkeyWithVault(ctx, r.rt, vClient, baseResDir, projectID, manifest.ResourceID, artifactPath)
+		return valkey.RestoreValkeyWithVault(ctx, r.rt, vClient, baseResDir, projectID, manifest.ResourceID, artifactPath, targetContainerName)
 	case "mysql", "mysql_instance":
-		return mysql.RestoreMySQLWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
+		return mysql.RestoreMySQLWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath, targetContainerName)
 	case "mongodb", "mongo", "mongodb_instance":
-		return mongodb.RestoreMongoDBWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath)
+		return mongodb.RestoreMongoDBWithVault(ctx, r.rt, vClient, projectID, manifest.ResourceID, artifactPath, targetContainerName)
 	default:
 		r.logger.Error("unsupported_resource_type_restore_failed", "resource_id", manifest.ResourceID, "type", manifest.ResourceType)
 		return &UnsupportedResourceTypeError{

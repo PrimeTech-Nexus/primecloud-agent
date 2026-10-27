@@ -1874,6 +1874,47 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			expectedChecksum = cs
 		}
 
+		targetMode := "NEW_INSTANCE"
+		if tm, ok := payload["target_mode"].(string); ok && tm != "" {
+			targetMode = strings.ToUpper(strings.TrimSpace(tm))
+		}
+
+		targetContainerName := ""
+		if tcn, ok := payload["target_container_name"].(string); ok && tcn != "" {
+			targetContainerName = strings.TrimSpace(tcn)
+		}
+
+		confirmOverwrite := false
+		if co, ok := payload["confirm_overwrite"].(bool); ok {
+			confirmOverwrite = co
+		} else if coStr, ok := payload["confirm_overwrite"].(string); ok && strings.EqualFold(strings.TrimSpace(coStr), "true") {
+			confirmOverwrite = true
+		}
+
+		// Security assertions: Fail closed on safety violations (AC-1.1, AC-1.3, AC-1.9, AC-1.14)
+		if sErr := recovery.ValidateRestoreSafety(recovery.RestoreSafetyConfig{
+			TargetMode:       targetMode,
+			TargetContainer:  targetContainerName,
+			ConfirmOverwrite: confirmOverwrite,
+			ResourceID:       resID,
+		}); sErr != nil {
+			errCode := "RESTORE_SAFETY_VIOLATION"
+			if strings.Contains(sErr.Error(), "OVERWRITE_CONFIRMATION_REQUIRED") {
+				errCode = "OVERWRITE_CONFIRMATION_REQUIRED"
+			} else if strings.Contains(sErr.Error(), "TARGET_CONTAINER_REQUIRED") {
+				errCode = "TARGET_CONTAINER_REQUIRED"
+			} else if strings.Contains(sErr.Error(), "TARGET_CONTAINER_INVALID") {
+				errCode = "TARGET_CONTAINER_INVALID"
+			}
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       errCode,
+				Message:         sErr.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, sErr
+		}
+
 		// 1. Locate encrypted artifact and manifest
 		var encPath, manifestPath string
 		candidates := []string{
@@ -2002,7 +2043,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			manifest.ResourceType = resType
 		}
 
-		restoreErr := reconstructor.RestoreToWorkloadWithVault(ctx, manifest, restoredPath, vaultClient, cfg.ResourceDir, projectID)
+		restoreErr := reconstructor.RestoreToWorkloadWithVault(ctx, manifest, restoredPath, vaultClient, cfg.ResourceDir, projectID, targetContainerName, targetMode)
 
 		// Immediately clean up temporary plaintext restored artifact
 		_ = os.Remove(restoredPath)
@@ -2019,10 +2060,12 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}
 
 		resultMap := map[string]interface{}{
-			"status":      "SUCCEEDED",
-			"job_id":      jobID,
-			"resource_id": resID,
-			"restored_at": time.Now().UTC().Format(time.RFC3339),
+			"status":                "SUCCEEDED",
+			"job_id":                jobID,
+			"resource_id":           resID,
+			"target_mode":           targetMode,
+			"target_container_name": targetContainerName,
+			"restored_at":           time.Now().UTC().Format(time.RFC3339),
 		}
 		resJSON, _ := json.Marshal(resultMap)
 

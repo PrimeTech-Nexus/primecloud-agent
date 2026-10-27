@@ -15,12 +15,12 @@ import (
 )
 
 // RestoreValkey restores a Valkey instance state from a backup RDB artifact.
-func RestoreValkey(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string) error {
-	return RestoreValkeyWithVault(ctx, rt, nil, "", "default", resourceID, artifactPath)
+func RestoreValkey(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string, targetOpts ...string) error {
+	return RestoreValkeyWithVault(ctx, rt, nil, "", "default", resourceID, artifactPath, targetOpts...)
 }
 
 // RestoreValkeyWithVault restores a Valkey instance from an RDB artifact, cleanly replacing state and verifying recovery.
-func RestoreValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, baseResDir, projectID, resourceID, artifactPath string) error {
+func RestoreValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, baseResDir, projectID, resourceID, artifactPath string, targetOpts ...string) error {
 	if artifactPath == "" {
 		return fmt.Errorf("artifact path cannot be empty")
 	}
@@ -44,6 +44,9 @@ func RestoreValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vC
 	}
 
 	containerName := fmt.Sprintf("pc-vk-%s", resourceID)
+	if len(targetOpts) > 0 && targetOpts[0] != "" {
+		containerName = targetOpts[0]
+	}
 
 	// If runtime is available and container exists, execute live RDB restore
 	if rt != nil {

@@ -12,12 +12,12 @@ import (
 )
 
 // RestoreMySQL restores a MySQL database instance from a backup artifact.
-func RestoreMySQL(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string) error {
-	return RestoreMySQLWithVault(ctx, rt, nil, "default", resourceID, artifactPath)
+func RestoreMySQL(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string, targetOpts ...string) error {
+	return RestoreMySQLWithVault(ctx, rt, nil, "default", resourceID, artifactPath, targetOpts...)
 }
 
 // RestoreMySQLWithVault restores a MySQL instance from an artifact using mysql stdin streaming and verifies database health.
-func RestoreMySQLWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, projectID, resourceID, artifactPath string) error {
+func RestoreMySQLWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, projectID, resourceID, artifactPath string, targetOpts ...string) error {
 	if artifactPath == "" {
 		return fmt.Errorf("artifact path cannot be empty")
 	}
@@ -37,6 +37,9 @@ func RestoreMySQLWithVault(ctx context.Context, rt runtime.ContainerRuntime, vCl
 	}
 
 	containerName := fmt.Sprintf("pc-my-%s", resourceID)
+	if len(targetOpts) > 0 && targetOpts[0] != "" {
+		containerName = targetOpts[0]
+	}
 
 	inspect, err := rt.InspectContainer(ctx, containerName)
 	if err != nil || inspect == nil {
