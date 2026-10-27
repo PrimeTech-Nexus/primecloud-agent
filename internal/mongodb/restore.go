@@ -12,12 +12,13 @@ import (
 )
 
 // RestoreMongoDB restores a MongoDB database instance from a backup artifact.
-func RestoreMongoDB(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string) error {
-	return RestoreMongoDBWithVault(ctx, rt, nil, "default", resourceID, artifactPath)
+func RestoreMongoDB(ctx context.Context, rt runtime.ContainerRuntime, resourceID, artifactPath string, targetOpts ...string) error {
+	return RestoreMongoDBWithVault(ctx, rt, nil, "default", resourceID, artifactPath, targetOpts...)
 }
 
 // RestoreMongoDBWithVault restores a MongoDB instance from a compressed archive using mongorestore --archive --gzip --drop and verifies database health.
-func RestoreMongoDBWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, projectID, resourceID, artifactPath string) error {
+// Credentials are passed via environment variables to prevent leaking sensitive passwords in /proc command line flags (AC-1.15).
+func RestoreMongoDBWithVault(ctx context.Context, rt runtime.ContainerRuntime, vClient *vault.Client, projectID, resourceID, artifactPath string, targetOpts ...string) error {
 	if artifactPath == "" {
 		return fmt.Errorf("artifact path cannot be empty")
 	}
@@ -37,6 +38,9 @@ func RestoreMongoDBWithVault(ctx context.Context, rt runtime.ContainerRuntime, v
 	}
 
 	containerName := fmt.Sprintf("pc-mg-%s", resourceID)
+	if len(targetOpts) > 0 && targetOpts[0] != "" {
+		containerName = targetOpts[0]
+	}
 
 	inspect, err := rt.InspectContainer(ctx, containerName)
 	if err != nil || inspect == nil {
@@ -78,19 +82,19 @@ func RestoreMongoDBWithVault(ctx context.Context, rt runtime.ContainerRuntime, v
 	}
 	defer fileReader.Close()
 
-	cmd := []string{
-		"mongorestore",
-		"--host", "127.0.0.1",
-		"--port", "27017",
-		"--username", authUser,
-		"--password", authPass,
-		"--authenticationDatabase", authDB,
-		"--archive",
-		"--gzip",
-		"--drop",
+	// Pass credentials via environment to prevent exposure in /proc command line flags (AC-1.15)
+	env := []string{
+		fmt.Sprintf("MONGO_USER=%s", authUser),
+		fmt.Sprintf("MONGO_PASS=%s", authPass),
+		fmt.Sprintf("MONGO_AUTH_DB=%s", authDB),
 	}
 
-	_, stderr, exitCode, execErr := rt.ExecContainer(ctx, containerName, cmd, nil, fileReader)
+	cmd := []string{
+		"sh", "-c",
+		"mongorestore --host 127.0.0.1 --port 27017 --username \"$MONGO_USER\" --password \"$MONGO_PASS\" --authenticationDatabase \"$MONGO_AUTH_DB\" --archive --gzip --drop",
+	}
+
+	_, stderr, exitCode, execErr := rt.ExecContainer(ctx, containerName, cmd, env, fileReader)
 	if execErr != nil {
 		return fmt.Errorf("failed executing mongorestore on %s: %w (stderr: %s)", containerName, execErr, string(stderr))
 	}
@@ -98,16 +102,12 @@ func RestoreMongoDBWithVault(ctx context.Context, rt runtime.ContainerRuntime, v
 		return fmt.Errorf("mongorestore command exited with error code %d: %s", exitCode, strings.TrimSpace(string(stderr)))
 	}
 
-	// Post-restore verification query: confirm database is responding and queryable
+	// Post-restore verification query: confirm database is responding and queryable without exposing password in flags (AC-1.15)
 	verifyCmd := []string{
-		"mongosh",
-		"--quiet",
-		"-u", authUser,
-		"-p", authPass,
-		"--authenticationDatabase", authDB,
-		"--eval", "db.adminCommand({ ping: 1 }).ok",
+		"sh", "-c",
+		"mongosh --quiet -u \"$MONGO_USER\" -p \"$MONGO_PASS\" --authenticationDatabase \"$MONGO_AUTH_DB\" --eval \"db.adminCommand({ ping: 1 }).ok\"",
 	}
-	_, vStderr, vCode, vErr := rt.ExecContainer(ctx, containerName, verifyCmd, nil, nil)
+	_, vStderr, vCode, vErr := rt.ExecContainer(ctx, containerName, verifyCmd, env, nil)
 	if vErr != nil || vCode != 0 {
 		return fmt.Errorf("restore verification failed on %s (exit %d): %s", containerName, vCode, strings.TrimSpace(string(vStderr)))
 	}
