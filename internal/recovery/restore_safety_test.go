@@ -214,11 +214,11 @@ func TestRestoreSafety_InPlaceOverwrite_FailsClosedWithoutConfirmation(t *testin
 // 2. AC-1.1, AC-1.3, AC-1.5, AC-1.14: NEW_INSTANCE requires target_container_name and rejects source substitution
 func TestRestoreSafety_NewInstance_TargetValidation(t *testing.T) {
 	testCases := []struct {
-		name             string
-		targetMode       string
-		targetContainer  string
-		resourceID       string
-		wantErrContains  string
+		name            string
+		targetMode      string
+		targetContainer string
+		resourceID      string
+		wantErrContains string
 	}{
 		{
 			name:            "NewInstance_EmptyTarget_FailsClosed",

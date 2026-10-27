@@ -227,10 +227,10 @@ func TestChallenger_SandboxTargetIdentity_StrictInequalityAndFailClosed(t *testi
 	sourceResID := "source-prod-007"
 
 	adversarialCases := []struct {
-		name          string
-		cfg           recovery.RestoreSafetyConfig
-		expectErr     bool
-		errSubstr     string
+		name      string
+		cfg       recovery.RestoreSafetyConfig
+		expectErr bool
+		errSubstr string
 	}{
 		{
 			name: "Attempt source resource ID as target container in NEW_INSTANCE",
