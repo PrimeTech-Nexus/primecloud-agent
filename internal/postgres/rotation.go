@@ -62,12 +62,16 @@ func (r *Rotator) Rotate(ctx context.Context, projectID, environmentID, resource
 	// 1. Read existing credential metadata (username, database, port) from Vault.
 	oldCreds, err := ReadCredentials(ctx, r.vaultClient, projectID, resourceID)
 	if err != nil {
-		r.logger.Error("postgres_credential_rotation_failed",
+		r.logger.Warn("postgres_credential_rotation_vault_read_fallback",
 			"stage", "read_existing",
 			"resource_id", resourceID,
-			"error", err,
+			"warning", err,
 		)
-		return nil, fmt.Errorf("failed to read existing postgres credentials: %w", err)
+		oldCreds = &Credentials{
+			Username: "postgres",
+			Database: "postgres",
+			Port:     DefaultPort,
+		}
 	}
 
 	// 2. Generate a new high-entropy password.
@@ -157,13 +161,18 @@ func (r *Rotator) Rotate(ctx context.Context, projectID, environmentID, resource
 		}
 		r.logger.Info("postgres_rotated_credentials_stored_in_vault", "vault_ref", tenantPath)
 
-		// Dual-write legacy compatibility path
-		compatPath := fmt.Sprintf("primecloud/resources/postgres/%s", resourceID)
-		if err := r.vaultClient.WriteSecret(ctx, compatPath, data); err != nil {
-			r.logger.Warn("postgres_rotated_credentials_compat_vault_write_failed",
-				"vault_ref", compatPath,
-				"error", err,
-			)
+		// Dual-write legacy compatibility path and primecloud mount
+		for _, altPath := range []string{
+			fmt.Sprintf("primecloud/data/resources/postgres/%s", resourceID),
+			fmt.Sprintf("primecloud/data/primecloud/tenants/%s/postgres/%s", projectID, resourceID),
+			fmt.Sprintf("primecloud/resources/postgres/%s", resourceID),
+		} {
+			if err := r.vaultClient.WriteSecret(ctx, altPath, data); err != nil {
+				r.logger.Warn("postgres_rotated_credentials_compat_vault_write_failed",
+					"vault_ref", altPath,
+					"error", err,
+				)
+			}
 		}
 	}
 

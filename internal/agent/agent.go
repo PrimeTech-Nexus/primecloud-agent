@@ -319,6 +319,68 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}, nil
 	}, nil)
 
+	// stop_application & workload.stop (suspension with data preservation)
+	stopAppHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		containerID := resolveAppContainerTarget(ctx, rt, op)
+		if containerID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "SUCCEEDED",
+				Message:         "No matching application container found on this node to stop",
+				CompletedAtUnix: time.Now().Unix(),
+			}, nil
+		}
+		if err := applications.StopApplication(ctx, rt, containerID, 10); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "STOP_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Application container %s stopped successfully (volumes and data preserved)", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("stop_application", stopAppHandler, nil)
+	registry.Register("workload.stop", stopAppHandler, nil)
+	registry.Register("suspend_application", stopAppHandler, nil)
+
+	// start_application & workload.start (reactivation)
+	startAppHandler := func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		containerID := resolveAppContainerTarget(ctx, rt, op)
+		if containerID == "" {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "SUCCEEDED",
+				Message:         "No matching application container found on this node to start",
+				CompletedAtUnix: time.Now().Unix(),
+			}, nil
+		}
+		if err := applications.StartApplication(ctx, rt, containerID); err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "START_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			Message:         fmt.Sprintf("Application container %s started successfully", containerID),
+			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}
+	registry.Register("start_application", startAppHandler, nil)
+	registry.Register("workload.start", startAppHandler, nil)
+	registry.Register("resume_application", startAppHandler, nil)
+
 	// 2. restart_application
 	registry.Register("restart_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		containerID := resolveAppContainerTarget(ctx, rt, op)
@@ -393,6 +455,7 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 	haproxyMgr := haproxy.NewManager(haproxyConfDir, a.logger)
 	pgProv := postgres.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	pgLC := postgres.NewLifecycleManager(rt)
+	pgRotator := postgres.NewRotator(rt, vaultClient, a.logger)
 	vkProv := valkey.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
 	vkLC := valkey.NewLifecycleManager(rt)
 	myProv := mysql.NewProvisioner(rt, vaultClient, cfg.ResourceDir, a.logger)
@@ -810,6 +873,57 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			Status:          "SUCCEEDED",
 			Message:         fmt.Sprintf("PostgreSQL container %s is healthy", containerName),
 			CompletedAtUnix: time.Now().Unix(),
+		}, nil
+	}, nil)
+
+	// 10b. rotate_postgres
+	registry.Register("rotate_postgres", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
+		resID := extractResourceID(op, "postgres_id")
+		payload := parsePayloadMap(op.PayloadJson)
+		projectID := op.ProjectId
+		if projectID == "" {
+			if pid, ok := payload["project_id"].(string); ok && pid != "" {
+				projectID = pid
+			}
+		}
+		if projectID == "" {
+			projectID = "default"
+		}
+		environmentID := op.EnvironmentId
+		if environmentID == "" {
+			if eid, ok := payload["environment_id"].(string); ok && eid != "" {
+				environmentID = eid
+			}
+		}
+
+		rotRes, err := pgRotator.Rotate(ctx, projectID, environmentID, resID)
+		if err != nil {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "ROTATE_POSTGRES_FAILED",
+				Message:         err.Error(),
+				CompletedAtUnix: time.Now().Unix(),
+			}, err
+		}
+
+		resData := map[string]interface{}{
+			"resource_id":      rotRes.ResourceID,
+			"project_id":       rotRes.ProjectID,
+			"vault_secret_ref": rotRes.VaultSecretRef,
+			"container_id":     rotRes.ContainerID,
+			"synchronized":     rotRes.Synchronized,
+			"status":           "AVAILABLE",
+			"node_id":          cfg.NodeID,
+		}
+		resBytes, _ := json.Marshal(resData)
+		return &pb.OperationResponse{
+			OperationId:     op.OperationId,
+			Status:          "SUCCEEDED",
+			ResultJson:      string(resBytes),
+			Message:         fmt.Sprintf("PostgreSQL credentials rotated successfully for %s", resID),
+			CompletedAtUnix: time.Now().Unix(),
+			ProgressPercent: 100,
 		}, nil
 	}, nil)
 

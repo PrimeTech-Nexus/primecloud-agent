@@ -134,6 +134,8 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 	// 3. Store Credentials in Vault
 	tenantVaultRef := fmt.Sprintf("secret/data/primecloud/tenants/%s/postgres/%s", projectID, resourceID)
 	compatVaultRef := fmt.Sprintf("primecloud/resources/postgres/%s", resourceID)
+	primecloudMountRef := fmt.Sprintf("primecloud/data/primecloud/tenants/%s/postgres/%s", projectID, resourceID)
+	primecloudCompatRef := fmt.Sprintf("primecloud/data/resources/postgres/%s", resourceID)
 	if p.vaultClient != nil {
 		secretData := map[string]interface{}{
 			"username": creds.Username,
@@ -148,9 +150,11 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 		}
 		p.logger.Info("postgres_credentials_stored_in_vault", "vault_ref", tenantVaultRef)
 
-		// Dual-write legacy compatibility path
-		if err := p.vaultClient.WriteSecret(ctx, compatVaultRef, secretData); err != nil {
-			p.logger.Warn("postgres_credentials_compat_vault_write_failed", "vault_ref", compatVaultRef, "error", err)
+		// Dual-write legacy compatibility and primecloud mount paths
+		for _, altPath := range []string{primecloudMountRef, primecloudCompatRef, compatVaultRef} {
+			if err := p.vaultClient.WriteSecret(ctx, altPath, secretData); err != nil {
+				p.logger.Warn("postgres_credentials_compat_vault_write_failed", "vault_ref", altPath, "error", err)
+			}
 		}
 	}
 
