@@ -219,6 +219,8 @@ func ParseCaddyAccessLogLine(line string, domainMap map[string]string) (*LogItem
 		"status_code": entry.Status,
 		"duration_ms": durationMs,
 		"client_ip":   entry.Request.RemoteIP,
+		"bytes_sent":  entry.Size,
+		"bytes_read":  entry.BytesRead,
 	}
 	if entry.Request.Headers != nil {
 		httpMeta["headers"] = entry.Request.Headers
@@ -226,6 +228,9 @@ func ParseCaddyAccessLogLine(line string, domainMap map[string]string) (*LogItem
 	structuredData := map[string]interface{}{
 		"status_code": entry.Status,
 		"duration_ms": durationMs,
+		"bytes_sent":  entry.Size,
+		"size":        entry.Size,
+		"bytes_read":  entry.BytesRead,
 		"http":        httpMeta,
 	}
 	if reqID != "" {

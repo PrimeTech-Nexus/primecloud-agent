@@ -29,6 +29,80 @@ type DeployPayload struct {
 	HealthCheckCmd   []string                `json:"health_check_cmd"`
 	HealthTimeoutSec int                     `json:"health_timeout_sec"`
 	Limits           *runtime.ResourceLimits `json:"limits"`
+	CPULimit         string                  `json:"cpu_limit"`
+	MemoryLimit      string                  `json:"memory_limit"`
+}
+
+// parseResourceLimits parses cpu_limit and memory_limit strings if Limits object is not provided.
+func parseResourceLimits(limits *runtime.ResourceLimits, cpuStr, memStr string) *runtime.ResourceLimits {
+	if limits != nil && (limits.MemoryBytes > 0 || limits.NanoCPUs > 0) {
+		res := *limits
+		if res.MemorySwap == 0 && res.MemoryBytes > 0 {
+			res.MemorySwap = res.MemoryBytes // No extra swap by default
+		}
+		if res.PidsLimit == 0 {
+			res.PidsLimit = 256
+		}
+		if res.CPUShares == 0 {
+			res.CPUShares = 1024
+		}
+		return &res
+	}
+
+	res := runtime.DefaultResourceLimits()
+
+	// Parse MemoryLimit string e.g. "512M", "512Mi", "1G", "1Gi", "1024", "2048M"
+	if trimmed := strings.TrimSpace(memStr); trimmed != "" {
+		upper := strings.ToUpper(trimmed)
+		var bytes int64
+		if strings.HasSuffix(upper, "GI") || strings.HasSuffix(upper, "GB") {
+			numPart := strings.TrimRight(upper, "GIB")
+			if val, err := strconv.ParseFloat(strings.TrimSpace(numPart), 64); err == nil && val > 0 {
+				bytes = int64(val * 1024 * 1024 * 1024)
+			}
+		} else if strings.HasSuffix(upper, "G") {
+			numPart := strings.TrimSuffix(upper, "G")
+			if val, err := strconv.ParseFloat(strings.TrimSpace(numPart), 64); err == nil && val > 0 {
+				bytes = int64(val * 1024 * 1024 * 1024)
+			}
+		} else if strings.HasSuffix(upper, "MI") || strings.HasSuffix(upper, "MB") {
+			numPart := strings.TrimRight(upper, "MIB")
+			if val, err := strconv.ParseFloat(strings.TrimSpace(numPart), 64); err == nil && val > 0 {
+				bytes = int64(val * 1024 * 1024)
+			}
+		} else if strings.HasSuffix(upper, "M") {
+			numPart := strings.TrimSuffix(upper, "M")
+			if val, err := strconv.ParseFloat(strings.TrimSpace(numPart), 64); err == nil && val > 0 {
+				bytes = int64(val * 1024 * 1024)
+			}
+		} else if val, err := strconv.ParseInt(upper, 10, 64); err == nil && val > 0 {
+			// Bare integer - if < 10000 assume MB, else assume bytes
+			if val < 10000 {
+				bytes = val * 1024 * 1024
+			} else {
+				bytes = val
+			}
+		}
+		if bytes > 0 {
+			res.MemoryBytes = bytes
+			res.MemorySwap = bytes
+		}
+	}
+
+	// Parse CPULimit string e.g. "0.5", "1", "2000m", "500m"
+	if trimmed := strings.TrimSpace(cpuStr); trimmed != "" {
+		lower := strings.ToLower(trimmed)
+		if strings.HasSuffix(lower, "m") {
+			millisStr := strings.TrimSuffix(lower, "m")
+			if val, err := strconv.ParseFloat(millisStr, 64); err == nil && val > 0 {
+				res.NanoCPUs = int64(val * 1e6)
+			}
+		} else if val, err := strconv.ParseFloat(lower, 64); err == nil && val > 0 {
+			res.NanoCPUs = int64(val * 1e9)
+		}
+	}
+
+	return res
 }
 
 // Deployer orchestrates deployment, secret resolution, and container execution.
@@ -286,10 +360,7 @@ func (d *Deployer) Deploy(
 		WorkloadType:   runtime.WorkloadTypeApplication,
 	}
 
-	limits := payload.Limits
-	if limits == nil {
-		limits = runtime.DefaultResourceLimits()
-	}
+	limits := parseResourceLimits(payload.Limits, payload.CPULimit, payload.MemoryLimit)
 
 	profile := runtime.DefaultHardenedProfile()
 
@@ -306,7 +377,7 @@ func (d *Deployer) Deploy(
 	}
 
 	// 5. Health check poll
-	waitTimeout := 15 * time.Second
+	waitTimeout := 60 * time.Second
 	if payload.HealthTimeoutSec > 0 {
 		waitTimeout = time.Duration(payload.HealthTimeoutSec) * time.Second
 	}

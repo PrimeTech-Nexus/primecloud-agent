@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -96,10 +95,10 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 
 	p.logger.Info("provisioning_valkey_starting", "project_id", projectID, "resource_id", resourceID, "image", image)
 
-	// 1. Create Volume Directory
+	// 1. Create Volume Directory with correct permissions for valkey (UID 999)
 	volumePath := filepath.Join(p.baseResDir, "valkey", resourceID)
-	if err := os.MkdirAll(volumePath, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create valkey volume directory: %w", err)
+	if err := ensureValkeyDataDir(volumePath); err != nil {
+		return nil, fmt.Errorf("failed to create valkey volume directory %s: %w", volumePath, err)
 	}
 
 	// 2. Generate Credentials

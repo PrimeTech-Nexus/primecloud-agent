@@ -21,12 +21,15 @@ import (
 )
 
 var (
-	// Secret redaction regex patterns matching API keys, tokens, passwords, private keys
+	// Secret redaction regex patterns matching API keys, tokens, passwords, private keys (SEC-OBS-07)
 	secretPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(api[_-]?key|secret|password|passwd|token|auth|bearer)\s*[:=]\s*["']?([^\s"']+)["']?`),
 		regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
 		regexp.MustCompile(`sk_test_[0-9a-zA-Z]{24,}`),
 		regexp.MustCompile(`sk_live_[0-9a-zA-Z]{24,}`),
+		regexp.MustCompile(`(?i)(?:postgres|postgresql|mysql|mongodb(?:\+srv)?):\/\/[^\s:]+:([^\s@]+)@`),
+		regexp.MustCompile(`ey[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*`),
+		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*`),
 	}
 )
 
@@ -392,7 +395,7 @@ func AggregateMultilineItems(items []LogItem) []LogItem {
 		}
 		base.StructuredData["is_multiline"] = true
 		base.StructuredData["line_count"] = len(currentGroup)
-		base.StructuredData["raw_traceback"] = fullText
+		base.StructuredData["raw_traceback"] = RedactSecrets(fullText)
 		base.Severity = SeverityError
 		base.Message = summary
 		result = append(result, base)
