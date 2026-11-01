@@ -421,10 +421,27 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		}, nil
 	}, nil)
 
-	// 4. health_check_application
+	// 4. health_check_application (active HTTP probe enabled)
 	registry.Register("health_check_application", func(ctx context.Context, op *pb.OperationEnvelope) (*pb.OperationResponse, error) {
 		containerID := resolveAppContainerTarget(ctx, rt, op)
-		if err := applications.WaitForContainerReady(ctx, rt, containerID, 10*time.Second); err != nil {
+		payload := parsePayloadMap(op.PayloadJson)
+		containerPort := 8000
+		if p, ok := payload["port"].(float64); ok && p > 0 {
+			containerPort = int(p)
+		}
+		path := "/health"
+		if p, ok := payload["path"].(string); ok && p != "" {
+			path = p
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		timeoutSec := 10
+		if t, ok := payload["timeout_seconds"].(float64); ok && t > 0 {
+			timeoutSec = int(t)
+		}
+
+		if err := applications.WaitForContainerReady(ctx, rt, containerID, time.Duration(timeoutSec)*time.Second); err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
@@ -433,6 +450,61 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 				CompletedAtUnix: time.Now().Unix(),
 			}, err
 		}
+
+		inspect, err := rt.InspectContainer(ctx, containerID)
+		if err != nil || inspect == nil || !inspect.Running {
+			return &pb.OperationResponse{
+				OperationId:     op.OperationId,
+				Status:          "FAILED",
+				ErrorCode:       "CONTAINER_NOT_RUNNING",
+				Message:         fmt.Sprintf("container %s is not running", containerID),
+				CompletedAtUnix: time.Now().Unix(),
+			}, fmt.Errorf("container not running")
+		}
+
+		hostPort := 0
+		if len(inspect.Ports) > 0 {
+			targetKeys := []string{
+				fmt.Sprintf("%d/tcp", containerPort),
+				strconv.Itoa(containerPort),
+				"8000/tcp",
+				"8000",
+			}
+			for _, key := range targetKeys {
+				if hpStr, ok := inspect.Ports[key]; ok && hpStr != "" {
+					if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+						hostPort = hp
+						break
+					}
+				}
+			}
+			if hostPort == 0 {
+				for _, hpStr := range inspect.Ports {
+					if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+						hostPort = hp
+						break
+					}
+				}
+			}
+		}
+
+		if hostPort > 0 {
+			probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+			defer probeCancel()
+			probeURL := fmt.Sprintf("http://127.0.0.1:%d%s", hostPort, path)
+			ok, err := applications.ProbeHTTP(probeCtx, probeURL, 0)
+			if err != nil || !ok {
+				errMsg := fmt.Sprintf("HTTP health check failed on %s: %v", probeURL, err)
+				return &pb.OperationResponse{
+					OperationId:     op.OperationId,
+					Status:          "FAILED",
+					ErrorCode:       "HEALTH_CHECK_FAILED",
+					Message:         errMsg,
+					CompletedAtUnix: time.Now().Unix(),
+				}, fmt.Errorf("%s", errMsg)
+			}
+		}
+
 		return &pb.OperationResponse{
 			OperationId:     op.OperationId,
 			Status:          "SUCCEEDED",
@@ -679,7 +751,14 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 
-		provRes, err := pgProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
+		cpuLim, _ := payload["cpu_limit"].(string)
+		memLim, _ := payload["memory_limit"].(string)
+		var customLimits *runtime.ResourceLimits
+		if cpuLim != "" || memLim != "" {
+			customLimits = applications.ParseResourceLimits(nil, cpuLim, memLim)
+		}
+
+		provRes, err := pgProv.ProvisionWithProjectAndLimits(ctx, projectID, environmentID, resID, image, hostPort, customLimits)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
@@ -1200,7 +1279,14 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 
-		provRes, err := myProv.ProvisionWithProject(ctx, projectID, environmentID, resID, image, hostPort)
+		cpuLim, _ := payload["cpu_limit"].(string)
+		memLim, _ := payload["memory_limit"].(string)
+		var customLimits *runtime.ResourceLimits
+		if cpuLim != "" || memLim != "" {
+			customLimits = applications.ParseResourceLimits(nil, cpuLim, memLim)
+		}
+
+		provRes, err := myProv.ProvisionWithProjectAndLimits(ctx, projectID, environmentID, resID, image, hostPort, customLimits)
 		if err != nil {
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,

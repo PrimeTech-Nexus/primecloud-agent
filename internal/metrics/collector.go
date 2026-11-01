@@ -883,6 +883,44 @@ func (c *Collector) BuildIngestBatch(metrics *MetricPayload) IngestMetricBatch {
 			}
 		}
 
+		// Container memory limit quota (if known/configured)
+		if stat.MemoryLimitBytes > 0 {
+			points = append(points, IngestMetricPoint{
+				ResourceID:   resID,
+				ResourceType: resType,
+				MetricName:   "memory_limit_bytes",
+				Value:        float64(stat.MemoryLimitBytes),
+				Unit:         "bytes",
+				Timestamp:    sampledIso,
+			})
+		}
+
+		// Container status: 1.0 for healthy/running, 0.0 for degraded/unhealthy, 0.5 for starting
+		var containerStatus float64 = 1.0
+		if stat.State != "running" || stat.HealthStatus == "unhealthy" {
+			containerStatus = 0.0
+		} else if stat.HealthStatus == "starting" {
+			containerStatus = 0.5
+		}
+		points = append(points, IngestMetricPoint{
+			ResourceID:   resID,
+			ResourceType: resType,
+			MetricName:   "container_status",
+			Value:        containerStatus,
+			Unit:         "status",
+			Timestamp:    sampledIso,
+		})
+
+		// Restart count from container inspection
+		points = append(points, IngestMetricPoint{
+			ResourceID:   resID,
+			ResourceType: resType,
+			MetricName:   "restart_count",
+			Value:        float64(stat.RestartCount),
+			Unit:         "count",
+			Timestamp:    sampledIso,
+		})
+
 		if stat.UptimeSeconds > 0 {
 			points = append(points, IngestMetricPoint{
 				ResourceID:   resID,

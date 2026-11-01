@@ -93,6 +93,11 @@ func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, h
 // environmentID is the PrimeCloud environment UUID used to attach the container to the managed-data network.
 // Pass an empty string if no environment network attachment is required (e.g., tests without Docker).
 func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string) (*ProvisionResult, error) {
+	return p.ProvisionWithProjectAndLimits(ctx, projectID, environmentID, resourceID, image, hostPort, nil)
+}
+
+// ProvisionWithProjectAndLimits allows customizing CPU and Memory limits according to the provisioned plan.
+func (p *Provisioner) ProvisionWithProjectAndLimits(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string, limits *runtime.ResourceLimits) (*ProvisionResult, error) {
 	if resourceID == "" {
 		return nil, fmt.Errorf("resource_id cannot be empty")
 	}
@@ -192,7 +197,9 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 		}
 	}
 
-	limits := runtime.DefaultResourceLimits()
+	if limits == nil {
+		limits = runtime.DefaultResourceLimits()
+	}
 	profile := runtime.DefaultHardenedProfile()
 	// Postgres requires postgres user inside container
 	profile.User = "999:999"

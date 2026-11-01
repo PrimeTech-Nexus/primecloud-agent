@@ -61,7 +61,7 @@ func ProbeHTTP(ctx context.Context, url string, expectedStatus int) (bool, error
 	defer resp.Body.Close()
 
 	if expectedStatus == 0 {
-		expectedStatus = http.StatusOK
+		return resp.StatusCode >= 200 && resp.StatusCode < 400, nil
 	}
 
 	return resp.StatusCode == expectedStatus, nil

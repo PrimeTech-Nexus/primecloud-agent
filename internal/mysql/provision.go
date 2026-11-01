@@ -124,6 +124,11 @@ func (p *Provisioner) Provision(ctx context.Context, resourceID, image string, h
 
 // ProvisionWithProject prepares storage, generates credentials, writes them to Vault under the tenant path, and starts the container.
 func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string) (*ProvisionResult, error) {
+	return p.ProvisionWithProjectAndLimits(ctx, projectID, environmentID, resourceID, image, hostPort, nil)
+}
+
+// ProvisionWithProjectAndLimits allows customizing CPU and Memory limits according to the provisioned plan.
+func (p *Provisioner) ProvisionWithProjectAndLimits(ctx context.Context, projectID, environmentID, resourceID, image, hostPort string, limits *runtime.ResourceLimits) (*ProvisionResult, error) {
 	if resourceID == "" {
 		return nil, fmt.Errorf("resource_id cannot be empty")
 	}
@@ -221,7 +226,9 @@ func (p *Provisioner) ProvisionWithProject(ctx context.Context, projectID, envir
 		}
 	}
 
-	limits := runtime.DefaultResourceLimits()
+	if limits == nil {
+		limits = runtime.DefaultResourceLimits()
+	}
 	profile := runtime.DefaultHardenedProfile()
 	profile.User = "999:999"
 

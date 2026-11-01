@@ -33,8 +33,16 @@ type DeployPayload struct {
 	MemoryLimit      string                  `json:"memory_limit"`
 }
 
-// parseResourceLimits parses cpu_limit and memory_limit strings if Limits object is not provided.
+// ParseResourceLimits parses cpu_limit and memory_limit strings if Limits object is not provided.
+func ParseResourceLimits(limits *runtime.ResourceLimits, cpuStr, memStr string) *runtime.ResourceLimits {
+	return parseResourceLimitsImpl(limits, cpuStr, memStr)
+}
+
 func parseResourceLimits(limits *runtime.ResourceLimits, cpuStr, memStr string) *runtime.ResourceLimits {
+	return parseResourceLimitsImpl(limits, cpuStr, memStr)
+}
+
+func parseResourceLimitsImpl(limits *runtime.ResourceLimits, cpuStr, memStr string) *runtime.ResourceLimits {
 	if limits != nil && (limits.MemoryBytes > 0 || limits.NanoCPUs > 0) {
 		res := *limits
 		if res.MemorySwap == 0 && res.MemoryBytes > 0 {

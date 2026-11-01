@@ -387,3 +387,105 @@ func TestHostMetricsWindowsAndHTTPTransmission(t *testing.T) {
 		t.Fatalf("expected 3 metrics transmitted over HTTP, got %d", len(receivedBatch.Metrics))
 	}
 }
+
+func TestCollectorBuildIngestBatchWorkloadTelemetry(t *testing.T) {
+	coll := NewCollector(100*time.Millisecond, "node-test-01", "agent-test-01", nil, nil, nil)
+
+	payload := &MetricPayload{
+		NodeID:    "node-test-01",
+		AgentID:   "agent-test-01",
+		SampledAt: time.Now(),
+		ContainerStats: map[string]ContainerMetric{
+			"cnt-healthy": {
+				ResourceID:       "app-uuid-1111",
+				State:            "running",
+				HealthStatus:     "healthy",
+				CPUUsagePercent:  25.5,
+				MemoryUsageBytes: 524288000,
+				MemoryLimitBytes: 1073741824, // 1 GB limit
+				RestartCount:     3,
+				UptimeSeconds:    3600,
+			},
+			"cnt-unhealthy": {
+				ResourceID:       "app-uuid-2222",
+				State:            "running",
+				HealthStatus:     "unhealthy",
+				CPUUsagePercent:  10.0,
+				MemoryUsageBytes: 104857600,
+				MemoryLimitBytes: 536870912,
+				RestartCount:     5,
+			},
+			"cnt-stopped": {
+				ResourceID:       "app-uuid-3333",
+				State:            "stopped",
+				HealthStatus:     "stopped",
+				MemoryLimitBytes: 268435456,
+				RestartCount:     1,
+			},
+			"cnt-starting": {
+				ResourceID:       "app-uuid-4444",
+				State:            "running",
+				HealthStatus:     "starting",
+				CPUUsagePercent:  5.0,
+				MemoryUsageBytes: 50000000,
+				RestartCount:     0,
+			},
+		},
+	}
+
+	batch := coll.BuildIngestBatch(payload)
+
+	// Build map by resourceID and metricName
+	type key struct {
+		resID  string
+		metric string
+	}
+	metricMap := make(map[key]IngestMetricPoint)
+	for _, pt := range batch.Metrics {
+		metricMap[key{pt.ResourceID, pt.MetricName}] = pt
+	}
+
+	// 1. Healthy container assertions
+	ptMemLim, ok := metricMap[key{"app-uuid-1111", "memory_limit_bytes"}]
+	if !ok || ptMemLim.Value != 1073741824 || ptMemLim.Unit != "bytes" {
+		t.Errorf("expected memory_limit_bytes 1073741824 bytes, got %+v", ptMemLim)
+	}
+	ptStatus1, ok := metricMap[key{"app-uuid-1111", "container_status"}]
+	if !ok || ptStatus1.Value != 1.0 || ptStatus1.Unit != "status" {
+		t.Errorf("expected container_status 1.0 status, got %+v", ptStatus1)
+	}
+	ptRestart1, ok := metricMap[key{"app-uuid-1111", "restart_count"}]
+	if !ok || ptRestart1.Value != 3.0 || ptRestart1.Unit != "count" {
+		t.Errorf("expected restart_count 3.0 count, got %+v", ptRestart1)
+	}
+
+	// 2. Unhealthy container assertions (container_status == 0.0)
+	ptStatus2, ok := metricMap[key{"app-uuid-2222", "container_status"}]
+	if !ok || ptStatus2.Value != 0.0 {
+		t.Errorf("expected container_status 0.0 for unhealthy, got %+v", ptStatus2)
+	}
+	ptRestart2, ok := metricMap[key{"app-uuid-2222", "restart_count"}]
+	if !ok || ptRestart2.Value != 5.0 {
+		t.Errorf("expected restart_count 5.0, got %+v", ptRestart2)
+	}
+
+	// 3. Stopped container assertions (container_status == 0.0, no cpu/memory usage emitted)
+	ptStatus3, ok := metricMap[key{"app-uuid-3333", "container_status"}]
+	if !ok || ptStatus3.Value != 0.0 {
+		t.Errorf("expected container_status 0.0 for stopped, got %+v", ptStatus3)
+	}
+	if _, hasCPU := metricMap[key{"app-uuid-3333", "cpu_usage_percent"}]; hasCPU {
+		t.Errorf("stopped container should not emit cpu_usage_percent")
+	}
+
+	// 4. Starting container assertions (container_status == 0.5)
+	ptStatus4, ok := metricMap[key{"app-uuid-4444", "container_status"}]
+	if !ok || ptStatus4.Value != 0.5 {
+		t.Errorf("expected container_status 0.5 for starting, got %+v", ptStatus4)
+	}
+	ptRestart4, ok := metricMap[key{"app-uuid-4444", "restart_count"}]
+	if !ok || ptRestart4.Value != 0.0 {
+		t.Errorf("expected restart_count 0.0, got %+v", ptRestart4)
+	}
+}
+
