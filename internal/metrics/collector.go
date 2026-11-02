@@ -568,6 +568,30 @@ func (c *Collector) Sample(ctx context.Context) (*MetricPayload, error) {
 									}
 								}
 							}
+							if stat.DatabaseSizeBytes == 0 {
+								duCmd := []string{"du", "-sb", "/var/lib/postgresql/data"}
+								duOut, _, duExit, duErr := c.rt.ExecContainer(ctx, cnt.ID, duCmd, nil, nil)
+								if duErr == nil && duExit == 0 {
+									fields := strings.Fields(string(duOut))
+									if len(fields) >= 1 {
+										if val, err := strconv.ParseInt(fields[0], 10, 64); err == nil && val > 0 {
+											stat.DatabaseSizeBytes = val
+										}
+									}
+								}
+							}
+							if stat.DatabaseSizeBytes == 0 {
+								duCmd := []string{"du", "-sk", "/var/lib/postgresql/data"}
+								duOut, _, duExit, duErr := c.rt.ExecContainer(ctx, cnt.ID, duCmd, nil, nil)
+								if duErr == nil && duExit == 0 {
+									fields := strings.Fields(string(duOut))
+									if len(fields) >= 1 {
+										if val, err := strconv.ParseInt(fields[0], 10, 64); err == nil && val > 0 {
+											stat.DatabaseSizeBytes = val * 1024
+										}
+									}
+								}
+							}
 						}
 
 						if isMySQL(cnt.Image) || isMySQL(cntName) {
@@ -942,14 +966,24 @@ func (c *Collector) BuildIngestBatch(metrics *MetricPayload) IngestMetricBatch {
 			})
 		}
 		if stat.DatabaseSizeBytes > 0 {
-			points = append(points, IngestMetricPoint{
-				ResourceID:   resID,
-				ResourceType: resType,
-				MetricName:   "database_size_bytes",
-				Value:        float64(stat.DatabaseSizeBytes),
-				Unit:         "bytes",
-				Timestamp:    sampledIso,
-			})
+			points = append(points,
+				IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "database_size_bytes",
+					Value:        float64(stat.DatabaseSizeBytes),
+					Unit:         "bytes",
+					Timestamp:    sampledIso,
+				},
+				IngestMetricPoint{
+					ResourceID:   resID,
+					ResourceType: resType,
+					MetricName:   "database_size",
+					Value:        float64(stat.DatabaseSizeBytes),
+					Unit:         "bytes",
+					Timestamp:    sampledIso,
+				},
+			)
 		}
 		if stat.ConnectedClients > 0 {
 			points = append(points, IngestMetricPoint{
