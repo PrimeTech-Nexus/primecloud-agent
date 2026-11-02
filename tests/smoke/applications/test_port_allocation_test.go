@@ -59,7 +59,7 @@ func (m *MockRuntime) Close() error                   { return nil }
 
 func TestDynamicPortAllocation_BuildPortConfig_Port8000(t *testing.T) {
 	// 1. Verify that when container port 8000 is requested, BuildPortConfig creates exposed port 8000/tcp
-	// and HostPort binding {HostIP: "0.0.0.0", HostPort: ""}
+	// and HostPort binding {HostIP: "127.0.0.1", HostPort: ""}
 	ports := map[string]string{
 		"8000/tcp": "8000",
 	}
@@ -78,8 +78,8 @@ func TestDynamicPortAllocation_BuildPortConfig_Port8000(t *testing.T) {
 	if !ok || len(bindings) != 1 {
 		t.Fatalf("Expected 1 binding for 8000/tcp, got: %v", bindings)
 	}
-	if bindings[0].HostIP != "0.0.0.0" {
-		t.Errorf("Expected HostIP 0.0.0.0, got: %q", bindings[0].HostIP)
+	if bindings[0].HostIP != "127.0.0.1" {
+		t.Errorf("Expected HostIP 127.0.0.1, got: %q", bindings[0].HostIP)
 	}
 	if bindings[0].HostPort != "" {
 		t.Errorf("Expected ephemeral HostPort (empty string), got: %q", bindings[0].HostPort)

@@ -695,3 +695,45 @@ func TestDeploy_SecretResolution_CrossMountFallback_PreservesDataEndpoint(t *tes
 		}
 	}
 }
+
+func TestDeploy_SetsTenantNetworkModeAndAliasesAtCreation(t *testing.T) {
+	mockRT := &mockRuntime{
+		containerID: "cnt-net-iso-12345",
+	}
+
+	deployer := applications.NewDeployer(mockRT, nil, nil)
+	ctx := context.Background()
+
+	payloadJSON := `{
+		"image": "ghcr.io/primetech-nexus/apps/app-tenant-iso:latest",
+		"ports": {"8000": "8000"}
+	}`
+
+	cid, err := deployer.Deploy(ctx, "proj-tenant-a", "env-tenant-a", "app-101", "inst-202", payloadJSON)
+	if err != nil {
+		t.Fatalf("Deploy failed unexpectedly: %v", err)
+	}
+
+	if cid != "cnt-net-iso-12345" {
+		t.Fatalf("expected container ID 'cnt-net-iso-12345', got %q", cid)
+	}
+
+	if mockRT.createdConfig == nil {
+		t.Fatal("expected container config to be populated")
+	}
+
+	// Verify NetworkMode is pc-net-<environmentID> (never empty / default bridge)
+	expectedNetMode := "pc-net-env-tenant-a"
+	if mockRT.createdConfig.NetworkMode != expectedNetMode {
+		t.Errorf("expected NetworkMode %q, got %q", expectedNetMode, mockRT.createdConfig.NetworkMode)
+	}
+
+	// Verify NetworkAliases include application DNS aliases
+	expectedAliases := []string{"app-app-101.internal.primecloud", "app-app-101"}
+	if len(mockRT.createdConfig.NetworkAliases) < 2 {
+		t.Fatalf("expected at least 2 aliases, got %v", mockRT.createdConfig.NetworkAliases)
+	}
+	if mockRT.createdConfig.NetworkAliases[0] != expectedAliases[0] || mockRT.createdConfig.NetworkAliases[1] != expectedAliases[1] {
+		t.Errorf("expected aliases %v, got %v", expectedAliases, mockRT.createdConfig.NetworkAliases)
+	}
+}

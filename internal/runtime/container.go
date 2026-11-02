@@ -41,6 +41,8 @@ type ContainerConfig struct {
 	InstanceID     string            `json:"instance_id"`
 	User           string            `json:"user,omitempty"`
 	NetworkMode    string            `json:"network_mode,omitempty"`
+	NetworkAliases []string          `json:"network_aliases,omitempty"`
+	HostIP         string            `json:"host_ip,omitempty"`
 	WorkloadType   WorkloadType      `json:"workload_type,omitempty"`
 }
 

@@ -15,6 +15,13 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/vault"
 )
 
+// VolumeMount defines host-to-container filesystem mount mapping.
+type VolumeMount struct {
+	HostPath  string `json:"host_path"`
+	MountPath string `json:"mount_path"`
+	ReadOnly  bool   `json:"read_only"`
+}
+
 // DeployPayload defines the JSON payload schema for deploy_application operations.
 type DeployPayload struct {
 	Image            string                  `json:"image"`
@@ -31,6 +38,8 @@ type DeployPayload struct {
 	Limits           *runtime.ResourceLimits `json:"limits"`
 	CPULimit         string                  `json:"cpu_limit"`
 	MemoryLimit      string                  `json:"memory_limit"`
+	Volumes          []VolumeMount           `json:"volumes"`
+	Binds            []string                `json:"binds"`
 }
 
 // ParseResourceLimits parses cpu_limit and memory_limit strings if Limits object is not provided.
@@ -353,6 +362,32 @@ func (d *Deployer) Deploy(
 		portsMap[k] = ""
 	}
 
+	var targetNetworkMode string
+	var targetNetworkAliases []string
+	if environmentID != "" {
+		if d.netMgr != nil {
+			if _, netErr := d.netMgr.EnsureEnvironmentNetwork(ctx, environmentID); netErr != nil {
+				return "", fmt.Errorf("failed ensuring tenant network pc-net-%s before container creation: %w", environmentID, netErr)
+			}
+		}
+		targetNetworkMode = fmt.Sprintf("pc-net-%s", environmentID)
+		targetNetworkAliases = network.FormatApplicationAliases(appID, instanceID)
+	}
+
+	var binds []string
+	if len(payload.Binds) > 0 {
+		binds = append(binds, payload.Binds...)
+	}
+	for _, v := range payload.Volumes {
+		if v.HostPath != "" && v.MountPath != "" {
+			mode := "rw"
+			if v.ReadOnly {
+				mode = "ro"
+			}
+			binds = append(binds, fmt.Sprintf("%s:%s:%s", v.HostPath, v.MountPath, mode))
+		}
+	}
+
 	cfg := &runtime.ContainerConfig{
 		Name:           containerName,
 		Image:          imageToRun,
@@ -360,12 +395,15 @@ func (d *Deployer) Deploy(
 		Command:        payload.Command,
 		Env:            finalEnv,
 		Ports:          portsMap,
+		Binds:          binds,
 		HealthCheckCmd: payload.HealthCheckCmd,
 		ProjectID:      projectID,
 		EnvironmentID:  environmentID,
 		ApplicationID:  appID,
 		InstanceID:     instanceID,
 		WorkloadType:   runtime.WorkloadTypeApplication,
+		NetworkMode:    targetNetworkMode,
+		NetworkAliases: targetNetworkAliases,
 	}
 
 	limits := parseResourceLimits(payload.Limits, payload.CPULimit, payload.MemoryLimit)
@@ -396,29 +434,17 @@ func (d *Deployer) Deploy(
 		return containerID, fmt.Errorf("container started but failed health check: %w", err)
 	}
 
-	// 6. Attach application container to the managed-data network (pc-net-<environmentID>).
-	// This enables the application to resolve Postgres and Valkey resources via internal DNS
-	// (e.g. postgres-<id>.internal.primecloud, valkey-<id>.internal.primecloud).
-	if d.netMgr != nil && environmentID != "" {
-		aliases := network.FormatApplicationAliases(appID, instanceID)
-		if err := d.netMgr.AttachContainerToEnvironmentNetwork(ctx, environmentID, containerID, aliases); err != nil {
-			d.logger.Warn("application_network_attach_failed",
-				"app_id", appID,
-				"instance_id", instanceID,
-				"environment_id", environmentID,
-				"container_id", containerID,
-				"error", err,
-			)
-			// Non-fatal: application is running; network attachment failure means it cannot
-			// yet resolve managed-data hostnames, but it is still reachable via Caddy.
-		} else {
-			d.logger.Info("application_network_attached",
-				"app_id", appID,
-				"environment_id", environmentID,
-				"network", "pc-net-"+environmentID,
-				"aliases", aliases,
-			)
-		}
+	// 6. Network configuration log
+	// Container was attached directly to pc-net-<environmentID> at creation time with 0 bridge exposure.
+	if environmentID != "" {
+		d.logger.Info("application_deployed_isolated",
+			"app_id", appID,
+			"instance_id", instanceID,
+			"environment_id", environmentID,
+			"container_id", containerID,
+			"network", targetNetworkMode,
+			"aliases", targetNetworkAliases,
+		)
 	}
 
 	d.logger.Info("application_deploy_succeeded", "container_id", containerID)

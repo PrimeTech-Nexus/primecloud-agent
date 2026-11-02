@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	dockerNetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -310,7 +311,7 @@ func BuildPortConfigForWorkload(workloadType WorkloadType, ports map[string]stri
 			exposedPorts[natPort] = struct{}{}
 			portBindings[natPort] = []nat.PortBinding{
 				{
-					HostIP:   "0.0.0.0",
+					HostIP:   "127.0.0.1",
 					HostPort: "", // Explicitly empty: Docker dynamically allocates an ephemeral host port
 				},
 			}
@@ -322,7 +323,7 @@ func BuildPortConfigForWorkload(workloadType WorkloadType, ports map[string]stri
 			exposedPorts[defaultPort] = struct{}{}
 			portBindings[defaultPort] = []nat.PortBinding{
 				{
-					HostIP:   "0.0.0.0",
+					HostIP:   "127.0.0.1",
 					HostPort: "",
 				},
 			}
@@ -364,6 +365,22 @@ func (d *DockerRuntime) CreateContainer(
 	if err != nil {
 		return "", fmt.Errorf("failed to configure port bindings: %w", err)
 	}
+	// Enforce 127.0.0.1 binding immutability for application workloads
+	if cfg.WorkloadType == WorkloadTypeApplication {
+		for portKey, bindings := range portBindings {
+			for i := range bindings {
+				bindings[i].HostIP = "127.0.0.1"
+			}
+			portBindings[portKey] = bindings
+		}
+	} else if cfg.HostIP != "" {
+		for portKey, bindings := range portBindings {
+			for i := range bindings {
+				bindings[i].HostIP = cfg.HostIP
+			}
+			portBindings[portKey] = bindings
+		}
+	}
 
 	dockerConfig := &container.Config{
 		Image:        cfg.Image,
@@ -400,8 +417,16 @@ func (d *DockerRuntime) CreateContainer(
 		Binds:        cfg.Binds,
 		PortBindings: portBindings,
 	}
+	var networkingConfig *dockerNetwork.NetworkingConfig
 	if cfg.NetworkMode != "" {
 		hostConfig.NetworkMode = container.NetworkMode(cfg.NetworkMode)
+		networkingConfig = &dockerNetwork.NetworkingConfig{
+			EndpointsConfig: map[string]*dockerNetwork.EndpointSettings{
+				cfg.NetworkMode: {
+					Aliases: cfg.NetworkAliases,
+				},
+			},
+		}
 	}
 
 	limits.ApplyToHostConfig(hostConfig)
@@ -410,7 +435,7 @@ func (d *DockerRuntime) CreateContainer(
 		return "", fmt.Errorf("failed to apply security isolation profile: %w", err)
 	}
 
-	resp, err := d.cli.ContainerCreate(ctx, dockerConfig, hostConfig, nil, nil, cfg.Name)
+	resp, err := d.cli.ContainerCreate(ctx, dockerConfig, hostConfig, networkingConfig, nil, cfg.Name)
 	if err != nil {
 		return "", fmt.Errorf("failed to create container %s: %w", cfg.Name, err)
 	}

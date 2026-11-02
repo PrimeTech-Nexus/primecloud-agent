@@ -266,7 +266,7 @@ func TestBuildPortConfigForWorkload_ManagedValkey(t *testing.T) {
 }
 
 func TestBuildPortConfigForWorkload_Application(t *testing.T) {
-	// Application workloads must default to 8000/tcp with dynamic host port binding
+	// Application workloads must default to 8000/tcp with dynamic host port binding on 127.0.0.1
 	exposed, bindings, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeApplication, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -277,5 +277,22 @@ func TestBuildPortConfigForWorkload_Application(t *testing.T) {
 	}
 	if len(bindings["8000/tcp"]) != 1 || bindings["8000/tcp"][0].HostPort != "" {
 		t.Errorf("expected dynamic ephemeral host port binding for 8000/tcp, got %v", bindings["8000/tcp"])
+	}
+	if bindings["8000/tcp"][0].HostIP != "127.0.0.1" {
+		t.Errorf("expected loopback HostIP 127.0.0.1, got %q", bindings["8000/tcp"][0].HostIP)
+	}
+
+	// Custom ports also strictly bind to 127.0.0.1
+	exposedCustom, bindingsCustom, err := runtime.BuildPortConfigForWorkload(runtime.WorkloadTypeApplication, map[string]string{
+		"3000/tcp": "",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := exposedCustom["3000/tcp"]; !ok {
+		t.Errorf("expected 3000/tcp in exposedCustom, got %v", exposedCustom)
+	}
+	if len(bindingsCustom["3000/tcp"]) != 1 || bindingsCustom["3000/tcp"][0].HostIP != "127.0.0.1" {
+		t.Errorf("expected 3000/tcp to bind to 127.0.0.1, got %v", bindingsCustom["3000/tcp"])
 	}
 }
