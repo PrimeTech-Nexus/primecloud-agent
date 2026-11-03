@@ -5,10 +5,57 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 
+	"github.com/primecloud/primecloud-agent/internal/logs"
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 )
+
+var secretRedactionPattern = regexp.MustCompile(`(?i)(password|secret|token|api_key|access_token|refresh_token|client_secret)\s*[:=]\s*[^\s"']+`)
+
+// SanitizeCrashLogs scrubs secret patterns and bounds output to 4096 bytes.
+func SanitizeCrashLogs(raw string) string {
+	scrubbed := secretRedactionPattern.ReplaceAllString(raw, "$1=***REDACTED***")
+	if len(scrubbed) > 4096 {
+		scrubbed = scrubbed[len(scrubbed)-4096:]
+	}
+	return scrubbed
+}
+
+// extractContainerCrashLogs fetches the last log lines from an exited container for diagnostics.
+func extractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime, containerID string) string {
+	if rt == nil {
+		return ""
+	}
+	reader, err := rt.GetContainerLogs(ctx, containerID)
+	if err != nil || reader == nil {
+		return ""
+	}
+	defer reader.Close()
+
+	items, err := logs.DemuxDockerLogStream(reader, "stdout")
+	if err != nil || len(items) == 0 {
+		return ""
+	}
+
+	var lines []string
+	start := 0
+	if len(items) > 50 {
+		start = len(items) - 50
+	}
+	for i := start; i < len(items); i++ {
+		msg := strings.TrimSpace(items[i].Message)
+		if msg != "" {
+			lines = append(lines, msg)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return SanitizeCrashLogs(strings.Join(lines, "\n"))
+}
 
 // WaitForContainerReady polls container status until it is running and healthy or timeout occurs.
 func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, containerID string, timeout time.Duration) error {
@@ -37,6 +84,10 @@ func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, con
 					return nil
 				}
 			} else if inspect.State == "exited" || inspect.State == "dead" {
+				crashLogs := extractContainerCrashLogs(ctx, rt, containerID)
+				if crashLogs != "" {
+					return fmt.Errorf("container exited prematurely with code %d:\n%s", inspect.ExitCode, crashLogs)
+				}
 				return fmt.Errorf("container exited prematurely with code %d", inspect.ExitCode)
 			}
 		}

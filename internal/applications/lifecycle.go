@@ -27,9 +27,16 @@ func StopApplication(ctx context.Context, rt runtime.ContainerRuntime, container
 }
 
 // StartApplication starts a stopped application container and waits for ready status.
+// Tier 3 Idempotency: If the container is already running and healthy, returns nil immediately.
 func StartApplication(ctx context.Context, rt runtime.ContainerRuntime, containerID string) error {
 	if rt == nil {
 		return fmt.Errorf("container runtime cannot be nil")
+	}
+
+	if inspect, err := rt.InspectContainer(ctx, containerID); err == nil && inspect != nil {
+		if inspect.Running && (inspect.Health == "" || inspect.Health == "healthy") {
+			return nil
+		}
 	}
 
 	if err := rt.StartContainer(ctx, containerID); err != nil {

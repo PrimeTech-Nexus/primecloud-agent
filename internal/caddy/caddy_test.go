@@ -738,3 +738,41 @@ func TestGenerateSnippet_FormatFilterAndCredentialScrubbing(t *testing.T) {
 		t.Errorf("ValidateConfig failed on format filter snippet: %v", err)
 	}
 }
+
+
+func TestGenerateSnippet_PrimeCloudWakeInterception(t *testing.T) {
+	route := &RouteConfig{
+		Domain:      "wake-app.primecloud.cloud",
+		Upstream:    "127.0.0.1:32808",
+		TLS:         true,
+		WakeEnabled: true,
+	}
+
+	snippet, err := GenerateSnippet(route)
+	if err != nil {
+		t.Fatalf("GenerateSnippet() unexpected error: %v", err)
+	}
+
+	expectedWakeDirectives := []string{
+		"handle /__primecloud/wake/* {",
+		"reverse_proxy 127.0.0.1:8001",
+		"handle_errors {",
+		"@upstream_down `{err.status_code} in [502, 503]`",
+		"handle @upstream_down {",
+		"header_up Host {host}",
+		"header_up X-Prime-Original-Host {host}",
+		"header_up X-Prime-Original-Uri {uri}",
+		"header_up X-Prime-Original-Method {method}",
+		"header_up X-Prime-Request-Id {http.request.uuid}",
+	}
+
+	for _, dir := range expectedWakeDirectives {
+		if !strings.Contains(snippet, dir) {
+			t.Errorf("expected Caddy snippet to contain PrimeCloud Wake directive %q, got:\n%s", dir, snippet)
+		}
+	}
+
+	if err := ValidateConfig(snippet); err != nil {
+		t.Errorf("ValidateConfig failed on PrimeCloud Wake snippet: %v", err)
+	}
+}

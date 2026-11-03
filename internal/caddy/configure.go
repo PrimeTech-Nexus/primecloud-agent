@@ -17,15 +17,17 @@ import (
 
 // RouteConfig defines routing rules for an application or service.
 type RouteConfig struct {
-	Domain          string            `json:"domain"`
-	Upstream        string            `json:"upstream"`
-	TLS             bool              `json:"tls"`
-	TLSMode         string            `json:"tls_mode,omitempty"`
-	CustomDomain    bool              `json:"custom_domain,omitempty"`
-	Headers         map[string]string `json:"headers,omitempty"`
-	HealthCheckPath string            `json:"health_check_path,omitempty"`
-	ResourceID      string            `json:"resource_id,omitempty"`
-	AccessLogPath   string            `json:"access_log_path,omitempty"`
+	Domain         string            `json:"domain"`
+	Upstream       string            `json:"upstream"`
+	TLS            bool              `json:"tls"`
+	TLSMode        string            `json:"tls_mode,omitempty"`
+	CustomDomain   bool              `json:"custom_domain,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	HealthCheckPath string           `json:"health_check_path,omitempty"`
+	ResourceID     string            `json:"resource_id,omitempty"`
+	AccessLogPath  string            `json:"access_log_path,omitempty"`
+	WakeEnabled    bool              `json:"wake_enabled,omitempty"`
+	WakeServiceURL string            `json:"wake_service_url,omitempty"`
 }
 
 // Manager orchestrates Caddy reverse proxy configuration.
@@ -240,6 +242,20 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 		// Wildcard fallback: unconfigured customer domain does NOT proxy to dead port; returns deterministic 404
 		sb.WriteString("    respond \"Application Not Found\" 404\n")
 	} else {
+		enableWake := route.WakeEnabled || strings.TrimSpace(route.WakeServiceURL) != ""
+		wakeURL := strings.TrimSpace(route.WakeServiceURL)
+		if wakeURL == "" {
+			wakeURL = "127.0.0.1:8001"
+		}
+		wakeURL = strings.TrimPrefix(wakeURL, "http://")
+		wakeURL = strings.TrimPrefix(wakeURL, "https://")
+
+		if enableWake {
+			sb.WriteString("    handle /__primecloud/wake/* {\n")
+			sb.WriteString(fmt.Sprintf("        reverse_proxy %s\n", wakeURL))
+			sb.WriteString("    }\n\n")
+		}
+
 		sb.WriteString(fmt.Sprintf("    reverse_proxy %s {\n", upstream))
 		sb.WriteString("        header_up Host {host}\n")
 		sb.WriteString("        header_up X-Real-IP {remote_host}\n")
@@ -256,6 +272,21 @@ func GenerateSnippet(route *RouteConfig) (string, error) {
 		}
 
 		sb.WriteString("    }\n")
+
+		if enableWake {
+			sb.WriteString("\n    handle_errors {\n")
+			sb.WriteString("        @upstream_down `{err.status_code} in [502, 503]`\n")
+			sb.WriteString("        handle @upstream_down {\n")
+			sb.WriteString(fmt.Sprintf("            reverse_proxy %s {\n", wakeURL))
+			sb.WriteString("                header_up Host {host}\n")
+			sb.WriteString("                header_up X-Prime-Original-Host {host}\n")
+			sb.WriteString("                header_up X-Prime-Original-Uri {uri}\n")
+			sb.WriteString("                header_up X-Prime-Original-Method {method}\n")
+			sb.WriteString("                header_up X-Prime-Request-Id {http.request.uuid}\n")
+			sb.WriteString("            }\n")
+			sb.WriteString("        }\n")
+			sb.WriteString("    }\n")
+		}
 	}
 	sb.WriteString("}\n")
 
