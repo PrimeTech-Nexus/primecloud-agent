@@ -85,6 +85,10 @@ type ContainerInspect struct {
 	State        string            `json:"state"`
 	Running      bool              `json:"running"`
 	ExitCode     int               `json:"exit_code"`
+	StateError   string            `json:"state_error,omitempty"`
+	OOMKilled    bool              `json:"oom_killed,omitempty"`
+	Cmd          []string          `json:"cmd,omitempty"`
+	Entrypoint   []string          `json:"entrypoint,omitempty"`
 	Health       string            `json:"health,omitempty"`
 	RestartCount int               `json:"restart_count,omitempty"`
 	Labels       map[string]string `json:"labels"`

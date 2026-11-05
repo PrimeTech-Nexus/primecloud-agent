@@ -296,3 +296,23 @@ func TestBuildPortConfigForWorkload_Application(t *testing.T) {
 		t.Errorf("expected 3000/tcp to bind to 127.0.0.1, got %v", bindingsCustom["3000/tcp"])
 	}
 }
+
+func TestDefaultLogConfig(t *testing.T) {
+	lc := runtime.DefaultLogConfig()
+	if lc.Type != "json-file" {
+		t.Errorf("expected json-file driver, got %s", lc.Type)
+	}
+	if lc.Config["max-size"] != "50m" {
+		t.Errorf("expected max-size 50m, got %s", lc.Config["max-size"])
+	}
+	if lc.Config["max-file"] != "3" {
+		t.Errorf("expected max-file 3, got %s", lc.Config["max-file"])
+	}
+}
+
+func TestDefaultStorageOpt(t *testing.T) {
+	so := runtime.DefaultStorageOpt()
+	if so["size"] != "10G" {
+		t.Errorf("expected size 10G, got %s", so["size"])
+	}
+}

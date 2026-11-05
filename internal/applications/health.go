@@ -57,6 +57,35 @@ func extractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime,
 	return SanitizeCrashLogs(strings.Join(lines, "\n"))
 }
 
+// formatExitReason constructs an informative, human-readable description of why a container stopped.
+func formatExitReason(inspect *runtime.ContainerInspect) string {
+	if inspect == nil {
+		return "unknown status"
+	}
+	desc := fmt.Sprintf("code %d", inspect.ExitCode)
+	switch inspect.ExitCode {
+	case 3:
+		desc = "code 3 (ASGI/Uvicorn startup failure: application import, lifespan startup, or dependency error)"
+	case 127:
+		desc = "code 127 (Command not found / executable missing from PATH)"
+	case 126:
+		desc = "code 126 (Command cannot be executed / permission denied)"
+	case 137:
+		if inspect.OOMKilled {
+			desc = "code 137 (Out of Memory / OOMKilled)"
+		} else {
+			desc = "code 137 (SIGKILL / terminated)"
+		}
+	case 143:
+		desc = "code 143 (SIGTERM / graceful termination requested)"
+	}
+
+	if inspect.StateError != "" {
+		desc = fmt.Sprintf("%s: %s", desc, inspect.StateError)
+	}
+	return desc
+}
+
 // WaitForContainerReady polls container status until it is running and healthy or timeout occurs.
 func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, containerID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -85,10 +114,11 @@ func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, con
 				}
 			} else if inspect.State == "exited" || inspect.State == "dead" {
 				crashLogs := extractContainerCrashLogs(ctx, rt, containerID)
+				exitDesc := formatExitReason(inspect)
 				if crashLogs != "" {
-					return fmt.Errorf("container exited prematurely with code %d:\n%s", inspect.ExitCode, crashLogs)
+					return fmt.Errorf("container exited prematurely with %s:\n%s", exitDesc, crashLogs)
 				}
-				return fmt.Errorf("container exited prematurely with code %d", inspect.ExitCode)
+				return fmt.Errorf("container exited prematurely with %s", exitDesc)
 			}
 		}
 

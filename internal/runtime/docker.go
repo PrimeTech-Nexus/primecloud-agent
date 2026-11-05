@@ -338,6 +338,26 @@ func BuildPortConfig(ports map[string]string) (nat.PortSet, nat.PortMap, error) 
 	return BuildPortConfigForWorkload(WorkloadTypeApplication, ports)
 }
 
+// DefaultLogConfig returns mandatory log rotation settings (50m max-size, 3 max-files)
+// to prevent multi-tenant runaway error loops from exhausting host disk space.
+func DefaultLogConfig() container.LogConfig {
+	return container.LogConfig{
+		Type: "json-file",
+		Config: map[string]string{
+			"max-size": "50m",
+			"max-file": "3",
+		},
+	}
+}
+
+// DefaultStorageOpt returns storage quota options (10G max overlay storage)
+// to prevent container write exhaustion on the host filesystem.
+func DefaultStorageOpt() map[string]string {
+	return map[string]string{
+		"size": "10G",
+	}
+}
+
 // CreateContainer creates a container applying mandatory labels, isolation profile, and resource limits.
 func (d *DockerRuntime) CreateContainer(
 	ctx context.Context,
@@ -416,6 +436,8 @@ func (d *DockerRuntime) CreateContainer(
 	hostConfig := &container.HostConfig{
 		Binds:        cfg.Binds,
 		PortBindings: portBindings,
+		LogConfig:    DefaultLogConfig(),
+		StorageOpt:   DefaultStorageOpt(),
 	}
 	var networkingConfig *dockerNetwork.NetworkingConfig
 	if cfg.NetworkMode != "" {
@@ -473,14 +495,20 @@ func (d *DockerRuntime) InspectContainer(ctx context.Context, containerID string
 	}
 
 	res := &ContainerInspect{
-		ID:       inspect.ID,
-		Name:     inspect.Name,
-		Image:    inspect.Config.Image,
-		State:    inspect.State.Status,
-		Running:  inspect.State.Running,
-		ExitCode: inspect.State.ExitCode,
-		Labels:   inspect.Config.Labels,
-		Ports:    make(map[string]string),
+		ID:         inspect.ID,
+		Name:       inspect.Name,
+		Image:      inspect.Config.Image,
+		State:      inspect.State.Status,
+		Running:    inspect.State.Running,
+		ExitCode:   inspect.State.ExitCode,
+		StateError: inspect.State.Error,
+		OOMKilled:  inspect.State.OOMKilled,
+		Labels:     inspect.Config.Labels,
+		Ports:      make(map[string]string),
+	}
+	if inspect.Config != nil {
+		res.Cmd = inspect.Config.Cmd
+		res.Entrypoint = inspect.Config.Entrypoint
 	}
 
 	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Ports != nil {
