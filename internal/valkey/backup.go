@@ -93,6 +93,16 @@ func BackupValkeyWithVault(ctx context.Context, rt runtime.ContainerRuntime, vCl
 			return nil, fmt.Errorf("valkey container %s is not running", containerName)
 		}
 
+		// Fallback: If auth token was not found in Vault, extract --requirepass from inspect.Cmd
+		if authToken == "" && inspect != nil {
+			for i, arg := range inspect.Cmd {
+				if arg == "--requirepass" && i+1 < len(inspect.Cmd) {
+					authToken = inspect.Cmd[i+1]
+					break
+				}
+			}
+		}
+
 		// Trigger BGSAVE
 		bgsaveCmd := []string{"valkey-cli"}
 		if authToken != "" {

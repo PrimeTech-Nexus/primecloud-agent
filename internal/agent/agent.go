@@ -739,6 +739,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
+			}
+		}
+		if projectID == "" {
 			projectID = "default"
 		}
 
@@ -966,6 +971,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
+			}
+		}
+		if projectID == "" {
 			projectID = "default"
 		}
 		environmentID := op.EnvironmentId
@@ -1027,6 +1037,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		if projectID == "" {
 			if pid, ok := payload["project_id"].(string); ok && pid != "" {
 				projectID = pid
+			}
+		}
+		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
 			}
 		}
 		if projectID == "" {
@@ -1269,6 +1284,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
+			}
+		}
+		if projectID == "" {
 			projectID = "default"
 		}
 
@@ -1496,6 +1516,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			}
 		}
 		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
+			}
+		}
+		if projectID == "" {
 			projectID = "default"
 		}
 
@@ -1719,6 +1744,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		if projectID == "" {
 			if pid, ok := payload["project_id"].(string); ok && pid != "" {
 				projectID = pid
+			}
+		}
+		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
 			}
 		}
 		if projectID == "" {
@@ -2056,6 +2086,11 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 		if projectID == "" {
 			if pid, ok := payload["project_id"].(string); ok && pid != "" {
 				projectID = pid
+			}
+		}
+		if projectID == "" {
+			if accID, ok := payload["account_id"].(string); ok && accID != "" {
+				projectID = accID
 			}
 		}
 		if projectID == "" {

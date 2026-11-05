@@ -77,14 +77,24 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 		return fmt.Errorf("failed to resolve postgres credentials: %w", credErr)
 	}
 
+	env := []string{
+		fmt.Sprintf("PGPASSWORD=%s", creds.Password),
+	}
+
 	isSandbox := strings.HasPrefix(containerName, "pc_drill_tgt_") || strings.Contains(containerName, "drill") || strings.Contains(containerName, "sandbox")
 
 	if isSandbox {
 		inspect, err := rt.InspectContainer(ctx, containerName)
 		if err != nil || inspect == nil {
 			// Sandbox container does not exist in runtime: provision an isolated PostgreSQL sandbox container
-			tempVolDir := filepath.Join(os.TempDir(), "primecloud-drill-pg", containerName)
-			if mkErr := os.MkdirAll(tempVolDir, 0700); mkErr != nil {
+			drillBaseDir := filepath.Join(os.TempDir(), "primecloud-drill-pg")
+			if os.Getenv("PRIMECLOUD_DRILL_DIR") != "" {
+				drillBaseDir = os.Getenv("PRIMECLOUD_DRILL_DIR")
+			} else if fi, statErr := os.Stat("/opt/primecloud/resources"); statErr == nil && fi.IsDir() {
+				drillBaseDir = "/opt/primecloud/resources/drills/postgres"
+			}
+			tempVolDir := filepath.Join(drillBaseDir, containerName)
+			if mkErr := ensurePostgresDataDir(tempVolDir); mkErr != nil {
 				return fmt.Errorf("failed to create postgres sandbox volume directory: %w", mkErr)
 			}
 
@@ -133,12 +143,12 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 			}
 		}
 
-		// Wait for readiness (pg_isready)
+		// Wait for readiness: verify container finished initdb restart and is accepting queries
 		ready := false
-		deadline := time.Now().Add(30 * time.Second)
+		deadline := time.Now().Add(45 * time.Second)
 		for time.Now().Before(deadline) {
-			chkCmd := []string{"pg_isready", "-U", creds.Username, "-d", creds.Database}
-			_, _, code, chkErr := rt.ExecContainer(ctx, containerName, chkCmd, nil, nil)
+			chkCmd := []string{"psql", "-U", creds.Username, "-d", creds.Database, "-c", "SELECT 1;"}
+			_, _, code, chkErr := rt.ExecContainer(ctx, containerName, chkCmd, env, nil)
 			if chkErr == nil && code == 0 {
 				ready = true
 				break
@@ -146,11 +156,11 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(300 * time.Millisecond):
+			case <-time.After(500 * time.Millisecond):
 			}
 		}
 		if !ready {
-			return fmt.Errorf("SANDBOX_READINESS_TIMEOUT: isolated postgres sandbox container %s failed pg_isready health check", containerName)
+			return fmt.Errorf("SANDBOX_READINESS_TIMEOUT: isolated postgres sandbox container %s failed readiness check", containerName)
 		}
 	} else {
 		// Non-sandbox container (e.g. in-place overwrite): verify target container exists and is running
@@ -173,10 +183,6 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 				return fmt.Errorf("CONTAINER_STOPPED: target postgres container %s is not running after start attempt", containerName)
 			}
 		}
-	}
-
-	env := []string{
-		fmt.Sprintf("PGPASSWORD=%s", creds.Password),
 	}
 
 	// Open file reader for stdin streaming
@@ -221,7 +227,16 @@ func RestorePostgresWithVault(ctx context.Context, rt runtime.ContainerRuntime, 
 		"-d", creds.Database,
 		"-c", "SELECT 1;",
 	}
-	_, vStderr, vCode, vErr := rt.ExecContainer(ctx, containerName, verifyCmd, env, nil)
+	var vStderr []byte
+	var vCode int
+	var vErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		_, vStderr, vCode, vErr = rt.ExecContainer(ctx, containerName, verifyCmd, env, nil)
+		if vErr == nil && vCode == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if vErr != nil || vCode != 0 {
 		return fmt.Errorf("restore verification failed on %s (exit %d): %s", containerName, vCode, strings.TrimSpace(string(vStderr)))
 	}
