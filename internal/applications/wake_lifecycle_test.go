@@ -106,3 +106,35 @@ func TestSanitizeCrashLogs_RedactsSecretsAndBoundsSize(t *testing.T) {
 		t.Fatalf("Expected crash logs bounded to 4096 bytes, got %d", len(bounded))
 	}
 }
+
+func TestSanitizeCrashLogs_PreservesCustomerTracebackAndRedactsPlatformInternals(t *testing.T) {
+	raw := `Traceback (most recent call last):
+  File "/app/app/main.py", line 19, in <module>
+    from app.middleware.csrf import CSRFProtectionMiddleware
+ModuleNotFoundError: No module named 'app.middleware.csrf'
+Failed to connect to postgresql://dbuser:supersecretpass@10.240.171.12:5432/proddb on node pc-node-001 via /var/run/docker.sock (node ip 167.86.73.226)`
+
+	sanitized := SanitizeCrashLogs(raw)
+
+	// Customer traceback and error must be preserved
+	if !strings.Contains(sanitized, "ModuleNotFoundError: No module named 'app.middleware.csrf'") {
+		t.Fatalf("SanitizeCrashLogs wiped customer exception: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "/app/app/main.py") {
+		t.Fatalf("SanitizeCrashLogs wiped customer source path: %s", sanitized)
+	}
+
+	// Platform internals must be redacted
+	if strings.Contains(sanitized, "supersecretpass") {
+		t.Fatalf("SanitizeCrashLogs leaked DB password: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "10.240.171.12") || strings.Contains(sanitized, "167.86.73.226") {
+		t.Fatalf("SanitizeCrashLogs leaked internal node IP: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "pc-node-001") {
+		t.Fatalf("SanitizeCrashLogs leaked internal node name: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "/var/run/docker.sock") {
+		t.Fatalf("SanitizeCrashLogs leaked internal docker socket: %s", sanitized)
+	}
+}

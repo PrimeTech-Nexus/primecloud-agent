@@ -227,10 +227,15 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 
 		containerID, err := deployer.Deploy(ctx, projectID, op.EnvironmentId, appID, instanceID, op.PayloadJson)
 		if err != nil {
+			errCode := "DEPLOYMENT_FAILED"
+			errStr := err.Error()
+			if strings.Contains(errStr, "failed health check") || strings.Contains(errStr, "exited prematurely") || strings.Contains(errStr, "unhealthy status") {
+				errCode = "APPLICATION_STARTUP_FAILED"
+			}
 			return &pb.OperationResponse{
 				OperationId:     op.OperationId,
 				Status:          "FAILED",
-				ErrorCode:       "DEPLOYMENT_FAILED",
+				ErrorCode:       errCode,
 				Message:         err.Error(),
 				CompletedAtUnix: time.Now().Unix(),
 			}, err
@@ -494,11 +499,15 @@ func NewAgentWithRuntime(cfg *Config, customRT runtime.ContainerRuntime, logger 
 			probeURL := fmt.Sprintf("http://127.0.0.1:%d%s", hostPort, path)
 			ok, err := applications.ProbeHTTP(probeCtx, probeURL, 0)
 			if err != nil || !ok {
-				errMsg := fmt.Sprintf("HTTP health check failed on %s: %v", probeURL, err)
+				crashLogs := applications.ExtractContainerCrashLogs(ctx, rt, containerID)
+				errMsg := fmt.Sprintf("HTTP health check failed on path %s: connection refused or probe timed out", path)
+				if crashLogs != "" {
+					errMsg = fmt.Sprintf("%s\n--- Application Output ---\n%s", errMsg, crashLogs)
+				}
 				return &pb.OperationResponse{
 					OperationId:     op.OperationId,
 					Status:          "FAILED",
-					ErrorCode:       "HEALTH_CHECK_FAILED",
+					ErrorCode:       "APPLICATION_STARTUP_FAILED",
 					Message:         errMsg,
 					CompletedAtUnix: time.Now().Unix(),
 				}, fmt.Errorf("%s", errMsg)

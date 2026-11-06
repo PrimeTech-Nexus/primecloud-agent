@@ -13,19 +13,30 @@ import (
 	"github.com/primecloud/primecloud-agent/internal/runtime"
 )
 
-var secretRedactionPattern = regexp.MustCompile(`(?i)(password|secret|token|api_key|access_token|refresh_token|client_secret)\s*[:=]\s*[^\s"']+`)
+var (
+	secretRedactionPattern = regexp.MustCompile(`(?i)(password|secret|token|api_key|access_token|refresh_token|client_secret)\s*[:=]\s*[^\s"']+`)
+	internalIPPattern      = regexp.MustCompile(`\b(?:167\.86\.73\.\d+|10\.240\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(?::\d+)?\b`)
+	internalSocketPattern  = regexp.MustCompile(`/(?:var/run|run)/[a-zA-Z0-9_\-\./]+\.sock`)
+	internalNodePattern    = regexp.MustCompile(`(?i)\bpc-node-\d+\b`)
+	connectionURLPattern   = regexp.MustCompile(`(?i)((?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|valkey):\/\/)[^\s:]+:([^\s@]+)@`)
+)
 
-// SanitizeCrashLogs scrubs secret patterns and bounds output to 4096 bytes.
+// SanitizeCrashLogs scrubs secret patterns, database URLs, internal IPs, and internal platform socket paths,
+// while preserving customer application tracebacks, and bounds output to 4096 bytes.
 func SanitizeCrashLogs(raw string) string {
 	scrubbed := secretRedactionPattern.ReplaceAllString(raw, "$1=***REDACTED***")
+	scrubbed = connectionURLPattern.ReplaceAllString(scrubbed, "${1}[REDACTED]:***REDACTED***@")
+	scrubbed = internalIPPattern.ReplaceAllString(scrubbed, "[REDACTED_IP]")
+	scrubbed = internalSocketPattern.ReplaceAllString(scrubbed, "[REDACTED_SOCKET]")
+	scrubbed = internalNodePattern.ReplaceAllString(scrubbed, "[REDACTED_NODE]")
 	if len(scrubbed) > 4096 {
 		scrubbed = scrubbed[len(scrubbed)-4096:]
 	}
 	return scrubbed
 }
 
-// extractContainerCrashLogs fetches the last log lines from an exited container for diagnostics.
-func extractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime, containerID string) string {
+// ExtractContainerCrashLogs fetches the last log lines from a container for customer diagnostics with secrets redacted.
+func ExtractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime, containerID string) string {
 	if rt == nil {
 		return ""
 	}
@@ -55,6 +66,11 @@ func extractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime,
 		return ""
 	}
 	return SanitizeCrashLogs(strings.Join(lines, "\n"))
+}
+
+// extractContainerCrashLogs provides internal backward compatibility.
+func extractContainerCrashLogs(ctx context.Context, rt runtime.ContainerRuntime, containerID string) string {
+	return ExtractContainerCrashLogs(ctx, rt, containerID)
 }
 
 // formatExitReason constructs an informative, human-readable description of why a container stopped.
@@ -106,6 +122,10 @@ func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, con
 						return nil
 					}
 					if inspect.Health == "unhealthy" {
+						crashLogs := ExtractContainerCrashLogs(ctx, rt, containerID)
+						if crashLogs != "" {
+							return fmt.Errorf("container reported unhealthy status:\n%s", crashLogs)
+						}
 						return fmt.Errorf("container reported unhealthy status")
 					}
 				} else {
@@ -125,6 +145,10 @@ func WaitForContainerReady(ctx context.Context, rt runtime.ContainerRuntime, con
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	crashLogs := ExtractContainerCrashLogs(ctx, rt, containerID)
+	if crashLogs != "" {
+		return fmt.Errorf("timeout waiting for container %s to become ready:\n%s", containerID, crashLogs)
+	}
 	return fmt.Errorf("timeout waiting for container %s to become ready", containerID)
 }
 
